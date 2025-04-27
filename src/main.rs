@@ -2,6 +2,7 @@ pub mod uniswap_v3;
 pub mod uniswap_graph;
 pub mod token;
 pub mod uniswap_cache;
+pub mod uniswap_events;
 
 use dotenv::dotenv;
 use env_logger::Env;
