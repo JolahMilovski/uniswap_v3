@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use ethers::{contract::abigen, providers::{Provider, StreamExt}, types::{Address, Filter, H160, H256, U512, U64}};
+use ethers::{contract::abigen, providers::{Provider, StreamExt}, types::{Address, Filter, H160, H256, U64}};
 use tokio::time::Duration;
 use ethers_providers::{Middleware, Ws};
 use log::{error, info};
@@ -10,17 +10,80 @@ use ethers::contract::EthLogDecode;
 use ethers::utils::keccak256;
 use ethers::abi::RawLog;
 
-use crate::{uniswap_cache::UniswapPoolCache, uniswap_graph, uniswap_v3::calculate_current_price}; 
+use crate::{uniswap_cache::UniswapPoolCache, uniswap_graph, uniswap_v3::{calculate_current_price, tick_to_sqrt_price}}; 
 
 abigen!(
     IUniswapV3Pool,
-    r#"[
-        event Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)
-        event Mint(address indexed sender, address indexed owner, int24 tickLower, int24 tickUpper, uint128 amount, uint256 amount0, uint256 amount1)
-        event Burn(address indexed owner, int24 tickLower, int24 tickUpper, uint128 amount, uint256 amount0, uint256 amount1)
-        function ticks(int24 tick) external view returns (uint128 liquidityGross, int128 liquidityNet, uint256 feeGrowthOutside0X128, uint256 feeGrowthOutside1X128, int56 tickCumulativeOutside, uint160 secondsPerLiquidityOutsideX128, uint32 secondsOutside, bool initialized)
-    ]"#
+    r#"[{
+        "inputs": [],
+        "name": "liquidity",
+        "outputs": [
+            { "internalType": "uint128", "name": "", "type": "uint128" }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            { "internalType": "int24", "name": "tick", "type": "int24" }
+        ],
+        "name": "ticks",
+        "outputs": [
+            { "internalType": "uint128", "name": "liquidityGross", "type": "uint128" },
+            { "internalType": "int128", "name": "liquidityNet", "type": "int128" },
+            { "internalType": "uint256", "name": "feeGrowthOutside0X128", "type": "uint256" },
+            { "internalType": "uint256", "name": "feeGrowthOutside1X128", "type": "uint256" },
+            { "internalType": "int56", "name": "tickCumulativeOutside", "type": "int56" },
+            { "internalType": "uint160", "name": "secondsPerLiquidityOutsideX128", "type": "uint160" },
+            { "internalType": "uint32", "name": "secondsOutside", "type": "uint32" },
+            { "internalType": "bool", "name": "initialized", "type": "bool" }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            { "indexed": true, "internalType": "address", "name": "sender", "type": "address" },
+            { "indexed": true, "internalType": "address", "name": "recipient", "type": "address" },
+            { "indexed": false, "internalType": "int256", "name": "amount0", "type": "int256" },
+            { "indexed": false, "internalType": "int256", "name": "amount1", "type": "int256" },
+            { "indexed": false, "internalType": "uint160", "name": "sqrtPriceX96", "type": "uint160" },
+            { "indexed": false, "internalType": "uint128", "name": "liquidity", "type": "uint128" },
+            { "indexed": false, "internalType": "int24", "name": "tick", "type": "int24" }
+        ],
+        "name": "Swap",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            { "indexed": true, "internalType": "address", "name": "sender", "type": "address" },
+            { "indexed": true, "internalType": "address", "name": "owner", "type": "address" },
+            { "indexed": false, "internalType": "int24", "name": "tickLower", "type": "int24" },
+            { "indexed": false, "internalType": "int24", "name": "tickUpper", "type": "int24" },
+            { "indexed": false, "internalType": "uint128", "name": "amount", "type": "uint128" },
+            { "indexed": false, "internalType": "uint256", "name": "amount0", "type": "uint256" },
+            { "indexed": false, "internalType": "uint256", "name": "amount1", "type": "uint256" }
+        ],
+        "name": "Mint",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            { "indexed": true, "internalType": "address", "name": "owner", "type": "address" },
+            { "indexed": false, "internalType": "int24", "name": "tickLower", "type": "int24" },
+            { "indexed": false, "internalType": "int24", "name": "tickUpper", "type": "int24" },
+            { "indexed": false, "internalType": "uint128", "name": "amount", "type": "uint128" },
+            { "indexed": false, "internalType": "uint256", "name": "amount0", "type": "uint256" },
+            { "indexed": false, "internalType": "uint256", "name": "amount1", "type": "uint256" }
+        ],
+        "name": "Burn",
+        "type": "event"
+    }]"#
 );
+
 
 abigen!(
     TickLens,
@@ -240,16 +303,28 @@ impl UniswapEventSubscriber {
             all_ticks.extend(ticks);
         }
 
+        // Запрос ликвидности вне блокировки графа
+        let new_liquidity = IUniswapV3Pool::new(pool_address, provider.clone()).liquidity().call().await?;
+
+        // Блокируем граф один раз для записи ликвидности и обновления тиковой карты
         let mut graph = graph.lock().await;
         if let Some(pool) = graph.edges.get_mut(&pool_address) {
+            // Обновляем ликвидность
+            pool.uniswap_liquidity = new_liquidity.into();
+
+            // Обновляем тиковую карту
             for tick_info in all_ticks.iter() {
-                pool.tick_map.insert(tick_info.tick, (tick_info.liquidity_net, U512::from(0))); 
+                if let Ok(price) = tick_to_sqrt_price(tick_info.tick) {
+                    pool.tick_map.insert(tick_info.tick, (tick_info.liquidity_net, price));
+                }
             }
-            info!("Обновлена карта тиков с {} тиками", all_ticks.len());
+
+            info!("Обновлена карта тиков с {} тиками и ликвидность пула: {:?}", all_ticks.len(), pool_address);
         }
 
         info!("Обновление тиков завершено для пула: {:?}", pool_address);
 
         Ok(())
     }
+
 }

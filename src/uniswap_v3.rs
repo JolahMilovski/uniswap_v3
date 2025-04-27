@@ -218,7 +218,7 @@ lazy_static! {
 
 
 
-fn tick_to_sqrt_price(tick: i32) -> Result<U512, String> {
+pub fn tick_to_sqrt_price(tick: i32) -> Result<U512, String> {
 
     if tick < -887272 || tick > 887272 {
         return Err("Tick out of bounds".to_string());
@@ -293,7 +293,7 @@ fn tick_to_sqrt_price(tick: i32) -> Result<U512, String> {
         ratio = U512::MAX / ratio;
     }
 
-    Ok(ratio)
+    Ok(ratio >> 32)
 
     }
     
