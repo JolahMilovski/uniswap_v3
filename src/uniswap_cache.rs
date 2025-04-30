@@ -12,6 +12,7 @@ pub struct UniswapPoolCache {
 }
 
 impl UniswapPoolCache {
+    
     pub fn new() -> Self {
         UniswapPoolCache {
             pool_addresses: HashSet::new(),

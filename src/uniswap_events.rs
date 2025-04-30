@@ -117,6 +117,16 @@ pub struct UniswapEventSubscriber {
 
 impl UniswapEventSubscriber {
 
+    pub fn new(
+        provider: Arc<Provider<Ws>>,
+        graph: Arc<Mutex<UniversalGraph>>,
+    ) -> Self {
+        UniswapEventSubscriber {
+            provider,
+            graph,
+        }
+    }
+
     pub async fn subscribe_to_events_for_all_pools(self: Arc<Self>) -> anyhow::Result<()> {
         let provider = self.provider.clone();
         let graph = self.graph.clone();
