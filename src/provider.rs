@@ -1,27 +1,28 @@
 use ethers_providers::{Middleware, Provider, Ws};
 use std::{
-    collections::HashSet,
-    sync::Arc,
-    time::{Duration, Instant},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::Mutex;
 use crate::get_env_var;
 
 struct ProviderState {
     provider: Arc<Provider<Ws>>,
     url: String,
-    failed_attempts: u32,
-    last_failed: Option<Instant>,
+    failed_attempts: AtomicU32,
+    last_failed_ts: AtomicU64, // UNIX timestamp в секундах
+    blacklisted: AtomicBool,
 }
 
 pub struct ProviderManager {
-    providers: Vec<ProviderState>,
-    blacklist: HashSet<String>,
-    blacklist_duration: Duration,
+    providers: Vec<Arc<ProviderState>>,
+    blacklist_duration_secs: u64,
 }
 
 impl ProviderManager {
-    pub async fn new() -> Arc<Mutex<Self>> {
+    pub async fn new() -> Arc<Self> {
         let urls = vec![
             get_env_var("WS_PROVIDER_URL_FIRST"),
             get_env_var("WS_PROVIDER_URL_SECOND"),
@@ -32,34 +33,36 @@ impl ProviderManager {
             match Ws::connect(&url).await {
                 Ok(ws) => {
                     let provider = Arc::new(Provider::new(ws));
-                    providers.push(ProviderState {
+                    providers.push(Arc::new(ProviderState {
                         provider,
                         url: url.clone(),
-                        failed_attempts: 0,
-                        last_failed: None,
-                    });
+                        failed_attempts: AtomicU32::new(0),
+                        last_failed_ts: AtomicU64::new(0),
+                        blacklisted: AtomicBool::new(false),
+                    }));
                 }
                 Err(e) => eprintln!("[init] Ошибка подключения к {url}: {e}"),
             }
         }
 
-        Arc::new(Mutex::new(Self {
+        Arc::new(Self {
             providers,
-            blacklist: HashSet::new(),
-            blacklist_duration: Duration::from_secs(600),
-        }))
+            blacklist_duration_secs: 600,
+        })
     }
 
-    pub async fn get_provider(&mut self) -> Option<Arc<Provider<Ws>>> {
-        for state in &mut self.providers {
-            let now = Instant::now();
+    pub async fn get_provider(&self) -> Option<Arc<Provider<Ws>>> {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
 
-            let blacklisted = self.blacklist.contains(&state.url);
+        for state in &self.providers {
+            let blacklisted = state.blacklisted.load(Ordering::Relaxed);
             if blacklisted {
-                if let Some(last_failed) = state.last_failed {
-                    if now.duration_since(last_failed) < self.blacklist_duration {
-                        continue;
-                    }
+                let last_failed = state.last_failed_ts.load(Ordering::Relaxed);
+                if last_failed != 0 && now_secs - last_failed < self.blacklist_duration_secs {
+                    continue;
                 }
             }
 
@@ -67,21 +70,21 @@ impl ProviderManager {
                 Ok(block) => {
                     if blacklisted {
                         println!("[check] Провайдер {} восстановлен, блок {}", state.url, block);
-                        self.blacklist.remove(&state.url);
+                        state.blacklisted.store(false, Ordering::Relaxed);
                     } else {
                         println!("[ok] Провайдер {}: блок {}", state.url, block);
                     }
 
-                    state.failed_attempts = 0;
+                    state.failed_attempts.store(0, Ordering::Relaxed);
                     return Some(state.provider.clone());
                 }
                 Err(e) => {
                     eprintln!("[fail] {}: {e}", state.url);
-                    state.failed_attempts += 1;
+                    let fails = state.failed_attempts.fetch_add(1, Ordering::Relaxed) + 1;
 
-                    if state.failed_attempts >= 3 {
-                        self.blacklist.insert(state.url.clone());
-                        state.last_failed = Some(now);
+                    if fails >= 3 && !state.blacklisted.load(Ordering::Relaxed) {
+                        state.blacklisted.store(true, Ordering::Relaxed);
+                        state.last_failed_ts.store(now_secs, Ordering::Relaxed);
                         println!("[blacklist] Провайдер {} временно отключен", state.url);
                     }
                 }
@@ -96,11 +99,9 @@ pub async fn get_working_provider() -> Arc<Provider<Ws>> {
     let manager = ProviderManager::new().await;
 
     loop {
-        let mut lock = manager.lock().await;
-        if let Some(provider) = lock.get_provider().await {
+        if let Some(provider) = manager.get_provider().await {
             return provider;
         }
-        drop(lock); // отпускаем мьютекс перед ожиданием
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
