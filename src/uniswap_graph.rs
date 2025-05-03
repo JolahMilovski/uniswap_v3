@@ -37,6 +37,7 @@ pub struct UniswapPool {
     pub uniswap_fee_tier: u32,              // Уровень комиссии (например, 3000 для 0.3%)
     #[serde(skip_serializing_if = "HashMap::is_empty", serialize_with = "serialize_tick_map")]
     pub tick_map: HashMap<i32, (i128, U512)>, // Новое поле для тиковой карты
+    pub is_active: bool,                      //активность пула
 }
 
 impl UniversalGraph {
@@ -69,6 +70,7 @@ impl UniversalGraph {
         uniswap_max_liquidity_per_tick: U512,
         uniswap_fee_tier: u32,
         tick_map: HashMap<i32, (i128, U512)>,      
+        is_active: bool
     ) {          
                // Добавляем токены в nodes
         self.nodes.insert(uniswap_token_a, uniswap_token_a_decimals);
@@ -95,7 +97,8 @@ impl UniversalGraph {
                 uniswap_tick_spacing,
                 uniswap_fee_tier,
                 uniswap_max_liquidity_per_tick,
-                tick_map
+                tick_map,
+                is_active
             },
         );        
     }
@@ -142,7 +145,8 @@ impl UniversalGraph {
                             sqrt_price_x96.to_string()
                         )
                     )
-                }).collect::<HashMap<String, (String, String)>>()
+                }).collect::<HashMap<String, (String, String)>>(),
+                "is_active":pool.is_active,
             })
             })
             .collect();

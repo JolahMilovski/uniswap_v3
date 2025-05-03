@@ -19,11 +19,7 @@ impl UniswapPoolCache {
             last_verified_block: 0,
         }
     }
-    // Получение адресов пулов
-    pub fn remove_pool_address(&mut self, address: &Address) {
-        self.pool_addresses.remove(address);
-    }
-
+    
     // Добавление адреса пула в кэш
     pub fn add_pool_address(&mut self, address: Address) {
         self.pool_addresses.insert(address);
@@ -74,7 +70,3 @@ impl UniswapPoolCache {
     }
 
 }
-
-
-
-
