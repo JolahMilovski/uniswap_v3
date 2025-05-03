@@ -4,7 +4,7 @@ use std::fs::File;
 use serde::{Deserialize, Serialize};
 use std::io::{Error, ErrorKind};
 use serde_json::{json, Value};
-use log::{info, warn, error};
+use log::{debug, error, info, warn};
 
 pub struct UniversalGraph {
     pub nodes: HashMap<Address, u8>, // Хранит адреса токенов и их decimal
@@ -103,18 +103,42 @@ impl UniversalGraph {
         );        
     }
 
+    /// Обновляет или добавляет пул в граф
+    pub fn upsert_pool(&mut self, new_pool: UniswapPool) {
+        // Обновляем информацию о токенах
+        self.nodes.insert(new_pool.uniswap_token_a, new_pool.uniswap_token_a_decimals);
+        self.nodes.insert(new_pool.uniswap_token_b, new_pool.uniswap_token_b_decimals);
+
+        // Обновляем или добавляем пул
+        match self.edges.get_mut(&new_pool.uniswap_pool_address) {
+            Some(existing_pool) => {
+                existing_pool.uniswap_liquidity = new_pool.uniswap_liquidity;
+                existing_pool.uniswap_sqrt_price = new_pool.uniswap_sqrt_price;
+                existing_pool.uniswap_current_price = new_pool.uniswap_current_price;
+                existing_pool.uniswap_tick_current = new_pool.uniswap_tick_current;
+                existing_pool.tick_map = new_pool.tick_map;
+                existing_pool.is_active = new_pool.is_active;
+                
+                debug!("Обновлен пул: {:?}", new_pool.uniswap_pool_address);
+            }
+            None => {
+                self.edges.insert(new_pool.uniswap_pool_address, new_pool);                
+            }
+        }
+    }
+
     pub fn save_pool_to_file(&self) -> std::io::Result<()> {
 
         let file_path = "uniswap_pools_data.json";        
         // 1. Проверка наличия данных
         if self.edges.is_empty() {
-            warn!("Попытка сохранения пустого графа. edges содержит 0 пулов.");
+            warn!(" [ГРАФ] Попытка сохранения пустого графа. edges содержит 0 пулов.");
             return Err(Error::new(
                 ErrorKind::InvalidData, 
-                "Нет данных для сохранения (edges пуст)"
+                " [ГРАФ] Нет данных для сохранения (edges пуст)"
             ));
         }
-        info!("Начинаем сохранение {} пулов в файл {}", self.edges.len(), file_path);
+        info!(" [ГРАФ] Начинаем сохранение {} пулов в файл {}", self.edges.len(), file_path);
 
         // 2. Подготовка данных с безопасной обработкой чисел
         let pools_dec: Vec<Value> = self.edges.values()
@@ -155,25 +179,25 @@ impl UniversalGraph {
         // 3. Создание файла
         let mut file = match File::create(file_path) {
             Ok(f) => {
-                info!("Файл {} успешно создан", file_path);
+                info!(" [ГРАФ] Файл {} успешно создан", file_path);
                 f
             },
             Err(e) => {
-                error!("Не удалось создать файл {}: {}", file_path, e);
+                error!(" [ГРАФ] Не удалось создать файл {}: {}", file_path, e);
                 return Err(e);
             }
         };
 
         // 4. Сериализация и запись с обработкой ошибок
-        info!("Начало сериализации данных...");
+        info!(" [ГРАФ] Начало сериализации данных...");
         let json_string = match serde_json::to_string_pretty(&pools_dec) {
             Ok(s) => s,
             Err(e) => {
-                error!("Ошибка сериализации: {}", e);
+                error!(" [ГРАФ] Ошибка сериализации: {}", e);
                 
                 // Попробуем сохранить хотя бы часть данных для диагностики
                 let fallback_path = "uniswap_pools_fallback.json";
-                warn!("Попытка сохранить упрощенные данные в {}", fallback_path);
+                warn!(" [ГРАФ] Попытка сохранить упрощенные данные в {}", fallback_path);
                 
                 let simplified: Vec<Value> = pools_dec.iter()
                     .map(|pool| json!({
@@ -194,14 +218,14 @@ impl UniversalGraph {
         // 5. Запись в файл
         match file.write_all(json_string.as_bytes()) {
             Ok(_) => {
-                info!("Данные успешно записаны в файл");
+                info!(" [ГРАФ] Данные успешно записаны в файл");
                 match file.sync_all() {
                     Ok(_) => {
-                        info!("Синхронизация файла завершена. Всего сохранено {} пулов", pools_dec.len());
+                        info!(" [ГРАФ] Синхронизация файла завершена. Всего сохранено {} пулов", pools_dec.len());
                         Ok(())
                     },
                     Err(e) => {
-                        error!("Ошибка синхронизации файла: {}", e);
+                        error!(" [ГРАФ] Ошибка синхронизации файла: {}", e);
                         Err(e)
                     }
                 }
@@ -212,6 +236,9 @@ impl UniversalGraph {
             }
         }
     }
+
+
+    
 }
 
 
