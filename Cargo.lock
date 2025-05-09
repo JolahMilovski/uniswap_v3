@@ -3897,6 +3897,7 @@ dependencies = [
  "dotenv",
  "env_logger",
  "ethers",
+ "ethers-contract",
  "ethers-middleware",
  "ethers-providers",
  "futures",

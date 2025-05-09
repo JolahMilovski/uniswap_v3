@@ -19,7 +19,7 @@ use env_logger::Env;
 use log::{error, info};
 use ethers::{providers::{Provider, Ws}, types::Address};
 use std::{collections::{HashMap, HashSet}, env, sync::Arc};
-use tokio::{signal, sync::Mutex};
+use tokio::sync::{oneshot, Mutex};
 use lazy_static::lazy_static;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,19 +30,19 @@ lazy_static! {
     pub static ref SYNC_END_BLOCK: AtomicU64 = AtomicU64::new(0);
 }
 
-
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
     dotenv().ok();
     
     env_logger::Builder::from_env(Env::default().default_filter_or("info"))
     .format_timestamp(None)
     .init();
 
+
     info!(" [MAIN]  Подключаемся к блокчену");
 
-    let start_block = get_env_var("START_BLOCK").parse::<u64>()?;
+    let start_block = get_env_var("START_BLOCK").parse::<u64>()?;  
 
     // Вызов асинхронной функции для создания провайдеров
     let provider: Arc<Provider<Ws>> = get_working_provider().await;
@@ -66,13 +66,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
 
 
-    // ✅ Загрузка token_list.json для фильтрации топовых токенов
+    //  ✅ Загрузка token_list.json для фильтрации топовых токенов
     let token_whitelist_set: HashSet<Address> = token::load_token_list_from_json("token_list.json").keys().cloned().collect();
-    info!("[ [MAIN] Загружено {} токенов из token_list.json", token_whitelist_set.len());
-
-    // Создаем UniversalGraph
-    let graph = Arc::new(Mutex::new(UniversalGraph::new()));
-
+    info!("[MAIN] Загружено {} токенов из token_list.json", token_whitelist_set.len());    
     let pool_cache: Arc<Mutex<UniswapPoolCache>> = Arc::new(Mutex::new(
         match UniswapPoolCache::load_from_bin("uniswap_pool_addresses_cache.bin") {
             Ok(cache) => {
@@ -86,11 +82,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     ));
 
-    let start = std::time::Instant::now();
+    
 
-   
+ // Канал для отмены
+    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+
+
+ // Инициализация подписчика
+    let subscriber = Arc::new(UniswapEventSubscriber::new(provider.clone()));
+
+    // 1. Создаем подписку с пустым фильтром для начальных пулов
+    subscriber.subscribe_to_pool_events(
+        vec![],  // Пустой список начальных пулов
+        cancel_rx,
+    ).await?;
+
+
+
+    //  Создаем UniversalGraph
+    let graph = Arc::new(Mutex::new(UniversalGraph::new()));
+
     info!("⏳[MAIN]  Синхронизация пулов начата...");
-
+    let start = std::time::Instant::now();
     // Клонируем Arc перед передачей в sync_pools
     let graph_for_sync = Arc::clone(&graph);
 
@@ -99,15 +112,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     SYNC_START_BLOCK.store(current_block, Ordering::SeqCst);
  
+    
+    
+    uniswap_v3::sync_pools(graph_for_sync, Arc::clone(&provider), &Arc::clone(&token_cache), Arc::clone(&pool_cache), &token_whitelist_set, start_block, subscriber ).await?;
 
-    uniswap_v3::sync_pools(graph_for_sync, Arc::clone(&provider), &Arc::clone(&token_cache), Arc::clone(&pool_cache), &token_whitelist_set, start_block).await?;
 
+
+    // ✅ Отменяем подписку на события после завершения sync_pools
+    if cancel_tx.send(()).is_err() {
+            error!("[MAIN] Ошибка cancel_tx.send не сработал.");
+        } else {
+            info!("[MAIN] Подписка на события успешно отменена.");
+        }
+
+
+    
 
     let end_block = provider.get_block_number().await?.as_u64();
 
     SYNC_END_BLOCK.store(end_block, Ordering::SeqCst);
     
-    info!("MAIN] Синхронизация завершена. Блоки {} - {} требуют быстрого обновления",  current_block, end_block);
+    info!("[MAIN] Синхронизация завершена. Блоки {} - {} требуют быстрого обновления",  current_block, end_block);
     
     let pool_cache_guard = pool_cache.lock().await;
 
@@ -121,34 +146,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         error!("Ошибка при сохранении кеша Uniswap в JSON: {:?}", e);
     } else {
         info!("Кеш Uniswap успешно сохранён в debug_uniswap_cache.json");
-    }
-
-
-    /**/
-    // 1. Создаем подписчика
-    let subscriber = Arc::new(UniswapEventSubscriber::new(
-        Arc::clone(&provider),
-        Arc::clone(&graph),
-    ));
-    let subscriber_clone = Arc::clone(&subscriber);
-       
-    
-    let handle = tokio::spawn(async move {
-        if let Err(e) = subscriber_clone.subscribe_to_events_for_all_pools().await {
-            error!("[MAIN] Ошибка при подписке на события: {:?}", e);
-        }
-    });
-    
-    // 2. Ожидаем сигнал на завершение (Ctrl+C)
-    tokio::select! {
-        _ = signal::ctrl_c() => {
-            info!("🚪[MAIN] Получен сигнал завершения...");
-        },
-        _ = handle => {
-            info!("[MAIN] Подписка завершена");
-        },
-    } 
-    
+    }  
+      
     let duration = start.elapsed();
     let secs = duration.as_secs();
     let minutes = secs / 60;
@@ -158,8 +157,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("[MAIN] Бот завершил сканирование пулов");
 
     Ok(())
-}
 
+}
 
 pub fn get_env_var(var_name: &str) -> String {
     env::var(var_name).unwrap_or_else(|_| panic!("[MAIN]Environment variable {} not found", var_name))

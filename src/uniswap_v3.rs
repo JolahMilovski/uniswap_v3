@@ -1,3 +1,4 @@
+use crate::uniswap_events::UniswapEventSubscriber;
 use crate::uniswap_graph::UniversalGraph;
 use crate::uniswap_graph::UniswapPool;
 use crate::token::TokenCache;
@@ -19,10 +20,9 @@ use ethers::types::{Address, U512};
 use log::warn;
 use tokio::time::sleep;
 
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use std::env;
 use std::str::FromStr;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -32,7 +32,7 @@ use tokio::task::JoinSet;
 
 use lazy_static::lazy_static;
 use indicatif::{ProgressBar, ProgressStyle};
-use log::{error, info};
+use log::info;
 use futures::{stream, StreamExt};
 
 abigen!(
@@ -171,12 +171,13 @@ abigen!(
         "type": "function"
     }]"#
 );
-
+// Функция для получения текущего блока
 pub async fn get_current_block(provider: Arc<Provider<Ws>>) -> Result<u64, Box<dyn std::error::Error>> {
     let block_number = provider.get_block_number().await?;
     Ok(block_number.as_u64())
 }
 
+// Функция для расчета текущей цены
 pub fn calculate_current_price(
     sqrt_price: U512,
     token0_decimals: u8,
@@ -209,13 +210,13 @@ pub fn calculate_current_price(
     Ok(final_price)
 }
 
-
+// Q96
 lazy_static! {
     static ref Q96: U512 = U512::from(1u128) << 96;
  }
 
 
-
+/// преобразует тик в sqrt_price_x96
 pub fn tick_to_sqrt_price(tick: i32) -> Result<U512, String> {
 
     if tick < -887272 || tick > 887272 {
@@ -296,8 +297,7 @@ pub fn tick_to_sqrt_price(tick: i32) -> Result<U512, String> {
     }
     
 
-    /// Получаем активные тики из пула Uniswap V3
-    
+/// Получаем активные тики из пула Uniswap V3  
 pub async fn fetch_active_ticks(
     pool_address: Address,
     client: Arc<Provider<Ws>>,
@@ -312,10 +312,10 @@ pub async fn fetch_active_ticks(
 
     // Параметры батчинга по fee
     let (total_batches, words_per_batch) = match fee {
-        100 => (100, 10),
-        500 => (100, 3),
-        3000 => (30, 2),
-        10_000 => (2, 10),
+        100 => (80, 20),
+        500 => (50, 20),
+        3000 => (10, 6),
+        10_000 => (2, 20),
         _ => (10, 5), // дефолт
     };
 
@@ -332,6 +332,7 @@ pub async fn fetch_active_ticks(
             let mut ticks = HashMap::new();
             if let Ok(list) = tick_lens.get_populated_ticks_in_word(pool_address, current_word.try_into().unwrap()).call().await {
                 for tick in list {
+                  sleep(std::time::Duration::from_millis(100)).await;
                     if let Ok(price) = tick_to_sqrt_price(tick.tick) {
                         ticks.insert(tick.tick, (tick.liquidity_net, price));
                     }
@@ -350,10 +351,11 @@ pub async fn fetch_active_ticks(
         set.spawn(async move {
             let mut ticks = HashMap::new();
             for i in 0..words_per_batch {
+                sleep(std::time::Duration::from_millis(100)).await;
                 let word = base_word - (i as i32);
                 if let Ok(list) = tick_lens.get_populated_ticks_in_word(pool_address, word.try_into().unwrap()).call().await {
                     let mut count = 0;
-                    for tick in list {
+                    for tick in list {                        
                         if let Ok(price) = tick_to_sqrt_price(tick.tick) {
                             ticks.insert(tick.tick, (tick.liquidity_net, price));
                             count += 1;
@@ -375,6 +377,7 @@ pub async fn fetch_active_ticks(
         set.spawn(async move {
             let mut ticks = HashMap::new();
             for i in 0..words_per_batch {
+                sleep(std::time::Duration::from_millis(100)).await;
                 let word = base_word + (i as i32);
                 if let Ok(list) = tick_lens.get_populated_ticks_in_word(pool_address, word.try_into().unwrap()).call().await {
                     let mut count = 0;
@@ -413,8 +416,11 @@ pub async fn fetch_active_ticks(
     }
 
     Ok(all_ticks)
+
+
+
 }
-   
+
 pub async fn sync_pools(
     graph: Arc<Mutex<UniversalGraph>>,
     provider: Arc<Provider<Ws>>,
@@ -422,25 +428,17 @@ pub async fn sync_pools(
     pool_cache: Arc<Mutex<UniswapPoolCache>>,
     token_whitelist: &HashSet<Address>,
     start_block_from_env: u64,
+    event_subscriber: Arc<UniswapEventSubscriber>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-
-    // Объект для сбора готовых UniswapPool
-    let pools_to_process = Arc::new(Mutex::new(Vec::new()));
-   
-    // === Фаза 1: обрабатываем адреса из кэша ==========================================================================================================================================================
+    // === Фаза 1: обработка пулов из кэша ===
     let (original_addresses, original_count) = {
         let pool_cache_lock = pool_cache.lock().await;
-        let addresses: Vec<Address> = pool_cache_lock.pool_addresses.iter().cloned().collect();
-        let count = addresses.len();
-        (addresses, count)
+        (pool_cache_lock.pool_addresses.clone(), pool_cache_lock.pool_addresses.len())
     };
 
-    // Новое сообщение: сколько пулов будет обработано из кэша
-    info!(
-        "[КЭШ] Начинаем обработку {} пулов из кэша (фаза 1)", 
-        original_count
-    );
+    info!("[КЭШ] Начинаем обработку {} пулов из кэша", original_count);
 
+    let phase1_active_count = Arc::new(AtomicUsize::new(0));
     let progress = ProgressBar::new(original_count as u64);
     progress.set_style(
         ProgressStyle::default_bar()
@@ -450,72 +448,58 @@ pub async fn sync_pools(
     );
 
     stream::iter(original_addresses)
-        .for_each_concurrent(1, |addr| {
-            let provider = provider.clone();
-            let token_cache = Arc::clone(&token_cache);
-            let pools_to_process = Arc::clone(&pools_to_process);
-            let progress = progress.clone();
-            let whitelist = token_whitelist.clone();
+    .for_each_concurrent(1, |addr| {
+        let provider = provider.clone();
+        let token_cache = Arc::clone(&token_cache);
+        let graph = Arc::clone(&graph);
+        let progress = progress.clone();
+        let phase1_active_count = phase1_active_count.clone();
+        let token_whitelist = token_whitelist.clone();
 
-            async move {
-                let mut temp_cache = UniswapPoolCache::new();
-                temp_cache.add_pool_address(addr);
-                
-                match build_uniswap_v3_pool(
-                    PoolSource::Address(addr),
-                    provider.clone(),
-                    &token_cache,
-                    &mut temp_cache,
-                    &whitelist,
-                ).await {
-                    Some(pool) => {
+        let event_subscriber = Arc::clone(&event_subscriber);
+
+        async move {
+            let pool_contract = UniswapV3Pool::new(addr, provider.clone());
+
+            let token0_call = pool_contract.token_0();
+            let token1_call = pool_contract.token_1();
+
+            match tokio::try_join!(
+                token0_call.call(),
+                token1_call.call()                                                                      
+                ) {
+                Ok((token0, token1)) if token_whitelist.contains(&token0) && token_whitelist.contains(&token1) => {
+                    info!("[КЭШ] Пул {:?} проходит whitelist: {:?} ↔ {:?}", addr, token0, token1);
+
+                    let _ = event_subscriber.add_pools_to_subscription(vec![addr]).await;
+                   
+                    if let Some(pool) = build_uniswap_v3_pool(
+                        addr,
+                        (token0, token1),
+                        provider.clone(),
+                        &token_cache,
+                    ).await {
                         if pool.is_active {
-                            pools_to_process.lock().await.push(pool);
-                            info!("[КЭШ] Пул из кеша добавлен в граф: {:?}", addr);
-                        } else {
-                            info!("[КЭШ] Пул из кеша неактивен: {:?}", addr);
+                            graph.lock().await.upsert_pool(pool.clone());
+
+                            event_subscriber.update_graph(graph.clone(), addr).await;
+
+                            phase1_active_count.fetch_add(1, Ordering::SeqCst);                       
                         }
                     }
-                    None => {
-                        warn!("[КЭШ] Пул из кеша не прошел проверку: {:?}", addr);
-                    }
-                }
-                progress.inc(1);
+                },
+                Ok(_) => info!("[КЭШ] Пул {:?} отфильтрован по whitelist", addr),
+
+                Err(e) => warn!("[КЭШ] Ошибка проверки токенов пула {:?}: {:?}", addr, e),
             }
-        })
-        .await;
+            progress.inc(1);
+        }
+    }).await;
+
     progress.finish_with_message("[КЭШ]✅ Пулы из кеша обработаны");
 
-    // Добавляем пулы из кэша в граф и выводим информацию
-    let cached_pools_count = {
-        let mut graph_lock = graph.lock().await;
-        let list = pools_to_process.lock().await;
-        
-        let mut active_count = 0;
-        for uni_pool in list.iter() {
-            if uni_pool.is_active {
-                graph_lock.upsert_pool(uni_pool.clone());
-                active_count += 1;
-            }
-        }
-        
-        info!(
-            "[ГРАФ] Загружено {} активных пулов из кэша (всего в графе: {})", 
-            active_count, 
-            graph_lock.edges.len()
-        );
-        active_count
-    };
+    // === Фаза 2: обработка новых пулов с фабрики ===========================================================================================================================
 
-    info!(
-        "[КЭШ] Обработано {} пулов из кэша ({} активных добавлено в граф)", 
-        original_count,
-        cached_pools_count
-    );
-
-    sleep(Duration::from_millis(2000)).await;
-
-    // === Фаза 2: сканируем новые пулы с фабрики =============================================================================================================================================================
     let (factory_address, start_block) = {
         let pool_cache_lock = pool_cache.lock().await;
         let factory_address: Address = get_env_var("UNISWAP_V3_FACTORY").parse()?;
@@ -527,282 +511,111 @@ pub async fn sync_pools(
         (factory_address, start_block_in)
     };
 
-    info!("[СИНХРОНИЗАЦИЯ] Новые пулы с блока {}", start_block);
+    info!("[СИНХРОНИЗАЦИЯ] Сканируем новые пулы с блока {}", start_block);
     let dex = Dex::UniswapV3(UniswapV3Dex::new(factory_address, BlockNumber::Number(start_block.into())));
     let all_new = sync_pairs(vec![dex], provider.clone(), None).await?;
-    
-    let to_check: Vec<_> = {
-        let pool_cache_lock = pool_cache.lock().await;
-        all_new.into_iter()
-            .filter(|p| !pool_cache_lock.pool_addresses.contains(&p.address()))
-            .collect()
-    };
 
-    let progress2 = ProgressBar::new(to_check.len() as u64);
-    progress2.set_style(
-        ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] [{bar:40.black/pink}] {pos}/{len} новых")
-            .unwrap()
-            .progress_chars("=>-"),
-    );
+    let progress2 = ProgressBar::new(all_new.len() as u64);
+    let phase2_active_count = Arc::new(AtomicUsize::new(0));
 
-    let new_pools = Arc::new(Mutex::new(Vec::new()));
-    let new_pools_for_graph = Arc::new(Mutex::new(Vec::new()));
+    stream::iter(all_new)
+    .for_each_concurrent(10, |pool| {
+        let provider = provider.clone();
+        let token_cache = Arc::clone(&token_cache);
+        let pool_cache = Arc::clone(&pool_cache);
+        let graph = Arc::clone(&graph);
+        let progress = progress2.clone();
+        let phase2_active_count = phase2_active_count.clone();
+        let token_whitelist = token_whitelist.clone();
+        let event_subscriber = Arc::clone(&event_subscriber);
 
-    stream::iter(to_check)
-        .for_each_concurrent(1, |pool| {
-            let provider = provider.clone();
-            let token_cache = Arc::clone(&token_cache);
-            let pool_cache = Arc::clone(&pool_cache);
-            let new_pools = Arc::clone(&new_pools);
-            let new_pools_for_graph = Arc::clone(&new_pools_for_graph);
-            let progress = progress2.clone();
-            let whitelist = token_whitelist.clone();
+        async move {
+            let addr = pool.address();
+            let pool_contract = UniswapV3Pool::new(addr, provider.clone());
+            
+            let token0_call = pool_contract.token_0();
+            let token1_call = pool_contract.token_1();
+            
+            match tokio::try_join!(
+                token0_call.call(),
+                token1_call.call()
+            ) {
+                Ok((token0, token1)) if token_whitelist.contains(&token0) && token_whitelist.contains(&token1) => {
+                    info!("[СИНХРОНИЗАЦИЯ] Новый пул {:?} проходит whitelist: {:?} ↔ {:?}", addr, token0, token1);
 
-            async move {
-                let addr = pool.address();
-                let mut pc = pool_cache.lock().await;
-                if let Some(p) = build_uniswap_v3_pool(
-                    PoolSource::Pool(pool.clone()),
-                    provider.clone(),
-                    &token_cache,
-                    &mut pc,
-                    &whitelist,
-                ).await {
-                    if p.is_active {
-                        pc.add_pool_address(addr);
-                        new_pools.lock().await.push(addr);
-                        new_pools_for_graph.lock().await.push(p);
-                        info!("[СИНХРОНИЗАЦИЯ] Добавлен пул: {:?}", addr);
-                    } else {
-                        info!("[СИНХРОНИЗАЦИЯ] Пул неактивен: {:?}", addr);
+                    let _ = event_subscriber.add_pools_to_subscription(vec![addr]).await;
+                    
+                    let mut pool_cache_look = pool_cache.lock().await;
+                    if let Some(pool) = build_uniswap_v3_pool(
+                        addr,
+                        (token0, token1),
+                        provider.clone(),
+                        &token_cache,
+                        ).await {
+                            if pool.is_active {
+                                pool_cache_look.add_pool_address(addr);
+                                graph.lock().await.upsert_pool(pool.clone());
+                                phase2_active_count.fetch_add(1, Ordering::SeqCst);
+                                event_subscriber.update_graph(graph.clone(), addr).await;
+                        }
                     }
-                } else {
-                    warn!("[СИНХРОНИЗАЦМЯ] Пул отброшен (не входит в whitelist или провалил build): {:?}", addr);
-                }
-                progress.inc(1);
+                },
+                Ok(_) => info!("[СИНХРОНИЗАЦИЯ] Пропуск нового пула {:?}: токены не в whitelist", addr),
+                Err(e) => warn!("[СИНХРОНИЗАЦИЯ] Ошибка проверки токенов пула {:?}: {:?}", addr, e),
             }
-        })
-        .await;
+            progress.inc(1);
+        }
+    }).await;
 
     progress2.finish_with_message("[СИНХРОНИЗАЦИЯ]✅ Новые пулы обработаны");
 
-    // Добавляем новые пулы в граф
-    {
-        let mut graph_lock = graph.lock().await;
-        let list = new_pools_for_graph.lock().await;
-        
-        for uni_pool in list.iter() {
-            graph_lock.upsert_pool(uni_pool.clone());
-        }
-        
-        info!("[ГРАФ] После фазы 2 (новые пулы): {} пулов в графе", graph_lock.edges.len());
-    }
+    // Итоговая статистика
+    info!(
+        "[ИТОГ] Обработано: {} пулов из кэша, {} новых пулов",
+        phase1_active_count.load(Ordering::SeqCst),
+        phase2_active_count.load(Ordering::SeqCst)
+    );
 
-    // Обновляем кэш пулов
-    {
-        let new_pools_count = new_pools.lock().await.len();
-
-        if new_pools_count > 0 {
-            let current_block = get_current_block(provider.clone()).await.unwrap_or(0);
-            let new_pools_set: HashSet<Address> = new_pools.lock().await.iter().cloned().collect();
-            
-            let mut pool_cache_lock = pool_cache.lock().await;
-            if let Err(e) = pool_cache_lock.update_with_new_pools(&new_pools_set, current_block) {
-                error!("[КЭШ]Ошибка обновления КЭША в sunc_pool после фазы сбора данных с блокчейна (2): {:?}", e);
-            }           
-            
-            if let Err(e) = pool_cache_lock.save_to_bin("uniswap_pool_addresses_cache.bin") {
-                error!("[КЭШ]Ошибка обновления КЭША в sync_pool: {:?}", e);
-            }
-            
-            if let Err(e) = pool_cache_lock.save_to_json("uniswap_pool_addresses_cache_debug.json") {
-                error!("[КЭШ] Ошибка сохранения debug JSON: {:?}", e);
-            }
-        }
-    }
-
-
-    // Сохраняем граф
-    {
-        let graph_lock = graph.lock().await;
-        match (&graph_lock).save_pool_to_file() {
-            Ok(_) => {
-                info!("✅[ГРАФ] Граф сохранён. Всего пулов: {}", graph_lock.edges.len());
-                Ok(())
-            },
-            Err(e) => {
-                error!("❌ [ГРАФ] Ошибка сохранения графа: {:?}", e);
-                Err(Box::new(e))
-            }
-        }
-    }
+    Ok(())
 }
 
 
-pub enum PoolSource {
-    Address(H160),
-    Pool(CfmmsPool)   
-}
-
-pub async fn process_pool_data(
-    pool_address: H160,
-    pool_contract: &UniswapV3Pool<Provider<Ws>>,
-    provider: Arc<Provider<Ws>>,
-) -> Option<(
-    U512,                              // liquidity
-    (ethers::types::U256, i32, u16, u16, u16, u8, bool), // slot0_result
-    i32,                              // tick_spacing
-    u128,                             // max_liquidity
-    u32,                              // fee
-    HashMap<i32, (i128, U512)>,       // tick_map
-)> {
-    // Store intermediate values
-    let liquidity = pool_contract.liquidity();
-    let slot0 = pool_contract.slot_0();
-    let tick_spacing = pool_contract.tick_spacing();
-    let max_liquidity = pool_contract.max_liquidity_per_tick();
-    let fee = pool_contract.fee();
-
-    // Create calls
-    let liquidity_call = liquidity.call();
-    let slot0_call = slot0.call();
-    let tick_spacing_call = tick_spacing.call();
-    let max_liquidity_call = max_liquidity.call();
-    let fee_call = fee.call();
-
-    // Execute all calls in parallel
-    let (
-        liquidity_result,
-        slot0_result,
-        tick_spacing_result,
-        max_liquidity_result,
-        fee_result
-    ) = tokio::try_join!(
-        liquidity_call,
-        slot0_call,
-        tick_spacing_call,
-        max_liquidity_call,
-        fee_call
-    ).ok()?;
-
-    let liquidity = U512::from(liquidity_result);
-    if liquidity.is_zero()
-    {
-        info!("[СИНХРОНИЗАЦИЯ] Пул {:?} пропущен: нулевая ликвидность", pool_address);
-        return None;
-    }
-   
-
-    // Параллельное получение информации о тиках
-    let tick_map = fetch_active_ticks(pool_address, provider.clone(), slot0_result.1, fee_result).await.ok()?;
-
-    Some((
-        liquidity,
-        slot0_result,
-        tick_spacing_result,
-        max_liquidity_result,
-        fee_result,
-        tick_map,
-    ))
-}
 
 pub async fn build_uniswap_v3_pool(
-    source: PoolSource,
+    pool_address: Address,
+    tokens: (Address, Address),
     provider: Arc<Provider<Ws>>,
     token_cache: &TokenCache,
-    pool_cache: &mut UniswapPoolCache,
-    token_whitelist: &HashSet<Address>,
 ) -> Option<UniswapPool> {
-    // 1. Получаем адрес пула в зависимости от источника
-    let pool_address = match source {
-        PoolSource::Address(addr) => {
-            info!("[БИЛДЕР]Проверяем пул из кэша: {:?}", addr);
-            if !pool_cache.pool_addresses.contains(&addr) {
-                error!("Адрес {:?} не найден в кэше", addr);
-                return None;
-            }
-            addr
-        },
-        PoolSource::Pool(pool) => {
-            info!("[БИЛДЕР]Проверяем новый пул: {:?}", pool.address());
-            pool.address()
-        }
-    };
+    let (token_a, token_b) = tokens;
 
-    // 2. Проверяем существование контракта
-    let code = provider.get_code(pool_address, None).await.ok()?;
-    if code.is_empty() {
-        error!("[БИЛДЕР]Контракт по адресу {:?} пустой", pool_address);
-        return None;
-    }
-
-    // 3. Создаем контракт и получаем адреса токенов
-    let pool_contract = UniswapV3Pool::new(pool_address, provider.clone());
-    
-    let token_0_call = pool_contract.token_0();
-    let token_1_call = pool_contract.token_1();
-
-    let (token_a, token_b) = tokio::try_join!(
-        token_0_call.call(),
-        token_1_call.call()
-    ).ok()?;
-
-    match source {
-        PoolSource::Address(_) => {
-            if !token_whitelist.contains(&token_a) || !token_whitelist.contains(&token_b) {
-                info!(
-                    "[БИЛДЕР]⚠️ Пул {:?} отфильтрован: токены не в whitelist: token0 = {:?}, token1 = {:?}",
-                    pool_address, token_a, token_b
-                );
-                return None;
-            }
-        },
-        PoolSource::Pool(_) => {
-            if !token_whitelist.contains(&token_a) || !token_whitelist.contains(&token_b) {
-                info!(
-                    "[БИЛДЕР]⚠️ Пул {:?} отфильтрован: токены не в whitelist: token0 = {:?}, token1 = {:?}",
-                    pool_address, token_a, token_b
-                );
-                return None;
-            }
-        }
-    }
-
-    // 5. Получаем базовую информацию о токенах
+    // Получаем данные токенов
     let (token_a_info, token_b_info) = tokio::try_join!(
         get_single_token_data(token_a, provider.clone(), token_cache),
         get_single_token_data(token_b, provider.clone(), token_cache)
     ).ok()?;
 
-    // 6. Получаем остальные данные пула через process_pool_data
+    // Получаем данные пула
+    let pool_contract = UniswapV3Pool::new(pool_address, provider.clone());
     let (
         liquidity,
         slot0_result,
         tick_spacing,
         max_liquidity_per_tick,
         fee,
-        tick_map
-    ) = process_pool_data(
-        pool_address,
-        &pool_contract,
-        provider.clone(),
-    ).await?;
+    ) = process_pool_data(pool_address, &pool_contract).await?;
 
-    // 7. Извлекаем и обрабатываем данные из slot0
     let (sqrt_price_x96, tick, _, _, _, _, _) = slot0_result;
     let sqrt_price = U512::from_str(&sqrt_price_x96.to_string()).unwrap_or_default();
 
-    // 8. Вычисляем текущую цену
     let current_price = calculate_current_price(
         sqrt_price,
         token_a_info.decimals,
         token_b_info.decimals
     ).ok()?;
 
-    let is_active = !liquidity.is_zero() && liquidity > U512::from(10_000) && !sqrt_price.is_zero() && current_price > U512::from(10_000);
+    let tick_map = fetch_active_ticks(pool_address, provider.clone(), slot0_result.1, fee).await.ok()?;
 
-    // 9. Формируем финальный объект пула
     Some(UniswapPool {
         uniswap_pool_address: pool_address,
         uniswap_dex: "uniswap_v3".to_string(),
@@ -821,8 +634,170 @@ pub async fn build_uniswap_v3_pool(
         uniswap_tick_spacing: tick_spacing,
         uniswap_max_liquidity_per_tick: U512::from(max_liquidity_per_tick),
         uniswap_fee_tier: fee,
-        tick_map: tick_map,
-        is_active: is_active,
+        tick_map,
+        is_active: true,
     })
 }
+
+/// Источник пула, который может быть как адресом, так и уже готовым объектом пула
+pub enum PoolSource {
+    /// Адрес пула
+    Address(H160),
+    /// Готовый объект пула
+    Pool(CfmmsPool)   
+}
+
+/// Асинхронно запрашивает и возвращает `tick_spacing` для данного пула
+pub async fn fetch_tick_spacing(
+    pool_address: H160,
+    provider: Arc<Provider<Ws>>,
+) -> Option<i32> {
+    // Создаём client-контракт пула
+    let pool_contract = UniswapV3Pool::new(pool_address, provider.clone());
+    // Делаем вызов метода `tick_spacing` и возвращаем результат, если Ok
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    pool_contract.tick_spacing().call().await.ok()
+}
+/// Асинхронно запрашивает и возвращает `liquidity` для данного пула
+/// liquidity - это общее количество ликвидности, которое присвоено пулу
+pub async fn fetch_pool_liquidity(pool_contract: &UniswapV3Pool<Provider<Ws>>,) -> Option<U512> {
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    pool_contract.liquidity().call().await.ok().map(U512::from)
+}
+
+/// Асинхронно запрашивает и возвращает `slot_0` для данного пула
+/// slot_0 - это структурное поле, которое хранит текущие значения
+/// sqrt_price, tick, observation_index, observation_cardinality, observation_cardinality_next, fee_protocol, unlocked
+pub async fn fetch_pool_slot0(pool_contract: &UniswapV3Pool<Provider<Ws>>,
+) -> Option<(ethers::types::U256, i32, u16, u16, u16, u8, bool)> {
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    pool_contract.slot_0().call().await.ok()
+}
+
+/// Асинхронно запрашивает и возвращает `tick_spacing` для данного пула
+/// tick_spacing - это шаг, на который тик-интервалы (range) разделяются
+pub async fn fetch_pool_tick_spacing(pool_contract: &UniswapV3Pool<Provider<Ws>>,
+) -> Option<i32> {
+    pool_contract.tick_spacing().call().await.ok()
+}
+
+/// Асинхронно запрашивает и возвращает `max_liquidity_per_tick` для данного пула
+/// max_liquidity_per_tick - это максимальное значение ликвидности, которое может быть
+/// присвоено отдельному тик-интервалу.
+pub async fn fetch_pool_max_liquidity(pool_contract: &UniswapV3Pool<Provider<Ws>>,
+) -> Option<u128> {
+    pool_contract.max_liquidity_per_tick().call().await.ok()
+}
+
+/// Асинхронно запрашивает и возвращает `fee` для данного пула
+///
+/// `fee` - это комиссия, которая берется за обмен токенов в пуле.
+/// Величина комиссии измеряется в 1/10000 от 1% (то есть 0.01%).
+pub async fn fetch_pool_fee(pool_contract: &UniswapV3Pool<Provider<Ws>>,) -> Option<u32> {
+    pool_contract.fee().call().await.ok()
+}
+
+
+
+/// Асинхронно обрабатывает данные о пуле
+///
+/// Получает: liquidity, slot0_result, tick_spacing, max_liquidity_per_tick, fee
+///
+/// slot0_result - это структурное поле, которое хранит текущие значения
+/// sqrt_price, tick, observation_index, observation_cardinality, observation_cardinality_next, fee_protocol, unlocked
+///
+/// tick_spacing - это шаг, на который тик-интервалы (range) разделяются
+///
+/// max_liquidity_per_tick - это максимальное значение ликвидности, которое может быть
+/// присвоено отдельному тик-интервалу.
+///
+/// fee - это комиссия, которая берется за обмен токенов в пуле.
+/// Величина комиссии измеряется в 1/10000 от 1% (то есть 0.01%).
+///
+/// Если ликвидность пула меньше 10_000, то функция возвращает None.
+///
+pub async fn process_pool_data(
+    pool_address: H160,
+    pool_contract: &UniswapV3Pool<Provider<Ws>>,
+) -> Option<(
+    U512,                              // liquidity
+    (ethers::types::U256, i32, u16, u16, u16, u8, bool), // slot0_result
+    i32,                              // tick_spacing
+    u128,                             // max_liquidity
+    u32,                              // fee
+)> {
+    // Execute all calls in parallel
+    let (
+        liquidity_option,
+        slot0_option,
+        tick_spacing_option,
+        max_liquidity_option,
+        fee_option
+    ) = tokio::join!(
+        async { fetch_pool_liquidity(pool_contract) }, 
+        async { fetch_pool_slot0(pool_contract) },     
+        async { fetch_pool_tick_spacing(pool_contract) }, 
+        async { fetch_pool_max_liquidity(pool_contract) }, 
+        async { fetch_pool_fee(pool_contract) }        
+    );
+
+    let actual_liquidity = match liquidity_option.await {
+        Some(liq) => {
+            if liq < U512::from(10_000) {
+                info!("[СИНХРОНИЗАЦИЯ] Пул {:?} пропущен: низкая ликвидность ({:?})", pool_address, liq);
+            return None;
+        }
+            liq
+        }
+        None => {
+            info!("[СИНХРОНИЗАЦИЯ] Пул {:?} пропущен: не удалось получить ликвидность", pool_address);
+return None;
+        }
+    };
+
+    let actual_slot0 = match slot0_option.await {
+        Some(s0) => s0,
+        None => {
+            info!("[СИНХРОНИЗАЦИЯ] Пул {:?} пропущен: не удалось получить slot0", pool_address);
+            return None;
+        }
+    };
+
+    let actual_tick_spacing = match tick_spacing_option.await {
+        Some(ts) => ts,
+        None => {
+            info!("[СИНХРОНИЗАЦИЯ] Пул {:?} пропущен: не удалось получить tick_spacing", pool_address);
+            return None;
+        }
+    };
+
+    let actual_max_liquidity = match max_liquidity_option.await {
+        Some(ml) => ml,
+        None => {
+            info!("[СИНХРОНИЗАЦИЯ] Пул {:?} пропущен: не удалось получить max_liquidity", pool_address);
+            return None;
+        }
+    };
+
+    let actual_fee = match fee_option.await {
+        
+        Some(feee) => feee,
+        None => {
+            info!("[СИНХРОНИЗАЦИЯ] Пул {:?} пропущен: не удалось получить fee", pool_address);
+            return None;
+        }
+    };
+
+    // Параллельное получение информации о тиках
+
+    Some((
+        actual_liquidity,
+        actual_slot0,
+        actual_tick_spacing,
+        actual_max_liquidity,
+        actual_fee,
+    ))
+    
+}
+
 

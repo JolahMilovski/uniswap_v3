@@ -13,6 +13,7 @@ dotenv = "0.15.0"
 tokio = { version = "1.44", features = ["full"] }
 ethers-middleware = "2.0.14"
 ethers-providers = "2.0.14"
+ethers-contract = "2.0.14"
 ethers ="2.0.14"
 cfmms = "0.6.2"
 lazy_static = "1.4"

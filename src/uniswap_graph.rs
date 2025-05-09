@@ -2,10 +2,12 @@ use ethers::types::{Address, U512};
 use std::{collections::HashMap, io::Write};
 use std::fs::File;
 use serde::{Deserialize, Serialize};
-use std::io::{Error, ErrorKind};
+use std::io::{self, Error, ErrorKind, Read};
 use serde_json::{json, Value};
 use log::{debug, error, info, warn};
 
+
+#[derive(Serialize,Clone,Debug,Deserialize )]
 pub struct UniversalGraph {
     pub nodes: HashMap<Address, u8>, // Хранит адреса токенов и их decimal
     pub edges: HashMap<Address, UniswapPool>, // Хранит пулы по их адресу
@@ -103,6 +105,15 @@ impl UniversalGraph {
         );        
     }
 
+    pub fn load_from_bin(path: &str) -> io::Result<Self> {
+        let mut file = File::open(path)?;
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer)?;
+        
+        bincode::deserialize(&buffer)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    }
+
     /// Обновляет или добавляет пул в граф
     pub fn upsert_pool(&mut self, new_pool: UniswapPool) {
         // Обновляем информацию о токенах
@@ -125,6 +136,21 @@ impl UniversalGraph {
                 self.edges.insert(new_pool.uniswap_pool_address, new_pool);                
             }
         }
+    }
+    pub fn save_to_bin(&self, path: &str) -> io::Result<()> {
+        let serialized = bincode::serialize(self)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let mut file = File::create(path)?;
+        file.write_all(&serialized)?;
+        Ok(())
+    }
+
+    pub fn save_to_bin_json(&self, path: &str) -> std::io::Result<()> {
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let mut file = File::create(path)?;
+        file.write_all(json.as_bytes())?;
+        Ok(())
     }
 
     pub fn save_pool_to_file(&self) -> std::io::Result<()> {
