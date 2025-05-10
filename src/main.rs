@@ -6,7 +6,10 @@ pub mod uniswap_events;
 pub mod provider;
 
 use ethers_providers::Middleware;
-use provider::get_working_provider;
+use ethers::types::Address;
+
+use provider::ProviderManager;
+
 use uniswap_cache::UniswapPoolCache;
 use uniswap_events::UniswapEventSubscriber;
 use uniswap_graph::UniversalGraph;
@@ -17,7 +20,6 @@ use token::load_token_cache;
 use dotenv::dotenv;
 use env_logger::Env;
 use log::{error, info};
-use ethers::{providers::{Provider, Ws}, types::Address};
 use std::{collections::{HashMap, HashSet}, env, sync::Arc};
 use tokio::sync::{oneshot, Mutex};
 use lazy_static::lazy_static;
@@ -42,12 +44,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!(" [MAIN]  Подключаемся к блокчену");
 
+    let provider_manager = ProviderManager::new().await;
+
+    // Получение WS провайдера
+    let provider_ws = match provider_manager.get_ws_provider().await {
+        Some(p) => p,
+        None => {
+            error!(" [MAIN] Не удалось получить рабочий WebSocket провайдер");
+            return Err("WebSocket провайдер не доступен".into());
+        }
+    };
+
+    // Получение HTTP провайдера
+    let provider_http = match provider_manager.get_http_provider().await {
+        Some(p) => p,
+        None => {
+            error!(" [MAIN] Не удалось получить рабочий HTTP провайдер");
+            return Err("HTTP провайдер не доступен".into());
+        }
+    };
+
+
+
+
     let start_block = get_env_var("START_BLOCK").parse::<u64>()?;  
 
-    // Вызов асинхронной функции для создания провайдеров
-    let provider: Arc<Provider<Ws>> = get_working_provider().await;
+ 
 
-    info!(" [MAIN]  Подключились через алхимиеские врата");
 
     // ⛓ Инициализация токен-кэша
     type TokenCache = Arc<Mutex<HashMap<Address, TokenInfo>>>;
@@ -89,7 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 
  // Инициализация подписчика
-    let subscriber = Arc::new(UniswapEventSubscriber::new(provider.clone()));
+    let subscriber = Arc::new(UniswapEventSubscriber::new(provider_ws.clone()));
 
     // 1. Создаем подписку с пустым фильтром для начальных пулов
     subscriber.subscribe_to_pool_events(
@@ -108,13 +131,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let graph_for_sync = Arc::clone(&graph);
 
         // Записываем начальный блок синхронизации
-    let current_block = provider.get_block_number().await?.as_u64();
+    let current_block = provider_ws.get_block_number().await?.as_u64();
 
     SYNC_START_BLOCK.store(current_block, Ordering::SeqCst);
  
     
     
-    uniswap_v3::sync_pools(graph_for_sync, Arc::clone(&provider), &Arc::clone(&token_cache), Arc::clone(&pool_cache), &token_whitelist_set, start_block, subscriber ).await?;
+    uniswap_v3::sync_pools(graph_for_sync, Arc::clone(&provider_ws), &Arc::clone(&token_cache), Arc::clone(&pool_cache), &token_whitelist_set, start_block, subscriber ).await?;
 
 
 
@@ -128,7 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     
 
-    let end_block = provider.get_block_number().await?.as_u64();
+    let end_block = provider_ws.get_block_number().await?.as_u64();
 
     SYNC_END_BLOCK.store(end_block, Ordering::SeqCst);
     

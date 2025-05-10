@@ -171,13 +171,13 @@ abigen!(
         "type": "function"
     }]"#
 );
-// Функция для получения текущего блока
+/// Функция для получения текущего блока
 pub async fn get_current_block(provider: Arc<Provider<Ws>>) -> Result<u64, Box<dyn std::error::Error>> {
     let block_number = provider.get_block_number().await?;
     Ok(block_number.as_u64())
 }
 
-// Функция для расчета текущей цены
+/// Функция для расчета текущей цены
 pub fn calculate_current_price(
     sqrt_price: U512,
     token0_decimals: u8,
