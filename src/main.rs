@@ -5,9 +5,6 @@ pub mod uniswap_cache;
 pub mod uniswap_events;
 pub mod provider;
 
-use ethers_providers::Middleware;
-use ethers::types::Address;
-
 use provider::ProviderManager;
 
 use uniswap_cache::UniswapPoolCache;
@@ -17,14 +14,15 @@ use uniswap_graph::UniversalGraph;
 use crate::token::TokenInfo;
 use token::load_token_cache;
 
+use ethers::types::Address;
 use dotenv::dotenv;
 use env_logger::Env;
 use log::{error, info};
 use std::{collections::{HashMap, HashSet}, env, sync::Arc};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::Mutex;
 use lazy_static::lazy_static;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 lazy_static! {
     // Глобальные переменные для отслеживания диапазона блоков
@@ -35,8 +33,11 @@ lazy_static! {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
+
+    //подключаем .ENV
     dotenv().ok();
     
+    //подключаем логирование
     env_logger::Builder::from_env(Env::default().default_filter_or("info"))
     .format_timestamp(None)
     .init();
@@ -44,6 +45,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!(" [MAIN]  Подключаемся к блокчену");
 
+
+    //создали менеджера провайдеров
     let provider_manager = ProviderManager::new().await;
 
     // Получение WS провайдера
@@ -65,16 +68,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
 
-
-
     let start_block = get_env_var("START_BLOCK").parse::<u64>()?;  
-
- 
-
-
+  
+    
+    
     // ⛓ Инициализация токен-кэша
     type TokenCache = Arc<Mutex<HashMap<Address, TokenInfo>>>;
-
+    
     let token_cache: TokenCache = Arc::new(Mutex::new(
         match load_token_cache().await {
             Some(cache) => {
@@ -89,9 +89,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
 
 
+    
+    
     //  ✅ Загрузка token_list.json для фильтрации топовых токенов
     let token_whitelist_set: HashSet<Address> = token::load_token_list_from_json("token_list.json").keys().cloned().collect();
+
     info!("[MAIN] Загружено {} токенов из token_list.json", token_whitelist_set.len());    
+
     let pool_cache: Arc<Mutex<UniswapPoolCache>> = Arc::new(Mutex::new(
         match UniswapPoolCache::load_from_bin("uniswap_pool_addresses_cache.bin") {
             Ok(cache) => {
@@ -104,63 +108,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     ));
-
-    
-
- // Канал для отмены
-    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-
-
- // Инициализация подписчика
-    let subscriber = Arc::new(UniswapEventSubscriber::new(provider_ws.clone()));
-
-    // 1. Создаем подписку с пустым фильтром для начальных пулов
-    subscriber.subscribe_to_pool_events(
-        vec![],  // Пустой список начальных пулов
-        cancel_rx,
-    ).await?;
-
-
-
+              
     //  Создаем UniversalGraph
     let graph = Arc::new(Mutex::new(UniversalGraph::new()));
-
+    
     info!("⏳[MAIN]  Синхронизация пулов начата...");
     let start = std::time::Instant::now();
+
     // Клонируем Arc перед передачей в sync_pools
     let graph_for_sync = Arc::clone(&graph);
-
-        // Записываем начальный блок синхронизации
-    let current_block = provider_ws.get_block_number().await?.as_u64();
-
-    SYNC_START_BLOCK.store(current_block, Ordering::SeqCst);
- 
     
     
+    
+    info!("⏳[MAIN]  Создание подписчика на блоки...");
+
+    //создание подписчика на блоки
+    let block_subscriber = Arc::clone(&provider_ws);
+    tokio::spawn(async move {
+        if let Err(e) = UniswapEventSubscriber::subscribe_to_new_blocks(block_subscriber).await {
+            error!("Ошибка в подписке на блоки: {}", e);
+        }
+    });
+
+
+    // Инициализация подписчика
+    let subscriber = Arc::new(UniswapEventSubscriber::new(provider_http.clone()));
+
+    //запускаем синхронизацию UNISWAP
     uniswap_v3::sync_pools(graph_for_sync, Arc::clone(&provider_ws), &Arc::clone(&token_cache), Arc::clone(&pool_cache), &token_whitelist_set, start_block, subscriber ).await?;
 
-
-
-    // ✅ Отменяем подписку на события после завершения sync_pools
-    if cancel_tx.send(()).is_err() {
-            error!("[MAIN] Ошибка cancel_tx.send не сработал.");
-        } else {
-            info!("[MAIN] Подписка на события успешно отменена.");
-        }
-
-
     
-
-    let end_block = provider_ws.get_block_number().await?.as_u64();
-
-    SYNC_END_BLOCK.store(end_block, Ordering::SeqCst);
-    
-    info!("[MAIN] Синхронизация завершена. Блоки {} - {} требуют быстрого обновления",  current_block, end_block);
     
     let pool_cache_guard = pool_cache.lock().await;
 
     if let Err(e) = pool_cache_guard.save_to_bin("uniswap_pool_addresses_cache.bin") {
-        error!("[КЭШ] Ошибка при сохранении кэша пулов: {:?}", e);
+        error!("[MAIN_КЭШ] Ошибка при сохранении кэша пулов: {:?}", e);
     } else {
         info!("[КЭШ] Кэш пулов успешно сохранён");
     }
