@@ -1,10 +1,12 @@
+use dashmap::DashMap;
 use ethers::contract::abigen;
 use ethers::types::Address;
 use ethers::prelude::*;
 use log::error;
+use tokio::time::sleep;
+use std::time::Duration;
 use std::{collections::HashMap, fs};
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use serde::{Serialize, Deserialize};
 
 const TOKEN_CACHE_BIN_PATH: &str = "token_cache.bin";
@@ -24,7 +26,8 @@ pub struct TokenInfo {
     pub decimals: u8,
 }
 
-pub type TokenCache = Arc<Mutex<HashMap<Address, TokenInfo>>>;
+
+pub type TokenCache = Arc<DashMap<Address, TokenInfo>>;
 
 
 
@@ -33,16 +36,16 @@ pub async fn get_single_token_data<M: Middleware + 'static>(
     provider: Arc<M>,
     token_cache: &TokenCache,
 ) -> Result<TokenInfo, anyhow::Error> {
-    {
-        let cache = token_cache.lock().await;
-        if let Some(cached) = cache.get(&address) {
-            return Ok(cached.clone());
-        }
+    if let Some(cached) = token_cache.get(&address) {
+        return Ok(cached.clone());
     }
 
     let contract = ERC20::new(address, provider.clone());
 
+    sleep(Duration::from_millis(300)).await;
+    
     let symbol = if let Ok(sym) = contract.symbol().call().await {
+
         let sym_trimmed = sym.trim();
         if sym_trimmed.is_empty()
             || sym_trimmed.to_lowercase().contains("test")
@@ -67,19 +70,19 @@ pub async fn get_single_token_data<M: Middleware + 'static>(
         decimals,
     };
 
-    {
-        let mut cache = token_cache.lock().await;
-        cache.insert(address, token_info.clone());
+    token_cache.insert(address, token_info.clone());
 
-        if let Ok(data) = bincode::serialize(&*cache) {
-            if let Err(e) = std::fs::write(TOKEN_CACHE_BIN_PATH, &data) {
-                error!("[КЭШ] Ошибка записи BIN: {:?}", e);
-            }
+    // Сохранение в файл (бин)
+    let serialized_map: HashMap<_, _> = token_cache.iter().map(|kv| (*kv.key(), kv.value().clone())).collect();
+    if let Ok(data) = bincode::serialize(&serialized_map) {
+        if let Err(e) = std::fs::write(TOKEN_CACHE_BIN_PATH, &data) {
+            error!("[TOKEN][КЭШ] Ошибка записи BIN: {:?}", e);
         }
     }
 
     Ok(token_info)
 }
+
 
 pub async fn load_token_cache() -> Option<HashMap<Address, TokenInfo>> {
     if let Ok(bytes) = tokio::fs::read("token_cache.bin").await {
@@ -95,12 +98,14 @@ pub async fn load_token_cache() -> Option<HashMap<Address, TokenInfo>> {
     }
 }
 
+
 pub async fn save_token_cache_to_json(token_cache: &TokenCache) -> Result<(), Box<dyn std::error::Error>> {
-    let cache = token_cache.lock().await;
-    let json = serde_json::to_string_pretty(&*cache)?;
+    let map: HashMap<_, _> = token_cache.iter().map(|kv| (*kv.key(), kv.value().clone())).collect();
+    let json = serde_json::to_string_pretty(&map)?;
     std::fs::write(TOKEN_CACHE_JSON_PATH, json)?;
     Ok(())
 }
+
 
 pub fn load_token_list_from_json(path: &str) -> HashMap<Address, String> {
     let json = fs::read_to_string(path).expect("Не удалось прочитать token_list.json");

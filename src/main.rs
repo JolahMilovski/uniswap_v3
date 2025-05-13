@@ -5,6 +5,7 @@ pub mod uniswap_cache;
 pub mod uniswap_events;
 pub mod provider;
 
+use dashmap::{DashMap, DashSet};
 use provider::ProviderManager;
 
 use uniswap_cache::UniswapPoolCache;
@@ -17,9 +18,13 @@ use token::load_token_cache;
 use ethers::types::Address;
 use dotenv::dotenv;
 use env_logger::Env;
+use env_logger::Builder;
 use log::{error, info};
-use std::{collections::{HashMap, HashSet}, env, sync::Arc};
+use std::{env, sync::Arc};
+use std::io::Write;
+
 use tokio::sync::Mutex;
+
 use lazy_static::lazy_static;
 
 use std::sync::atomic::AtomicU64;
@@ -38,16 +43,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
     
     //подключаем логирование
-    env_logger::Builder::from_env(Env::default().default_filter_or("info"))
-    .format_timestamp(None)
-    .init();
+   Builder::from_env(Env::default().default_filter_or("info"))
+        .format(|buf, record| {
+            // Определяем цвета и стили
+            let level_color = match record.level() {
+                log::Level::Error => "\x1b[31;1m",  // Красный жирный
+                log::Level::Warn => "\x1b[33;1m",   // Желтый жирный
+                log::Level::Info => "\x1b[32;1m",    // Зеленый жирный
+                log::Level::Debug => "\x1b[36;1m",   // Голубой жирный
+                log::Level::Trace => "\x1b[35;1m",   // Пурпурный жирный
+            };
+            
+            // Эмодзи для уровней
+            let level_emoji = match record.level() {
+                log::Level::Error => "🔥",  // Огонь для ошибок
+                log::Level::Warn => "⚠️",   // Предупреждение
+                log::Level::Info => "ℹ️",   // Информация
+                log::Level::Debug => "🐞",  // Жук для дебага
+                log::Level::Trace => "🔬",  // Лупа для трассировки
+            };
+            
+            // Цвет модуля
+            let module_color = "\x1b[90;1m";  // Серый жирный
+            
+            // Сброс стилей
+            let reset = "\x1b[0m";
+            
+            // Форматируем сообщение
+            writeln!(
+                buf,
+                "{}{} {}{} {}{} {}[{}]{} {}{}{}",
+                level_color,
+                level_emoji,
+                chrono::Local::now().format("%H:%M:%S%.3f"),
+                reset,
+                level_color,
+                record.level(),
+                reset,
+                module_color,
+                record.module_path().unwrap_or("unknown"),
+                reset,
+                level_color,
+                record.args(),
+            )
+        })
+        .filter_module("tokio", log::LevelFilter::Warn)  // Уменьшаем шум от tokio
+        .filter_module("hyper", log::LevelFilter::Warn)  // Уменьшаем шум от hyper
+        .init();
 
-
-    info!(" [MAIN]  Подключаемся к блокчену");
-
+  
+    
+    info!(" [MAIN] Подключаемся к блокчейну");
 
     //создали менеджера провайдеров
     let provider_manager = ProviderManager::new().await;
+
 
     // Получение WS провайдера
     let provider_ws = match provider_manager.get_ws_provider().await {
@@ -73,27 +123,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     
     // ⛓ Инициализация токен-кэша
-    type TokenCache = Arc<Mutex<HashMap<Address, TokenInfo>>>;
+    pub type TokenCache = Arc<DashMap<Address, TokenInfo>>;
     
-    let token_cache: TokenCache = Arc::new(Mutex::new(
-        match load_token_cache().await {
-            Some(cache) => {
-                info!("[КЭШ] [MAIN]  Token кэш успешно загружен");
-                cache
-            }
-            None => {
-                info!("[КЭШ] [MAIN] Token кэш не найден или поврежден, создаём новый");
-                HashMap::new()
-            }
-        }
-    ));
+    let token_cache: TokenCache = Arc::new(match load_token_cache().await {
+    Some(cache) => {
+        info!("[КЭШ] [MAIN] Token кэш успешно загружен");
+        DashMap::from_iter(cache.into_iter())
+    }
+    None => {
+        info!("[КЭШ] [MAIN] Token кэш не найден или поврежден, создаём новый");
+        DashMap::new()
+    }
+});
+
 
 
     
     
     //  ✅ Загрузка token_list.json для фильтрации топовых токенов
-    let token_whitelist_set: HashSet<Address> = token::load_token_list_from_json("token_list.json").keys().cloned().collect();
+    let token_whitelist_set: Arc<DashSet<Address>> = Arc::new(
+    token::load_token_list_from_json("token_list.json")
+        .keys()
+        .cloned()
+        .collect()
+);
 
+
+    
     info!("[MAIN] Загружено {} токенов из token_list.json", token_whitelist_set.len());    
 
     let pool_cache: Arc<Mutex<UniswapPoolCache>> = Arc::new(Mutex::new(
@@ -110,25 +166,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
               
     //  Создаем UniversalGraph
-    let graph = Arc::new(Mutex::new(UniversalGraph::new()));
+    let graph: Arc<UniversalGraph> = Arc::new(UniversalGraph::new());
     
     info!("⏳[MAIN]  Синхронизация пулов начата...");
     let start = std::time::Instant::now();
 
     // Клонируем Arc перед передачей в sync_pools
-    let graph_for_sync = Arc::clone(&graph);
+    let graph_for_sync: Arc<UniversalGraph> = Arc::clone(&graph);
     
     
     
     info!("⏳[MAIN]  Создание подписчика на блоки...");
-
-    //создание подписчика на блоки
-    let block_subscriber = Arc::clone(&provider_ws);
-    tokio::spawn(async move {
-        if let Err(e) = UniswapEventSubscriber::subscribe_to_new_blocks(block_subscriber).await {
-            error!("Ошибка в подписке на блоки: {}", e);
-        }
-    });
 
 
     // Инициализация подписчика
