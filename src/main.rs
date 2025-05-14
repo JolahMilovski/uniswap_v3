@@ -8,6 +8,8 @@ pub mod provider;
 use dashmap::{DashMap, DashSet};
 use provider::ProviderManager;
 
+use tokio::sync::watch;
+use tokio::time::sleep;
 use uniswap_cache::UniswapPoolCache;
 use uniswap_events::UniswapEventSubscriber;
 use uniswap_graph::UniversalGraph;
@@ -39,65 +41,67 @@ lazy_static! {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 
-    //подключаем .ENV
+    //==========================================  подключаем .ENV  и ЛОГ ============================================
     dotenv().ok();
+    let start_block = get_env_var("START_BLOCK").parse::<u64>()?;  
     
     //подключаем логирование
-   Builder::from_env(Env::default().default_filter_or("info"))
-        .format(|buf, record| {
-            // Определяем цвета и стили
-            let level_color = match record.level() {
-                log::Level::Error => "\x1b[31;1m",  // Красный жирный
-                log::Level::Warn => "\x1b[33;1m",   // Желтый жирный
-                log::Level::Info => "\x1b[32;1m",    // Зеленый жирный
-                log::Level::Debug => "\x1b[36;1m",   // Голубой жирный
-                log::Level::Trace => "\x1b[35;1m",   // Пурпурный жирный
-            };
-            
-            // Эмодзи для уровней
-            let level_emoji = match record.level() {
-                log::Level::Error => "🔥",  // Огонь для ошибок
-                log::Level::Warn => "⚠️",   // Предупреждение
-                log::Level::Info => "ℹ️",   // Информация
-                log::Level::Debug => "🐞",  // Жук для дебага
-                log::Level::Trace => "🔬",  // Лупа для трассировки
-            };
-            
-            // Цвет модуля
-            let module_color = "\x1b[90;1m";  // Серый жирный
-            
-            // Сброс стилей
-            let reset = "\x1b[0m";
-            
-            // Форматируем сообщение
-            writeln!(
-                buf,
-                "{}{} {}{} {}{} {}[{}]{} {}{}{}",
-                level_color,
-                level_emoji,
-                chrono::Local::now().format("%H:%M:%S%.3f"),
-                reset,
-                level_color,
-                record.level(),
-                reset,
-                module_color,
-                record.module_path().unwrap_or("unknown"),
-                reset,
-                level_color,
-                record.args(),
-            )
-        })
-        .filter_module("tokio", log::LevelFilter::Warn)  // Уменьшаем шум от tokio
-        .filter_module("hyper", log::LevelFilter::Warn)  // Уменьшаем шум от hyper
-        .init();
+    Builder::from_env(Env::default().default_filter_or("info"))
+    .format(|buf, record| {
+        // Определяем цвета и стили
+        let level_color = match record.level() {
+            log::Level::Error => "\x1b[31;1m",  // Красный жирный
+            log::Level::Warn => "\x1b[95;1m",   // Пурпурный жирный
+            log::Level::Info => "\x1b[36;1m",    // Зеленый жирный
+            log::Level::Debug => "\x1b[36;1m",   // Голубой жирный
+            log::Level::Trace => "\x1b[35;1m",   // Пурпурный жирный
+        };
+        
+        // Эмодзи для уровней
+        let level_emoji = match record.level() {
+            log::Level::Error => "",  // Огонь для ошибок
+            log::Level::Warn => "⚠️",   // Предупреждение
+            log::Level::Info => "🔥",   // Информация
+            log::Level::Debug => "🐞",  // Жук для дебага
+            log::Level::Trace => "🔬",  // Лупа для трассировки
+        };
+        
+        // Цвет модуля
+        let module_color = "\x1b[31;1m";  // Серый жирный
+        
+        // Сброс стилей
+        let reset = "\x1b[0m";
+        
+        // Форматируем сообщение
+        writeln!(
+            buf,
+            "{}{} {}{} {}{} {}[{}]{} {}{}{}",
+            level_color,
+            level_emoji,
+            chrono::Local::now().format("%H:%M:%S%.3f"),
+            reset,
+            level_color,
+            record.level(),
+            reset,
+            module_color,
+            record.module_path().unwrap_or("unknown"),
+            reset,
+            level_color,
+            record.args(),
+        )
+    })
+    .filter_module("tokio", log::LevelFilter::Warn)  // Уменьшаем шум от tokio
+    .filter_module("hyper", log::LevelFilter::Warn)  // Уменьшаем шум от hyper
+    .init();
 
-  
-    
-    info!(" [MAIN] Подключаемся к блокчейну");
+
+//==========================================  ПОДКЛЮЧАЕМ ПРОВАЙДЕРОВ  ============================================
+
+info!(" [MAIN] Подключаемся к блокчейну");
+
 
     //создали менеджера провайдеров
     let provider_manager = ProviderManager::new().await;
-
 
     // Получение WS провайдера
     let provider_ws = match provider_manager.get_ws_provider().await {
@@ -116,42 +120,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("HTTP провайдер не доступен".into());
         }
     };
+    let  provider_ws_clone = provider_ws.clone() ;
 
 
-    let start_block = get_env_var("START_BLOCK").parse::<u64>()?;  
-  
-    
-    
+    let provider_ws_for_sync = provider_ws.clone() ;
+  //==========================================  КЭШ ТОКЕНОВ И БЕЛЫЙ СПИСОК  ============================================
+           
     // ⛓ Инициализация токен-кэша
     pub type TokenCache = Arc<DashMap<Address, TokenInfo>>;
     
     let token_cache: TokenCache = Arc::new(match load_token_cache().await {
-    Some(cache) => {
-        info!("[КЭШ] [MAIN] Token кэш успешно загружен");
-        DashMap::from_iter(cache.into_iter())
-    }
-    None => {
-        info!("[КЭШ] [MAIN] Token кэш не найден или поврежден, создаём новый");
-        DashMap::new()
-    }
-});
-
-
-
-    
+        Some(cache) => {
+            info!("[КЭШ] [MAIN] Token кэш успешно загружен");
+            DashMap::from_iter(cache.into_iter())
+        }
+        None => {
+            info!("[КЭШ] [MAIN] Token кэш не найден или поврежден, создаём новый");
+            DashMap::new()
+        }
+    });   
     
     //  ✅ Загрузка token_list.json для фильтрации топовых токенов
     let token_whitelist_set: Arc<DashSet<Address>> = Arc::new(
-    token::load_token_list_from_json("token_list.json")
+        token::load_token_list_from_json("token_list.json")
         .keys()
         .cloned()
         .collect()
-);
-
-
+    );
+      
     
     info!("[MAIN] Загружено {} токенов из token_list.json", token_whitelist_set.len());    
-
+    
     let pool_cache: Arc<Mutex<UniswapPoolCache>> = Arc::new(Mutex::new(
         match UniswapPoolCache::load_from_bin("uniswap_pool_addresses_cache.bin") {
             Ok(cache) => {
@@ -164,33 +163,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     ));
-              
+        
+//==========================================  ПОЖКЛЮЧАЕМ ГРАФ  ==============================================================
+
     //  Создаем UniversalGraph
     let graph: Arc<UniversalGraph> = Arc::new(UniversalGraph::new());
-    
+
     info!("⏳[MAIN]  Синхронизация пулов начата...");
     let start = std::time::Instant::now();
 
     // Клонируем Arc перед передачей в sync_pools
     let graph_for_sync: Arc<UniversalGraph> = Arc::clone(&graph);
-    
-    
-    
+
+
+
+
+//==========================================  ПОДКЛЮЧАЕМ МОДУЛЬ ПОДПИСКИ  ==============================================================
+
+/*
+*/
+ 
+    // Создаем канал для передачи новых блоков
+    let (block_sender, block_receiver) = watch::channel(0);
+
+    // Запускаем подписку на новые блоки в отдельной задаче
+    tokio::spawn(async move {
+        if let Err(e) = UniswapEventSubscriber::subscribe_to_new_blocks( &provider_ws, block_sender).await {
+            error!("Ошибка в подписке на блоки: {:?}", e);
+        }
+    });
+
+    sleep(std::time::Duration::from_secs(1)).await;
+
     info!("⏳[MAIN]  Создание подписчика на блоки...");
 
+    let subscriber: Arc<UniswapEventSubscriber> = Arc::new(UniswapEventSubscriber::new(provider_http.clone()));
 
-    // Инициализация подписчика
-    let subscriber = Arc::new(UniswapEventSubscriber::new(provider_http.clone()));
+    let subscriber_clone = Arc::clone(&subscriber);
 
-    //запускаем синхронизацию UNISWAP
-    uniswap_v3::sync_pools(graph_for_sync, Arc::clone(&provider_ws), &Arc::clone(&token_cache), Arc::clone(&pool_cache), &token_whitelist_set, start_block, subscriber ).await?;
+    // Запускаем обработку событий в отдельной задаче
+    tokio::spawn(
+        async move {
+            let _ = subscriber_clone.polling_event(graph.clone(),provider_ws_clone, block_receiver).await;
+    });
 
-    
-    
-    let pool_cache_guard = pool_cache.lock().await;
 
-    if let Err(e) = pool_cache_guard.save_to_bin("uniswap_pool_addresses_cache.bin") {
-        error!("[MAIN_КЭШ] Ошибка при сохранении кэша пулов: {:?}", e);
+
+//==========================================  ЗАПУСТИЛИ СКАНИРОВАНИЕ  ==============================================================
+
+//запускаем синхронизацию UNISWAP
+uniswap_v3::sync_pools(graph_for_sync, provider_ws_for_sync, &Arc::clone(&token_cache), Arc::clone(&pool_cache), &token_whitelist_set, start_block, subscriber).await?;//subscriber
+
+
+//==========================================  ОБНОВИМ КЕШ  ==============================================================
+
+let pool_cache_guard = pool_cache.lock().await;
+
+if let Err(e) = pool_cache_guard.save_to_bin("uniswap_pool_addresses_cache.bin") {
+    error!("[MAIN_КЭШ] Ошибка при сохранении кэша пулов: {:?}", e);
     } else {
         info!("[КЭШ] Кэш пулов успешно сохранён");
     }
@@ -200,6 +230,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         info!("Кеш Uniswap успешно сохранён в debug_uniswap_cache.json");
     }  
+
+//========================================= ЗАВЕРШЕНИЯ ===============================================================================
       
     let duration = start.elapsed();
     let secs = duration.as_secs();

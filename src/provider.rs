@@ -33,6 +33,8 @@ pub struct ProviderManager {
 impl ProviderManager {
     pub async fn new() -> Arc<Self> {
         let ws_urls = vec![
+
+            get_env_var("WS_PROVIDER_URL_ALCHEMY_FIRST"),
             get_env_var("WS_PROVIDER_URL_ALCHEMY_SECOND"),
         ];
 

@@ -23,6 +23,7 @@ use ethers_providers::Ws;
 use futures::FutureExt;
 use log::error;
 use log::warn;
+use log::info;
 //use tokio::time::sleep;
 
 use std::collections::HashMap;
@@ -40,7 +41,6 @@ use tokio::time::Duration;
 
 use lazy_static::lazy_static;
 use indicatif::{ProgressBar, ProgressStyle};
-use log::info;
 
 abigen!(
     UniswapV3Pool,
@@ -178,8 +178,6 @@ abigen!(
         "type": "function"
     }]"#
 );
-
-
 
 /// Функция для расчета текущей цены
 pub fn calculate_current_price(
@@ -436,7 +434,7 @@ pub async fn sync_pools(
     pool_cache: Arc<Mutex<UniswapPoolCache>>,
     token_whitelist: &DashSet<Address>,
     start_block_from_env: u64,
-    event_subscriber: Arc<UniswapEventSubscriber>,
+    event_subscriber: Arc<UniswapEventSubscriber>
 ) -> Result<(), Box<dyn std::error::Error>> {
 
     // === Фаза 1: обработка пулов из кэша ========================================================================================================================================================================================================================
@@ -456,7 +454,7 @@ pub async fn sync_pools(
             .progress_chars("=>-"),
     );
 
-    let semaphore = Arc::new(Semaphore::new(2)); 
+    let semaphore = Arc::new(Semaphore::new(10)); 
     let mut futures = FuturesUnordered::new();
     for addr in original_addresses {
         let provider = provider.clone();
@@ -475,21 +473,24 @@ pub async fn sync_pools(
             let token0_call = pool_contract.token_0();
             let token1_call = pool_contract.token_1();
 
-            sleep(Duration::from_millis(200)).await;
+            sleep(Duration::from_millis(900)).await;
 
             match tokio::try_join!(token0_call.call(), token1_call.call()) {
 
                 Ok((token0, token1)) if token_whitelist.contains(&token0) && token_whitelist.contains(&token1) => {
 
-                            info!("[UNISWAP_V3_КЭШ_whitelist] Пул {:?} проходит whitelist: {:?} ↔ {:?}", addr, token0, token1);
+                            info!("[UNISWAP_V3_КЭШ_whitelist] Пул {:?} проходит whitelist: {:?} ↔ {:?}",
+                             addr, token0, token1);
 
-                            sleep(Duration::from_millis(300)).await;
-
-                            let _ = event_subscriber.add_pools_to_subscription(addr, provider.clone()).await;
-
-                            sleep(Duration::from_millis(400)).await;
-                            
-                            if let Some(pool) = build_uniswap_v3_pool(addr, (token0, token1), provider.clone(), &token_cache).await {
+                             
+                             sleep(Duration::from_millis(900)).await;
+                             
+                             if let Some(pool) = build_uniswap_v3_pool(addr, (token0, token1), provider.clone(), &token_cache).await {
+                                 
+                                 sleep(Duration::from_millis(900)).await;
+                                let _ = event_subscriber.add_pools_to_subscription(addr ).await;
+    
+                                sleep(Duration::from_millis(400)).await;
 
                                 if pool.is_active {
 
@@ -497,21 +498,18 @@ pub async fn sync_pools(
 
                                     sleep(Duration::from_millis(400)).await;
 
-                                    if let Err(err) = event_subscriber.update_graph_from_event(graph.clone(), addr, provider.clone()).await {
-                                            warn!("[UNISWAP_V3_GRAPH_UPDATE_ERROR] Ошибка обновления графа по событиям для {:?}: {:?}", addr, err);
-                                        }
-
                                     phase1_active_count.fetch_add(1, Ordering::SeqCst);
                                 }
                             }
                         }
                     Ok(_) => info!("[UNISWAP_V3_КЭШ_whitelist] Пул {:?} отфильтрован по whitelist", addr),
+
                 Err(e) => warn!("[UNISWAP_V3_КЭШ] Ошибка проверки токенов пула {:?}: {:?}", addr, e),
             }
             progress.inc(1);
         }));
     }
-    sleep(Duration::from_millis(300)).await;
+    sleep(Duration::from_millis(900)).await;
 
     while let Some(res) = futures.next().await {
         if let Err(e) = res {
@@ -582,15 +580,16 @@ pub async fn sync_pools(
                 Ok((token0, token1)) if token_whitelist.contains(&token0) && token_whitelist.contains(&token1) => {
                     info!("[UNISWAP_V3_СИНХРОНИЗАЦИЯ] Новый пул {:?} проходит whitelist: {:?} ↔ {:?}", addr, token0, token1);
 
-                    let _ = event_subscriber.add_pools_to_subscription(addr, provider.clone()).await;
-
+                    
                     let mut pool_cache_look = pool_cache.lock().await;
                     if let Some(pool) = build_uniswap_v3_pool(addr, (token0, token1), provider.clone(), &token_cache).await {
+
+                        let _ = event_subscriber.add_pools_to_subscription(addr);
+
                         if pool.is_active {
                             pool_cache_look.add_pool_address(addr);
                             graph.upsert_pool(pool.clone());
                             phase2_active_count.fetch_add(1, Ordering::SeqCst);
-                            let _ = event_subscriber.update_graph_from_event(graph.clone(), addr, provider).await;
                         }
                     }
                 }
