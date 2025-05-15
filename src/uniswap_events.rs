@@ -493,7 +493,7 @@ impl UniswapEventSubscriber {
                 }          
             }        
             // 6. Обновляем блоки для следующей итерации
-            info!("[UNISWAP_EVENT_POLLING_EVENT] Обработаны события для блока от {} до {}", block_from, block_to);
+            info!("[UNISWAP_EVENT_POLLING_EVENT] Обработаны события для блока от {} до {} всего {} блоков", block_from, block_to, block_to.saturating_sub(block_from) + 1);
             
             block_from = block_to + 1;
             // 7. Сдвигаем block_from на следующий блок

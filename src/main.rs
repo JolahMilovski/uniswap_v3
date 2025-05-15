@@ -10,6 +10,8 @@ use provider::ProviderManager;
 
 use tokio::sync::watch;
 use tokio::time::sleep;
+//use tracing_subscriber::layer::SubscriberExt;
+///use tracing_subscriber::util::SubscriberInitExt;
 use uniswap_cache::UniswapPoolCache;
 use uniswap_events::UniswapEventSubscriber;
 use uniswap_graph::UniversalGraph;
@@ -44,6 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //==========================================  подключаем .ENV  и ЛОГ ============================================
     dotenv().ok();
     let start_block = get_env_var("START_BLOCK").parse::<u64>()?;  
+    
     
     //подключаем логирование
     Builder::from_env(Env::default().default_filter_or("info"))
@@ -93,15 +96,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .filter_module("tokio", log::LevelFilter::Warn)  // Уменьшаем шум от tokio
     .filter_module("hyper", log::LevelFilter::Warn)  // Уменьшаем шум от hyper
     .init();
-
-
+ 
+ 
 //==========================================  ПОДКЛЮЧАЕМ ПРОВАЙДЕРОВ  ============================================
 
 info!(" [MAIN] Подключаемся к блокчейну");
 
 
     //создали менеджера провайдеров
-    let provider_manager = ProviderManager::new().await;
+    let provider_manager = ProviderManager::new(499).await;  //лимит по запросам в new
 
     // Получение WS провайдера
     let provider_ws = match provider_manager.get_ws_provider().await {

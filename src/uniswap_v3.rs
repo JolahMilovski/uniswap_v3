@@ -454,7 +454,7 @@ pub async fn sync_pools(
             .progress_chars("=>-"),
     );
 
-    let semaphore = Arc::new(Semaphore::new(10)); 
+    let semaphore = Arc::new(Semaphore::new(1)); 
     let mut futures = FuturesUnordered::new();
     for addr in original_addresses {
         let provider = provider.clone();
