@@ -4,14 +4,18 @@ pub mod token;
 pub mod uniswap_cache;
 pub mod uniswap_events;
 pub mod provider;
-
+/*
+use console_subscriber::ConsoleLayer;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Registry;
+ */
 use dashmap::{DashMap, DashSet};
 use provider::ProviderManager;
 
 use tokio::sync::watch;
 use tokio::time::sleep;
-//use tracing_subscriber::layer::SubscriberExt;
-///use tracing_subscriber::util::SubscriberInitExt;
 use uniswap_cache::UniswapPoolCache;
 use uniswap_events::UniswapEventSubscriber;
 use uniswap_graph::UniversalGraph;
@@ -29,25 +33,35 @@ use std::io::Write;
 
 use tokio::sync::Mutex;
 
-use lazy_static::lazy_static;
 
-use std::sync::atomic::AtomicU64;
-
-lazy_static! {
-    // Глобальные переменные для отслеживания диапазона блоков
-    pub static ref SYNC_START_BLOCK: AtomicU64 = AtomicU64::new(0);
-    pub static ref SYNC_END_BLOCK: AtomicU64 = AtomicU64::new(0);
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 
+    
+    //=========================================   tokio-subscriber   ===============================================
+     /*
+    #[cfg(debug_assertions)]
+    {
+        let console_layer = ConsoleLayer::builder()
+            .retention(Duration::from_secs(30))            // хранить таски 30 секунд
+            .server_addr(([127, 0, 0, 1], 6669))            // сокет подключения
+            .build();
+
+        let filter = EnvFilter::new("uniswap=trace,ethers=warn,tokio=warn");
+
+        Registry::default()
+       
+            .init();
+    } */
+   
+
     //==========================================  подключаем .ENV  и ЛОГ ============================================
     dotenv().ok();
     let start_block = get_env_var("START_BLOCK").parse::<u64>()?;  
     
-    
+   
     //подключаем логирование
     Builder::from_env(Env::default().default_filter_or("info"))
     .format(|buf, record| {
@@ -104,7 +118,7 @@ info!(" [MAIN] Подключаемся к блокчейну");
 
 
     //создали менеджера провайдеров
-    let provider_manager = ProviderManager::new(499).await;  //лимит по запросам в new
+    let provider_manager = ProviderManager::new(999).await;  //лимит по запросам в new
 
     // Получение WS провайдера
     let provider_ws = match provider_manager.get_ws_provider().await {
@@ -213,7 +227,6 @@ info!(" [MAIN] Подключаемся к блокчейну");
 
 
 //==========================================  ЗАПУСТИЛИ СКАНИРОВАНИЕ  ==============================================================
-
 //запускаем синхронизацию UNISWAP
 uniswap_v3::sync_pools(graph_for_sync, provider_ws_for_sync, &Arc::clone(&token_cache), Arc::clone(&pool_cache), &token_whitelist_set, start_block, subscriber).await?;//subscriber
 

@@ -11,7 +11,7 @@ use ethers::contract::EthEvent;
 use anyhow::Result;
 
 use futures::{future::join_all, StreamExt};
-use log::info;
+use log::{info, warn};
 use tokio::{sync::watch, time::sleep};
 
 use crate::{uniswap_graph::UniversalGraph, uniswap_v3::{process_pool_data, tick_to_sqrt_price, UniswapV3Pool}};
@@ -147,7 +147,7 @@ pub struct EventPoolUpdate {
 #[derive(Debug, Clone)]
 pub struct UniswapEventSubscriber {
     provider: Arc<Provider<Http>>,
-    subscribed_pools: DashSet<Address>,
+    pub subscribed_pools: DashSet<Address>,
     last_processed_block: Arc<AtomicU64>,
 }
 
@@ -244,7 +244,13 @@ impl UniswapEventSubscriber {
     ///список хешей для фильтра событий
    pub async fn fetch_events(&self, from_block: u64, to_block: u64) -> anyhow::Result<Vec<PoolEventInfo>> {
 
-        sleep(Duration::from_millis(400)).await;
+        if from_block > to_block {
+            warn!(
+                "Ошибка: from_block ({}) больше to_block ({})",
+                from_block,
+                to_block
+            );
+        }
 
         let subscribed_pools = self.subscribed_pools.iter().collect::<Vec<_>>();
 
@@ -441,7 +447,7 @@ impl UniswapEventSubscriber {
         &self,
         graph: Arc<UniversalGraph>,
         provider_ws: Arc<Provider<Ws>>,
-        block_receiver: watch::Receiver<u64>, // Канал для отправки блока
+        block_receiver: watch::Receiver<u64>, // Канал для получения блока
     ) -> anyhow::Result<()> {
         
             //номер блока запуска
@@ -484,8 +490,8 @@ impl UniswapEventSubscriber {
                     .update_graph_from_event(&pool_event_info, graph.clone(), pool_address, provider_ws.clone())
                     .await
                     {
-                        log::warn!(
-                            "[UNISWAP_EVENT_POLLING_EVENT] Ошибка обновления графа для пула {:?}: {}",
+                        log::error!(
+                            "[UNISWAP_EVENT_POLLING_EVENT_ERROR] Ошибка обновления графа для пула {:?}: {}",
                             pool_address, e
                         );
                         continue;
