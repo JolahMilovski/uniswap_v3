@@ -12,6 +12,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Registry;
  */
 use dashmap::{DashMap, DashSet};
+use log::warn;
 use provider::ProviderManager;
 
 use tokio::sync::watch;
@@ -28,6 +29,7 @@ use dotenv::dotenv;
 use env_logger::Env;
 use env_logger::Builder;
 use log::{error, info};
+use std::time::Duration;
 use std::{env, sync::Arc};
 use std::io::Write;
 
@@ -40,22 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 
     
-    //=========================================   tokio-subscriber   ===============================================
-     /*
-    #[cfg(debug_assertions)]
-    {
-        let console_layer = ConsoleLayer::builder()
-            .retention(Duration::from_secs(30))            // хранить таски 30 секунд
-            .server_addr(([127, 0, 0, 1], 6669))            // сокет подключения
-            .build();
-
-        let filter = EnvFilter::new("uniswap=trace,ethers=warn,tokio=warn");
-
-        Registry::default()
-       
-            .init();
-    } */
-   
+    
 
     //==========================================  подключаем .ENV  и ЛОГ ============================================
     dotenv().ok();
@@ -118,25 +105,15 @@ info!(" [MAIN] Подключаемся к блокчейну");
 
 
     //создали менеджера провайдеров
-    let provider_manager = ProviderManager::new(999).await;  //лимит по запросам в new
+    let provider_manager = ProviderManager::new(499).await;  //лимит по запросам в new
 
     // Получение WS провайдера
-    let provider_ws = match provider_manager.get_ws_provider().await {
-        Some(p) => p,
-        None => {
-            error!(" [MAIN] Не удалось получить рабочий WebSocket провайдер");
-            return Err("WebSocket провайдер не доступен".into());
-        }
-    };
+    let provider_ws =  provider_manager.get_ws().await;
 
     // Получение HTTP провайдера
-    let provider_http = match provider_manager.get_http_provider().await {
-        Some(p) => p,
-        None => {
-            error!(" [MAIN] Не удалось получить рабочий HTTP провайдер");
-            return Err("HTTP провайдер не доступен".into());
-        }
-    };
+    let provider_http =  provider_manager.get_http().await;
+
+
     let  provider_ws_clone = provider_ws.clone() ;
 
 
@@ -187,7 +164,7 @@ info!(" [MAIN] Подключаемся к блокчейну");
     let graph: Arc<UniversalGraph> = Arc::new(UniversalGraph::new());
 
     info!("⏳[MAIN]  Синхронизация пулов начата...");
-    let start = std::time::Instant::now();
+    //let start = std::time::Instant::now();
 
     // Клонируем Arc перед передачей в sync_pools
     let graph_for_sync: Arc<UniversalGraph> = Arc::clone(&graph);
@@ -218,49 +195,73 @@ info!(" [MAIN] Подключаемся к блокчейну");
 
     let subscriber_clone = Arc::clone(&subscriber);
 
-    // Запускаем обработку событий в отдельной задаче
-    tokio::spawn(
-        async move {
-            let _ = subscriber_clone.polling_event(graph.clone(),provider_ws_clone, block_receiver).await;
+    // Запускаем polling_event как вечную фоновую задачу
+    tokio::spawn(async move {
+        if let Err(e) = subscriber_clone
+            .polling_event(graph.clone(), provider_ws_clone, block_receiver)
+            .await
+        {
+            error!("💥 [MAIN] Задача polling_event завершилась с ошибкой: {:?}", e);
+        } else {
+            warn!("⚠️ [MAIN] Задача polling_event завершилась. Это не штатное поведение.");
+        }
     });
 
 
-
 //==========================================  ЗАПУСТИЛИ СКАНИРОВАНИЕ  ==============================================================
-//запускаем синхронизацию UNISWAP
-uniswap_v3::sync_pools(graph_for_sync, provider_ws_for_sync, &Arc::clone(&token_cache), Arc::clone(&pool_cache), &token_whitelist_set, start_block, subscriber).await?;//subscriber
 
+ // Основной цикл для периодической синхронизации пулов
+     // Настройки синхронизации
+    let mut sync_counter: u64 = 0;
+    let sync_interval = Duration::from_secs(1800); // 30 минут
 
+    // Основной цикл
+    loop {
+        sync_counter += 1;
+        let cycle_start = std::time::Instant::now();
+        
+        info!("🔄 [ЦИКЛ {}] Начало синхронизации пулов", sync_counter);
+
+        // Синхронизация пулов
+        match uniswap_v3::sync_pools(graph_for_sync.clone(),provider_ws_for_sync.clone(),&token_cache,pool_cache.clone(),&token_whitelist_set,start_block,subscriber.clone()).await {
+            Ok(_) => {
+                let duration = cycle_start.elapsed();
+                info!("✅ [ЦИКЛ {}] Синхронизация завершена за {:?}", sync_counter, duration);
+            }
+            Err(e) => {
+                error!("❌ [ЦИКЛ {}] Ошибка синхронизации: {:?}", sync_counter, e);
+            }
+        }
 //==========================================  ОБНОВИМ КЕШ  ==============================================================
+        {
+            let cache = pool_cache.lock().await;
+            if let Err(e) = cache.save_to_bin("uniswap_pool_addresses_cache.bin") {
+                error!("[ЦИКЛ {}] Ошибка сохранения кэша: {:?}", sync_counter, e);
+            }
+            if let Err(e) = cache.save_to_json("debug_uniswap_cache.json") {
+                error!("[ЦИКЛ {}] Ошибка сохранения JSON: {:?}", sync_counter, e);
+            }
+        }
 
-let pool_cache_guard = pool_cache.lock().await;
-
-if let Err(e) = pool_cache_guard.save_to_bin("uniswap_pool_addresses_cache.bin") {
-    error!("[MAIN_КЭШ] Ошибка при сохранении кэша пулов: {:?}", e);
-    } else {
-        info!("[КЭШ] Кэш пулов успешно сохранён");
+        // Ожидание следующего цикла
+        info!("⏳ [ЦИКЛ {}] Ожидание следующей синхронизации через {} минут...", 
+            sync_counter, 
+            sync_interval.as_secs() / 60);
+        
+        sleep(sync_interval).await;
+        info!("[MAIN] Бот завершил сканирование пулов");
     }
 
-    if let Err(e) = pool_cache_guard.save_to_json("debug_uniswap_cache.json") {
-        error!("Ошибка при сохранении кеша Uniswap в JSON: {:?}", e);
-    } else {
-        info!("Кеш Uniswap успешно сохранён в debug_uniswap_cache.json");
-    }  
-
-//========================================= ЗАВЕРШЕНИЯ ===============================================================================
-      
-    let duration = start.elapsed();
-    let secs = duration.as_secs();
-    let minutes = secs / 60;
-    let seconds = secs % 60;
-
-    info!("[MAIN]✅ Синхронизация пулов завершена за {} минут {} секунд", minutes, seconds);
-    info!("[MAIN] Бот завершил сканирование пулов");
-
-    Ok(())
-
 }
+
 
 pub fn get_env_var(var_name: &str) -> String {
     env::var(var_name).unwrap_or_else(|_| panic!("[MAIN]Environment variable {} not found", var_name))
 }
+/*
+
+
+
+//========================================= ЗАВЕРШЕНИЯ ===============================================================================
+      
+*/

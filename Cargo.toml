@@ -10,7 +10,7 @@ env_logger = "0.11.6"
 anyhow = "1.0.97"
 log = "0.4"
 dotenv = "0.15.0"
-tokio = { version = "1.44", features = ["full"] }
+tokio = { version = "1.44", features = ["full","tracing" ] }
 ethers-middleware = "2.0.14"
 ethers-providers = "2.0.14"
 ethers-contract = "2.0.14"
@@ -27,3 +27,8 @@ colored = "3.0.0"
 
 governor = "0.10.0"
 nonzero_ext = "0.3.0"
+
+
+#tracing = "0.1.41"
+#console-subscriber = "0.4.1"
+#tracing-subscriber = "0.3.19"
