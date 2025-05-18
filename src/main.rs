@@ -4,17 +4,15 @@ pub mod token;
 pub mod uniswap_cache;
 pub mod uniswap_events;
 pub mod provider;
-/*
-use console_subscriber::ConsoleLayer;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::Registry;
- */
-use dashmap::{DashMap, DashSet};
-use log::warn;
+pub mod aave_v3_flash_monitor;
+
+
 use provider::ProviderManager;
 
+/*
+use log::error;
+use dashmap::{DashMap, DashSet};
+use log::warn;
 use tokio::sync::watch;
 use tokio::time::sleep;
 use uniswap_cache::UniswapPoolCache;
@@ -25,32 +23,36 @@ use crate::token::TokenInfo;
 use token::load_token_cache;
 
 use ethers::types::Address;
+use tokio::sync::Mutex;
+use std::sync::Arc;
+use std::time::Duration;
+*/
+ 
+
+
 use dotenv::dotenv;
 use env_logger::Env;
 use env_logger::Builder;
-use log::{error, info};
-use std::time::Duration;
-use std::{env, sync::Arc};
+use log::info;
+use std::env;
 use std::io::Write;
 
-use tokio::sync::Mutex;
 
 
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-
-
     
     
 
     //==========================================  подключаем .ENV  и ЛОГ ============================================
     dotenv().ok();
-    let start_block = get_env_var("START_BLOCK").parse::<u64>()?;  
+    
+    //let start_block = get_env_var("START_BLOCK").parse::<u64>()?;  
     
    
     //подключаем логирование
-    Builder::from_env(Env::default().default_filter_or("info"))
+Builder::from_env(Env::default().default_filter_or("info"))
     .format(|buf, record| {
         // Определяем цвета и стили
         let level_color = match record.level() {
@@ -99,27 +101,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .init();
  
  
-//==========================================  ПОДКЛЮЧАЕМ ПРОВАЙДЕРОВ  ============================================
+//==========================================  ПОДКЛЮЧАЕМ ПРОВАЙДЕРОВ  ==================================================
 
 info!(" [MAIN] Подключаемся к блокчейну");
+//создали менеджера провайдеров
+let provider_manager = ProviderManager::new(499).await;  //лимит по запросам в new
+
+// Получение WS провайдера
+let provider_http =  provider_manager.get_http().await;
 
 
-    //создали менеджера провайдеров
-    let provider_manager = ProviderManager::new(499).await;  //лимит по запросам в new
+let provider_for_aave = provider_http.clone();
 
-    // Получение WS провайдера
-    let provider_ws =  provider_manager.get_ws().await;
+// Получение HTTP провайдера
 
-    // Получение HTTP провайдера
-    let provider_http =  provider_manager.get_http().await;
-
-
-    let  provider_ws_clone = provider_ws.clone() ;
+/*
+let provider_ws =  provider_manager.get_ws().await;
+let  provider_ws_clone = provider_ws.clone();
+let provider_ws_for_sync = provider_ws.clone();
+*/
 
 
-    let provider_ws_for_sync = provider_ws.clone() ;
-  //==========================================  КЭШ ТОКЕНОВ И БЕЛЫЙ СПИСОК  ============================================
-           
+//==========================================  ИНИЦИАЛИЗАЦИЯ AAVE FLASH MONITOR  ======================================
+
+
+// Запуск мониторинга Aave в фоновом режиме
+
+
+
+
+     
+   
+
+    // Запускаем мониторинг асинхронно в фоне
+    tokio::spawn(async move {
+        if let Err(e) = aave_v3_flash_monitor::get_aave_data(provider_for_aave).await {
+            eprintln!("Error in Aave liquidity monitor: {:?}", e);
+        }
+    });
+
+tokio::signal::ctrl_c().await?;
+
+    
+Ok(())     
+    
+        
+        
+        
+        
+        //==========================================  КЭШ ТОКЕНОВ И БЕЛЫЙ СПИСОК  ============================================
+  /*      
+        
     // ⛓ Инициализация токен-кэша
     pub type TokenCache = Arc<DashMap<Address, TokenInfo>>;
     
@@ -158,7 +190,7 @@ info!(" [MAIN] Подключаемся к блокчейну");
         }
     ));
         
-//==========================================  ПОЖКЛЮЧАЕМ ГРАФ  ==============================================================
+//==========================================  ПОЖКЛЮЧАЕМ ГРАФ  ========================================================================
 
     //  Создаем UniversalGraph
     let graph: Arc<UniversalGraph> = Arc::new(UniversalGraph::new());
@@ -170,14 +202,11 @@ info!(" [MAIN] Подключаемся к блокчейну");
     let graph_for_sync: Arc<UniversalGraph> = Arc::clone(&graph);
 
 
-
-
 //==========================================  ПОДКЛЮЧАЕМ МОДУЛЬ ПОДПИСКИ  ==============================================================
 
-/*
-*/
- 
-    // Создаем канал для передачи новых блоков
+
+
+     // Создаем канал для передачи новых блоков
     let (block_sender, block_receiver) = watch::channel(0);
 
     // Запускаем подписку на новые блоки в отдельной задаче
@@ -252,16 +281,18 @@ info!(" [MAIN] Подключаемся к блокчейну");
         info!("[MAIN] Бот завершил сканирование пулов");
     }
 
+*/
+
+
 }
 
 
 pub fn get_env_var(var_name: &str) -> String {
     env::var(var_name).unwrap_or_else(|_| panic!("[MAIN]Environment variable {} not found", var_name))
 }
-/*
+
 
 
 
 //========================================= ЗАВЕРШЕНИЯ ===============================================================================
       
-*/
