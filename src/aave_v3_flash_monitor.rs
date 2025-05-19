@@ -74,26 +74,26 @@ pub struct AaveLiquiditySnapshot {
 
 pub async fn get_aave_data(provider: Arc<Provider<Http>>) -> Result<()> {
     
-
-        let pool_address: Address = env::var("ARBITRUM_AAVE_V3_POOL_ADDRESS")?.parse()?;
-        let data_provider_address: Address = env::var("ARBITRUM_AAVE_V3_POOL_DATA_PROVIDER_ADDRESS")?.parse()?;
+            let pool_address: Address = env::var("ARBITRUM_AAVE_V3_POOL_ADDRESS")?.parse()?;
+            let data_provider_address: Address = env::var("ARBITRUM_AAVE_V3_POOL_DATA_PROVIDER_ADDRESS")?.parse()?;
+    
 
         let pool_data_provider = AavePoolDataProvider::new(data_provider_address, provider.clone());
         let pool_v3 = AavePool::new(pool_address, provider.clone());
 
     loop {
-        info!("🔄 Начинаем обновление ликвидности Aave");
+        info!("🔄  [AAVE] Начинаем обновление ликвидности Aave");
 
         match pool_data_provider.get_all_reserves_tokens().call().await {
             Ok(reserves) => {
-                info!("✅ Получено {} токенов из data provider", reserves.len());
+                info!("✅  [AAVE] Получено {} токенов из data provider", reserves.len());
 
                 let mut snapshot_data = Vec::with_capacity(reserves.len());
 
                 for token in &reserves {
                     match pool_v3.get_reserve_data(token.token_address).call().await {
                         Ok(reserve_data) => {
-                            info!("💧 Токен {} ({:?}): ликвидность = {}", token.symbol, token.token_address, reserve_data.available_liquidity);
+                            info!("💧  [AAVE] Токен {} ({:?}): ликвидность = {}", token.symbol, token.token_address, reserve_data.available_liquidity);
 
                             snapshot_data.push(AaveTokenLiquidity {
                                 token_address: token.token_address,
@@ -102,7 +102,7 @@ pub async fn get_aave_data(provider: Arc<Provider<Http>>) -> Result<()> {
                             });
                         }
                         Err(e) => {
-                            error!("❌ Ошибка при получении ликвидности для токена {}: {:?}", token.symbol, e);
+                            error!("❌ [AAVE] Ошибка при получении ликвидности для токена {}: {:?}", token.symbol, e);
                         }
                     }
                 }
@@ -121,26 +121,26 @@ pub async fn get_aave_data(provider: Arc<Provider<Http>>) -> Result<()> {
                         {
                             Ok(mut file) => {
                                 if let Err(e) = file.write_all(json.as_bytes()) {
-                                    error!("❌ Ошибка записи JSON в файл: {:?}", e);
+                                    error!("❌  [AAVE]  Ошибка записи JSON в файл: {:?}", e);
                                 }
                                 if let Err(e) = file.write_all(b"\n") {
-                                    error!("❌ Ошибка записи новой строки в файл: {:?}", e);
+                                    error!("❌  [AAVE] Ошибка записи новой строки в файл: {:?}", e);
                                 }
 
-                                info!("🟢 [{}] Сохранили {} записей в aave_liquidity.json", snapshot.timestamp, snapshot.data.len());
+                                info!("🟢  [AAVE]  [{}] Сохранили {} записей в aave_liquidity.json", snapshot.timestamp, snapshot.data.len());
                             }
                             Err(e) => {
-                                error!("❌ Не удалось открыть файл aave_liquidity.json: {:?}", e);
+                                error!("❌  [AAVE]  Не удалось открыть файл aave_liquidity.json: {:?}", e);
                             }
                         }
                     }
                     Err(e) => {
-                        error!("❌ Ошибка сериализации JSON: {:?}", e);
+                        error!("❌  [AAVE]  Ошибка сериализации JSON: {:?}", e);
                     }
                 }
             }
             Err(e) => {
-                error!("❌ Ошибка получения списка резервов из data provider: {:?}", e);
+                error!("❌  [AAVE]  Ошибка получения списка резервов из data provider: {:?}", e);
             }
         }
 

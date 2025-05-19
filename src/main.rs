@@ -5,12 +5,8 @@ pub mod uniswap_cache;
 pub mod uniswap_events;
 pub mod provider;
 pub mod aave_v3_flash_monitor;
-
-
-use provider::ProviderManager;
-
-/*
 use log::error;
+use provider::ProviderManager;
 use dashmap::{DashMap, DashSet};
 use log::warn;
 use tokio::sync::watch;
@@ -18,18 +14,12 @@ use tokio::time::sleep;
 use uniswap_cache::UniswapPoolCache;
 use uniswap_events::UniswapEventSubscriber;
 use uniswap_graph::UniversalGraph;
-
 use crate::token::TokenInfo;
 use token::load_token_cache;
-
 use ethers::types::Address;
 use tokio::sync::Mutex;
 use std::sync::Arc;
 use std::time::Duration;
-*/
- 
-
-
 use dotenv::dotenv;
 use env_logger::Env;
 use env_logger::Builder;
@@ -48,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //==========================================  подключаем .ENV  и ЛОГ ============================================
     dotenv().ok();
     
-    //let start_block = get_env_var("START_BLOCK").parse::<u64>()?;  
+    let start_block = get_env_var("START_BLOCK").parse::<u64>()?;  
     
    
     //подключаем логирование
@@ -115,22 +105,15 @@ let provider_for_aave = provider_http.clone();
 
 // Получение HTTP провайдера
 
-/*
+
 let provider_ws =  provider_manager.get_ws().await;
 let  provider_ws_clone = provider_ws.clone();
 let provider_ws_for_sync = provider_ws.clone();
-*/
+
 
 
 //==========================================  ИНИЦИАЛИЗАЦИЯ AAVE FLASH MONITOR  ======================================
-
-
-// Запуск мониторинга Aave в фоновом режиме
-
-
-
-
-     
+   
    
 
     // Запускаем мониторинг асинхронно в фоне
@@ -139,19 +122,13 @@ let provider_ws_for_sync = provider_ws.clone();
             eprintln!("Error in Aave liquidity monitor: {:?}", e);
         }
     });
-
-tokio::signal::ctrl_c().await?;
-
     
-Ok(())     
     
-        
-        
-        
-        
-        //==========================================  КЭШ ТОКЕНОВ И БЕЛЫЙ СПИСОК  ============================================
-  /*      
-        
+    
+    
+    //==========================================  КЭШ ТОКЕНОВ И БЕЛЫЙ СПИСОК  ============================================
+    
+    
     // ⛓ Инициализация токен-кэша
     pub type TokenCache = Arc<DashMap<Address, TokenInfo>>;
     
@@ -173,7 +150,7 @@ Ok(())
         .cloned()
         .collect()
     );
-      
+    
     
     info!("[MAIN] Загружено {} токенов из token_list.json", token_whitelist_set.len());    
     
@@ -189,68 +166,68 @@ Ok(())
             }
         }
     ));
-        
-//==========================================  ПОЖКЛЮЧАЕМ ГРАФ  ========================================================================
-
+    
+    //==========================================  ПОЖКЛЮЧАЕМ ГРАФ  ========================================================================
+    
     //  Создаем UniversalGraph
     let graph: Arc<UniversalGraph> = Arc::new(UniversalGraph::new());
-
+    
     info!("⏳[MAIN]  Синхронизация пулов начата...");
     //let start = std::time::Instant::now();
-
+    
     // Клонируем Arc перед передачей в sync_pools
     let graph_for_sync: Arc<UniversalGraph> = Arc::clone(&graph);
-
-
-//==========================================  ПОДКЛЮЧАЕМ МОДУЛЬ ПОДПИСКИ  ==============================================================
-
-
-
-     // Создаем канал для передачи новых блоков
+    
+    
+    //==========================================  ПОДКЛЮЧАЕМ МОДУЛЬ ПОДПИСКИ  ==============================================================
+    
+    
+    
+    // Создаем канал для передачи новых блоков
     let (block_sender, block_receiver) = watch::channel(0);
-
+    
     // Запускаем подписку на новые блоки в отдельной задаче
     tokio::spawn(async move {
         if let Err(e) = UniswapEventSubscriber::subscribe_to_new_blocks( &provider_ws, block_sender).await {
             error!("Ошибка в подписке на блоки: {:?}", e);
         }
     });
-
+    
     sleep(std::time::Duration::from_secs(1)).await;
-
+    
     info!("⏳[MAIN]  Создание подписчика на блоки...");
-
+    
     let subscriber: Arc<UniswapEventSubscriber> = Arc::new(UniswapEventSubscriber::new(provider_http.clone()));
-
+    
     let subscriber_clone = Arc::clone(&subscriber);
-
+    
     // Запускаем polling_event как вечную фоновую задачу
     tokio::spawn(async move {
         if let Err(e) = subscriber_clone
-            .polling_event(graph.clone(), provider_ws_clone, block_receiver)
-            .await
+        .polling_event(graph.clone(), provider_ws_clone, block_receiver)
+        .await
         {
             error!("💥 [MAIN] Задача polling_event завершилась с ошибкой: {:?}", e);
         } else {
             warn!("⚠️ [MAIN] Задача polling_event завершилась. Это не штатное поведение.");
         }
     });
-
-
-//==========================================  ЗАПУСТИЛИ СКАНИРОВАНИЕ  ==============================================================
-
- // Основной цикл для периодической синхронизации пулов
-     // Настройки синхронизации
+    
+    
+    //==========================================  ЗАПУСТИЛИ СКАНИРОВАНИЕ  ==============================================================
+    
+    // Основной цикл для периодической синхронизации пулов
+    // Настройки синхронизации
     let mut sync_counter: u64 = 0;
     let sync_interval = Duration::from_secs(1800); // 30 минут
-
+    
     // Основной цикл
     loop {
         sync_counter += 1;
         let cycle_start = std::time::Instant::now();
         
         info!("🔄 [ЦИКЛ {}] Начало синхронизации пулов", sync_counter);
-
+        
         // Синхронизация пулов
         match uniswap_v3::sync_pools(graph_for_sync.clone(),provider_ws_for_sync.clone(),&token_cache,pool_cache.clone(),&token_whitelist_set,start_block,subscriber.clone()).await {
             Ok(_) => {
@@ -261,7 +238,7 @@ Ok(())
                 error!("❌ [ЦИКЛ {}] Ошибка синхронизации: {:?}", sync_counter, e);
             }
         }
-//==========================================  ОБНОВИМ КЕШ  ==============================================================
+        //==========================================  ОБНОВИМ КЕШ  ==============================================================
         {
             let cache = pool_cache.lock().await;
             if let Err(e) = cache.save_to_bin("uniswap_pool_addresses_cache.bin") {
@@ -271,19 +248,16 @@ Ok(())
                 error!("[ЦИКЛ {}] Ошибка сохранения JSON: {:?}", sync_counter, e);
             }
         }
-
+        
         // Ожидание следующего цикла
         info!("⏳ [ЦИКЛ {}] Ожидание следующей синхронизации через {} минут...", 
-            sync_counter, 
-            sync_interval.as_secs() / 60);
+        sync_counter, 
+        sync_interval.as_secs() / 60);
         
         sleep(sync_interval).await;
         info!("[MAIN] Бот завершил сканирование пулов");
-    }
-
-*/
-
-
+    }      
+     
 }
 
 
