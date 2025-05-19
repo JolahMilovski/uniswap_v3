@@ -5,6 +5,8 @@ pub mod uniswap_cache;
 pub mod uniswap_events;
 pub mod provider;
 pub mod aave_v3_flash_monitor;
+pub mod take_gas_price;
+
 use log::error;
 use provider::ProviderManager;
 use dashmap::{DashMap, DashSet};
@@ -98,16 +100,18 @@ info!(" [MAIN] Подключаемся к блокчейну");
 let provider_manager = ProviderManager::new(499).await;  //лимит по запросам в new
 
 // Получение WS провайдера
-let provider_http =  provider_manager.get_http().await;
-
-
-let provider_for_aave = provider_http.clone();
+let provider_ws =  provider_manager.get_ws().await;
 
 // Получение HTTP провайдера
+let provider_http =  provider_manager.get_http().await;
+
+// Клонируем HTTP  провайдеров
+let provider_for_aave = provider_http.clone();
+let provider_gas = provider_http.clone();
 
 
-let provider_ws =  provider_manager.get_ws().await;
-let  provider_ws_clone = provider_ws.clone();
+// Клонируем WS  провайдеров
+let provider_ws_clone = provider_ws.clone();
 let provider_ws_for_sync = provider_ws.clone();
 
 
@@ -166,6 +170,22 @@ let provider_ws_for_sync = provider_ws.clone();
             }
         }
     ));
+
+    //====================================  ПОДКЛЮЧАЕМСЯ К ГАЗОВОЙ ТРУБЕ =================================================================-
+
+    // Создаем канал для газа
+    let (gas_feed, gas_sender) = take_gas_price::GasPriceFeed::new();
+
+    // Запускаем таск по обновлению цены газа
+    tokio::spawn({
+        
+        async move {
+            take_gas_price::start_gas_price_loop(provider_gas, gas_sender).await;
+        }
+    });
+
+
+
     
     //==========================================  ПОЖКЛЮЧАЕМ ГРАФ  ========================================================================
     
