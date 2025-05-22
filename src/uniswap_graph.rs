@@ -1,21 +1,26 @@
 use dashmap::DashMap;
-use serde::{Serialize, Deserialize};
-use std::collections::HashMap;
-use std::io::{self, Error, ErrorKind, Read, Write};
-use std::fs::File;
 use ethers::types::{Address, U512};
-use serde_json::{json, Value};
-use log::{debug, info, warn, error};
+use log::{debug, error, info, warn};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{self, Error, ErrorKind, Read, Write};
 
-#[derive(Clone, Debug,Deserialize,Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct UniversalGraph {
-    pub nodes: DashMap<Address, u8>, // Изменили на DashMap для потокобезопасности
-    pub edges: DashMap<Address, UniswapPool>, // Изменили на DashMap
+    /// Ключ: адрес пула  
+    /// Значение: (токен0, токен1)
+    pub nodes: DashMap<Address, (Address, Address)>,
+    /// Ключ: адрес пула  
+    /// Значение: структура пула
+    pub edges: DashMap<Address, UniswapPool>,
 }
 
-#[derive(Serialize,Deserialize)]
+
+#[derive(Serialize, Deserialize)]
 struct UniversalGraphSnapshot {
-    nodes: HashMap<Address, u8>,
+    nodes: HashMap<Address, (Address, Address)>,
     edges: HashMap<Address, UniswapPool>,
 }
 
@@ -43,7 +48,10 @@ pub struct UniswapPool {
     pub uniswap_tick_spacing: i32,
     pub uniswap_max_liquidity_per_tick: U512,
     pub uniswap_fee_tier: u32,
-    #[serde(skip_serializing_if = "DashMap::is_empty", serialize_with = "serialize_tick_map")]
+    #[serde(
+        skip_serializing_if = "DashMap::is_empty",
+        serialize_with = "serialize_tick_map"
+    )]
     pub tick_map: DashMap<i32, (i128, U512)>, // Изменили на DashMap
     pub is_active: bool,
 }
@@ -55,9 +63,9 @@ impl UniversalGraph {
             edges: DashMap::new(),
         }
     }
-    
+
     pub fn add_pool(
-        &self,  // Изменили на &self, так как DashMap уже обеспечивает внутреннюю синхронизацию
+        &self, // Изменили на &self, так как DashMap уже обеспечивает внутреннюю синхронизацию
         uniswap_pool_address: Address,
         uniswap_dex: String,
         uniswap_token_a: Address,
@@ -65,8 +73,8 @@ impl UniversalGraph {
         uniswap_token_a_symbol: String,
         uniswap_token_b: Address,
         uniswap_token_b_decimals: u8,
-        uniswap_token_b_symbol: String,        
-        uniswap_liquidity: U512,          
+        uniswap_token_b_symbol: String,
+        uniswap_liquidity: U512,
         uniswap_sqrt_price: U512,
         uniswap_current_price: U512,
         uniswap_tick_current: i32,
@@ -75,11 +83,11 @@ impl UniversalGraph {
         uniswap_tick_spacing: i32,
         uniswap_max_liquidity_per_tick: U512,
         uniswap_fee_tier: u32,
-        tick_map: HashMap<i32, (i128, U512)>,      
-        is_active: bool
+        tick_map: HashMap<i32, (i128, U512)>,
+        is_active: bool,
     ) {
-        self.nodes.insert(uniswap_token_a, uniswap_token_a_decimals);
-        self.nodes.insert(uniswap_token_b, uniswap_token_b_decimals);
+        self.nodes
+            .insert(uniswap_pool_address, (uniswap_token_a, uniswap_token_b));
 
         let dash_tick_map = DashMap::new();
         for (tick, data) in tick_map {
@@ -107,24 +115,28 @@ impl UniversalGraph {
                 uniswap_max_liquidity_per_tick,
                 uniswap_fee_tier,
                 tick_map: dash_tick_map,
-                is_active
+                is_active,
             },
         );
     }
 
     pub fn save_pool_to_file(&self) -> std::io::Result<()> {
         let file_path = "uniswap_pools_data.json";
-        
+
         // 1. Проверка наличия данных
         if self.edges.is_empty() {
             warn!("[UNISAWP_GRAPH_ГРАФ] Попытка сохранения пустого графа. edges содержит 0 пулов.");
             return Err(Error::new(
-                ErrorKind::InvalidData, 
-                "[UNISAWP_GRAPH_ГРАФ] Нет данных для сохранения (edges пуст)"
+                ErrorKind::InvalidData,
+                "[UNISAWP_GRAPH_ГРАФ] Нет данных для сохранения (edges пуст)",
             ));
         }
-        
-        info!("[ГРАФ] Начинаем сохранение {} пулов в файл {}", self.edges.len(), file_path);
+
+        info!(
+            "[ГРАФ] Начинаем сохранение {} пулов в файл {}",
+            self.edges.len(),
+            file_path
+        );
 
         // 2. Подготовка данных с безопасной обработкой чисел
         let pools_dec: Vec<Value> = self.edges
@@ -171,9 +183,12 @@ impl UniversalGraph {
             Ok(f) => {
                 info!("[UNISAWP_GRAPH_ГРАФ] Файл {} успешно создан", file_path);
                 f
-            },
+            }
             Err(e) => {
-                error!("[UNISAWP_GRAPH_ГРАФ] Не удалось создать файл {}: {}", file_path, e);
+                error!(
+                    "[UNISAWP_GRAPH_ГРАФ] Не удалось создать файл {}: {}",
+                    file_path, e
+                );
                 return Err(e);
             }
         };
@@ -184,27 +199,35 @@ impl UniversalGraph {
             Ok(s) => s,
             Err(e) => {
                 error!("[UNISAWP_GRAPH_ГРАФ] Ошибка сериализации: {}", e);
-                
+
                 // Попробуем сохранить хотя бы часть данных для диагностики
                 let fallback_path = "uniswap_pools_fallback.json";
-                warn!("[UNISAWP_GRAPH_ГРАФ] Попытка сохранить упрощенные данные в {}", fallback_path);
-                
+                warn!(
+                    "[UNISAWP_GRAPH_ГРАФ] Попытка сохранить упрощенные данные в {}",
+                    fallback_path
+                );
+
                 let simplified: Vec<Value> = pools_dec
                     .iter()
-                    .map(|pool| json!({
-                        "pool": pool["uniswap_pool_address"],
-                        "token_a": pool["uniswap_token_a"],
-                        "token_b": pool["uniswap_token_b"]
-                    }))
+                    .map(|pool| {
+                        json!({
+                            "pool": pool["uniswap_pool_address"],
+                            "token_a": pool["uniswap_token_a"],
+                            "token_b": pool["uniswap_token_b"]
+                        })
+                    })
                     .collect();
-                
+
                 if let Ok(simple_str) = serde_json::to_string(&simplified) {
                     let _ = std::fs::write(fallback_path, simple_str);
                 }
-                
-                return Err(Error::new(ErrorKind::InvalidData, format!("Ошибка сериализации: {}", e)));
+
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("Ошибка сериализации: {}", e),
+                ));
             }
-        }; 
+        };
 
         // 5. Запись в файл
         match file.write_all(json_string.as_bytes()) {
@@ -212,15 +235,18 @@ impl UniversalGraph {
                 info!("[UNISAWP_GRAPH_ГРАФ] Данные успешно записаны в файл");
                 match file.sync_all() {
                     Ok(_) => {
-                        info!("[UNISAWP_GRAPH_ГРАФ] Синхронизация файла завершена. Всего сохранено {} пулов", pools_dec.len());
+                        info!(
+                            "[UNISAWP_GRAPH_ГРАФ] Синхронизация файла завершена. Всего сохранено {} пулов",
+                            pools_dec.len()
+                        );
                         Ok(())
-                    },
+                    }
                     Err(e) => {
                         error!("[ГРАФ] Ошибка синхронизации файла: {}", e);
                         Err(e)
                     }
                 }
-            },
+            }
             Err(e) => {
                 error!("UNISAWP_GRAPH_Ошибка записи в файл: {}", e);
                 Err(e)
@@ -228,34 +254,32 @@ impl UniversalGraph {
         }
     }
 
-
     pub fn load_from_bin(path: &str) -> io::Result<Self> {
         let mut file = File::open(path)?;
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
-        
-        bincode::deserialize(&buffer)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+
+        bincode::deserialize(&buffer).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
     }
 
     pub fn upsert_pool(&self, new_pool: UniswapPool) {
-        self.nodes.insert(new_pool.uniswap_token_a, new_pool.uniswap_token_a_decimals);
-        self.nodes.insert(new_pool.uniswap_token_b, new_pool.uniswap_token_b_decimals);
-
         if let Some(mut existing_pool) = self.edges.get_mut(&new_pool.uniswap_pool_address) {
             existing_pool.uniswap_liquidity = new_pool.uniswap_liquidity;
             existing_pool.uniswap_sqrt_price = new_pool.uniswap_sqrt_price;
             existing_pool.uniswap_current_price = new_pool.uniswap_current_price;
             existing_pool.uniswap_tick_current = new_pool.uniswap_tick_current;
             existing_pool.is_active = new_pool.is_active;
-            
+
             // Обновляем tick_map
             existing_pool.tick_map.clear();
             for (tick, data) in new_pool.tick_map.into_iter() {
                 existing_pool.tick_map.insert(tick, data);
             }
-            
-            debug!("UNISAWP_GRAPH_Обновлен пул: {:?}", new_pool.uniswap_pool_address);
+
+            debug!(
+                "UNISAWP_GRAPH_Обновлен пул: {:?}",
+                new_pool.uniswap_pool_address
+            );
         } else {
             self.edges.insert(new_pool.uniswap_pool_address, new_pool);
         }
@@ -263,8 +287,8 @@ impl UniversalGraph {
 
     pub fn save_to_bin(&self, path: &str) -> io::Result<()> {
         let snapshot = self.snapshot();
-        let serialized = bincode::serialize(&snapshot)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let serialized =
+            bincode::serialize(&snapshot).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let mut file = File::create(path)?;
         file.write_all(&serialized)?;
         Ok(())
@@ -277,19 +301,34 @@ impl UniversalGraph {
         let mut file = File::create(path)?;
         file.write_all(json.as_bytes())?;
         Ok(())
-    }   
+    }
 
     fn snapshot(&self) -> UniversalGraphSnapshot {
         UniversalGraphSnapshot {
-            nodes: self.nodes.iter().map(|r| (*r.key(), *r.value())).collect(),
-            edges: self.edges.iter().map(|r| (*r.key(), r.value().clone())).collect(),
+            nodes: self
+                .nodes
+                .iter()
+                .map(
+                    |r: dashmap::mapref::multiple::RefMulti<
+                        '_,
+                        ethers::types::H160,
+                        (ethers::types::H160, ethers::types::H160),
+                    >| (*r.key(), *r.value()),
+                )
+                .collect(),
+            edges: self
+                .edges
+                .iter()
+                .map(|r| (*r.key(), r.value().clone()))
+                .collect(),
         }
     }
 }
 
-
-
-fn serialize_tick_map<S>(tick_map: &DashMap<i32, (i128, U512)>, serializer: S) -> Result<S::Ok, S::Error>
+fn serialize_tick_map<S>(
+    tick_map: &DashMap<i32, (i128, U512)>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
@@ -298,10 +337,7 @@ where
     for entry in tick_map.iter() {
         map.serialize_entry(
             &entry.key().to_string(),
-            &(
-                entry.value().0.to_string(),
-                entry.value().1.to_string()
-            )
+            &(entry.value().0.to_string(), entry.value().1.to_string()),
         )?;
     }
     map.end()
