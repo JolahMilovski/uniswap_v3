@@ -20,8 +20,8 @@ pub struct UniversalGraph {
 
 #[derive(Serialize, Deserialize)]
 struct UniversalGraphSnapshot {
-    nodes: HashMap<Address, (Address, Address)>,
-    edges: HashMap<Address, UniswapPool>,
+    nodes: HashMap<Address, (Address, Address)>, // адрес пула : адреса токенов
+    edges: HashMap<Address, UniswapPool>, //адрес пула : данные пула
 }
 
 #[derive(Serialize, Clone, Debug, Deserialize)]
@@ -254,13 +254,7 @@ impl UniversalGraph {
         }
     }
 
-    pub fn load_from_bin(path: &str) -> io::Result<Self> {
-        let mut file = File::open(path)?;
-        let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer)?;
-
-        bincode::deserialize(&buffer).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-    }
+    
 
     pub fn upsert_pool(&self, new_pool: UniswapPool) {
         if let Some(mut existing_pool) = self.edges.get_mut(&new_pool.uniswap_pool_address) {
@@ -293,6 +287,18 @@ impl UniversalGraph {
         file.write_all(&serialized)?;
         Ok(())
     }
+    
+
+
+    pub fn load_from_bin(path: &str) -> io::Result<Self> {
+        let mut file = File::open(path)?;
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer)?;
+
+        bincode::deserialize(&buffer).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    }
+
+
 
     pub fn save_to_bin_json(&self, path: &str) -> std::io::Result<()> {
         let snapshot = self.snapshot();
