@@ -257,6 +257,7 @@ impl UniversalGraph {
     
 
     pub fn upsert_pool(&self, new_pool: UniswapPool) {
+
         if let Some(mut existing_pool) = self.edges.get_mut(&new_pool.uniswap_pool_address) {
             existing_pool.uniswap_liquidity = new_pool.uniswap_liquidity;
             existing_pool.uniswap_sqrt_price = new_pool.uniswap_sqrt_price;
@@ -274,8 +275,19 @@ impl UniversalGraph {
                 "UNISAWP_GRAPH_Обновлен пул: {:?}",
                 new_pool.uniswap_pool_address
             );
-        } else {
-            self.edges.insert(new_pool.uniswap_pool_address, new_pool);
+            self.nodes.insert(new_pool.uniswap_pool_address, (new_pool.uniswap_token_a, new_pool.uniswap_token_b));
+        }
+        
+        else
+        
+        {
+            let pool_address = new_pool.uniswap_pool_address;
+            let token_a = new_pool.uniswap_token_a;
+            let token_b = new_pool.uniswap_token_b;
+
+            self.edges.insert(pool_address, new_pool);
+            self.nodes.insert(pool_address, (token_a, token_b));
+
         }
     }
 
