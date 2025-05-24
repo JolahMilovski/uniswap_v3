@@ -161,6 +161,6 @@ pub async fn get_aave_data(
             }
         }
 
-        sleep(Duration::from_secs(300)).await;
+        sleep(Duration::from_secs(1200)).await;
     }
 }

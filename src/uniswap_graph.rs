@@ -1,11 +1,10 @@
 use dashmap::DashMap;
 use ethers::types::{Address, U512};
-use log::{debug, error, info, warn};
+use log::debug;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, Error, ErrorKind, Read, Write};
+use std::io::{self, Read, Write};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct UniversalGraph {
@@ -16,7 +15,6 @@ pub struct UniversalGraph {
     /// Значение: структура пула
     pub edges: DashMap<Address, UniswapPool>,
 }
-
 
 #[derive(Serialize, Deserialize)]
 struct UniversalGraphSnapshot {
@@ -48,15 +46,13 @@ pub struct UniswapPool {
     pub uniswap_tick_spacing: i32,
     pub uniswap_max_liquidity_per_tick: U512,
     pub uniswap_fee_tier: u32,
-    #[serde(
-        skip_serializing_if = "DashMap::is_empty",
-        serialize_with = "serialize_tick_map"
-    )]
+    #[serde(skip_serializing_if = "DashMap::is_empty",serialize_with = "serialize_tick_map")]
     pub tick_map: DashMap<i32, (i128, U512)>, // Изменили на DashMap
     pub is_active: bool,
 }
 
 impl UniversalGraph {
+
     pub fn new() -> Self {
         UniversalGraph {
             nodes: DashMap::new(),
@@ -83,7 +79,7 @@ impl UniversalGraph {
         uniswap_tick_spacing: i32,
         uniswap_max_liquidity_per_tick: U512,
         uniswap_fee_tier: u32,
-        tick_map: HashMap<i32, (i128, U512)>,
+        tick_map: DashMap<i32, (i128, U512)>,
         is_active: bool,
     ) {
         self.nodes
@@ -119,143 +115,7 @@ impl UniversalGraph {
             },
         );
     }
-
-    pub fn save_pool_to_file(&self) -> std::io::Result<()> {
-        let file_path = "uniswap_pools_data.json";
-
-        // 1. Проверка наличия данных
-        if self.edges.is_empty() {
-            warn!("[UNISAWP_GRAPH_ГРАФ] Попытка сохранения пустого графа. edges содержит 0 пулов.");
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "[UNISAWP_GRAPH_ГРАФ] Нет данных для сохранения (edges пуст)",
-            ));
-        }
-
-        info!(
-            "[ГРАФ] Начинаем сохранение {} пулов в файл {}",
-            self.edges.len(),
-            file_path
-        );
-
-        // 2. Подготовка данных с безопасной обработкой чисел
-        let pools_dec: Vec<Value> = self.edges
-            .iter()
-            .map(|entry| {
-                let pool = entry.value();
-                json!({
-                    "uniswap_pool_address": format!("{:?}", pool.uniswap_pool_address),
-                    "uniswap_dex": pool.uniswap_dex,
-                    "uniswap_token_a": format!("{:?}", pool.uniswap_token_a),
-                    "uniswap_token_a_decimals": pool.uniswap_token_a_decimals,
-                    "uniswap_token_a_symbol": pool.uniswap_token_a_symbol,
-                    "uniswap_token_b": format!("{:?}", pool.uniswap_token_b),
-                    "uniswap_token_b_decimals": pool.uniswap_token_b_decimals,
-                    "uniswap_token_b_symbol": pool.uniswap_token_b_symbol,
-                    "uniswap_liquidity": pool.uniswap_liquidity.to_string(),
-                    "uniswap_sqrt_price": pool.uniswap_sqrt_price.to_string(),
-                    "uniswap_current_price": pool.uniswap_current_price.to_string(),
-                    "uniswap_tick_current": pool.uniswap_tick_current,
-                    "uniswap_tick_lower": pool.uniswap_tick_lower,
-                    "uniswap_tick_upper": pool.uniswap_tick_upper,
-                    "uniswap_tick_spacing": pool.uniswap_tick_spacing,
-                    "uniswap_max_liquidity_per_tick": pool.uniswap_max_liquidity_per_tick.to_string(),
-                    "uniswap_fee_tier": pool.uniswap_fee_tier,
-                    "tick_map": pool.tick_map
-                        .iter()
-                        .map(|tick_entry| {
-                            (
-                                tick_entry.key().to_string(),
-                                (
-                                    tick_entry.value().0.to_string(),
-                                    tick_entry.value().1.to_string()
-                                )
-                            )
-                        })
-                        .collect::<HashMap<String, (String, String)>>(),
-                    "is_active": pool.is_active,
-                })
-            })
-            .collect();
-
-        // 3. Создание файла
-        let mut file = match File::create(file_path) {
-            Ok(f) => {
-                info!("[UNISAWP_GRAPH_ГРАФ] Файл {} успешно создан", file_path);
-                f
-            }
-            Err(e) => {
-                error!(
-                    "[UNISAWP_GRAPH_ГРАФ] Не удалось создать файл {}: {}",
-                    file_path, e
-                );
-                return Err(e);
-            }
-        };
-
-        // 4. Сериализация и запись с обработкой ошибок
-        info!("[UNISAWP_GRAPH_ГРАФ] Начало сериализации данных...");
-        let json_string = match serde_json::to_string_pretty(&pools_dec) {
-            Ok(s) => s,
-            Err(e) => {
-                error!("[UNISAWP_GRAPH_ГРАФ] Ошибка сериализации: {}", e);
-
-                // Попробуем сохранить хотя бы часть данных для диагностики
-                let fallback_path = "uniswap_pools_fallback.json";
-                warn!(
-                    "[UNISAWP_GRAPH_ГРАФ] Попытка сохранить упрощенные данные в {}",
-                    fallback_path
-                );
-
-                let simplified: Vec<Value> = pools_dec
-                    .iter()
-                    .map(|pool| {
-                        json!({
-                            "pool": pool["uniswap_pool_address"],
-                            "token_a": pool["uniswap_token_a"],
-                            "token_b": pool["uniswap_token_b"]
-                        })
-                    })
-                    .collect();
-
-                if let Ok(simple_str) = serde_json::to_string(&simplified) {
-                    let _ = std::fs::write(fallback_path, simple_str);
-                }
-
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    format!("Ошибка сериализации: {}", e),
-                ));
-            }
-        };
-
-        // 5. Запись в файл
-        match file.write_all(json_string.as_bytes()) {
-            Ok(_) => {
-                info!("[UNISAWP_GRAPH_ГРАФ] Данные успешно записаны в файл");
-                match file.sync_all() {
-                    Ok(_) => {
-                        info!(
-                            "[UNISAWP_GRAPH_ГРАФ] Синхронизация файла завершена. Всего сохранено {} пулов",
-                            pools_dec.len()
-                        );
-                        Ok(())
-                    }
-                    Err(e) => {
-                        error!("[ГРАФ] Ошибка синхронизации файла: {}", e);
-                        Err(e)
-                    }
-                }
-            }
-            Err(e) => {
-                error!("UNISAWP_GRAPH_Ошибка записи в файл: {}", e);
-                Err(e)
-            }
-        }
-    }
-
-    
-
+      
     pub fn upsert_pool(&self, new_pool: UniswapPool) {
 
         if let Some(mut existing_pool) = self.edges.get_mut(&new_pool.uniswap_pool_address) {
@@ -309,8 +169,6 @@ impl UniversalGraph {
 
         bincode::deserialize(&buffer).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
     }
-
-
 
     pub fn save_to_bin_json(&self, path: &str) -> std::io::Result<()> {
         let snapshot = self.snapshot();
