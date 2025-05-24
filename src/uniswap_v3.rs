@@ -306,10 +306,10 @@ pub async fn fetch_active_ticks(
 
     // Параметры батчинга по fee
     let (total_batches, words_per_batch) = match fee {
-        100 => (10, 10),
-        500 => (10, 10),
-        3000 => (10, 10),
-        10_000 => (10, 10),
+           100 => (1, 1),
+           500 => (1, 1),
+          3000 => (1, 1),
+        10_000 => (1, 1),
         _ => (10, 5), // дефолт
     };
 
@@ -484,7 +484,7 @@ pub async fn sync_pools(
                         if token_whitelist.contains(&token0)
                             && token_whitelist.contains(&token1) =>
                     {
-                        info!(
+                        warn!(
                             "[UNISWAP_V3_КЭШ_whitelist] Пул {:?} проходит whitelist: {:?} ↔ {:?}",
                             addr, token0, token1
                         );

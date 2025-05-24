@@ -1,5 +1,5 @@
 pub mod aave_v3_flash_monitor;
-//pub mod path_builder;
+pub mod path_builder;
 pub mod provider;
 pub mod take_gas_price;
 pub mod token;
@@ -9,6 +9,10 @@ pub mod uniswap_graph;
 pub mod uniswap_v3;
 
 
+use aave_v3_flash_monitor::get_aave_data;
+use aave_v3_flash_monitor::AaveTokenLiquidity;
+use log::warn;
+use path_builder::PathBuilder;
 use provider::ProviderManager;
 
 use crate::token::TokenInfo;
@@ -19,7 +23,6 @@ use env_logger::Env;
 use ethers::types::Address;
 use log::error;
 use log::info;
-use log::warn;
 use std::env;
 use std::io::Write;
 use std::sync::Arc;
@@ -111,11 +114,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     //==========================================  ИНИЦИАЛИЗАЦИЯ AAVE FLASH MONITOR  ======================================
 
-    // Запускаем мониторинг асинхронно в фоне
-    tokio::spawn(
-        async move {    
-        if let Err(e) = aave_v3_flash_monitor::get_aave_data(provider_for_aave).await {
-            eprintln!("Error in Aave liquidity monitor: {:?}", e);
+    // Создаём канал с пустой структурой
+    let (aave_tx, aave_rx) = watch::channel(AaveTokenLiquidity::default());
+
+    // Запускаем мониторинг, передавая Sender
+    tokio::spawn({
+        async move {
+            if let Err(e) = get_aave_data(provider_for_aave, aave_tx).await {
+                eprintln!("Error in Aave liquidity monitor: {:?}", e);
+            }
         }
     });
 
@@ -161,7 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     ));
 
-    //====================================  ПОДКЛЮЧАЕМСЯ К ГАЗОВОЙ ТРУБЕ =================================================================-
+    //====================================  ПОДКЛЮЧАЕМСЯ К ГАЗОВОЙ ТРУБЕ =================================================================
 
     // Создаем канал для газа
     let (_gas_feed, gas_sender) = take_gas_price::GasPriceFeed::new();
@@ -173,16 +180,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    //==========================================  ПОЖКЛЮЧАЕМ ГРАФ  ========================================================================
+    //==========================================  ПОЖКЛЮЧАЕМ ГРАФ  И ЕГО КЛОНЫ  ===========================================================
 
     //  Создаем UniversalGraph
     let graph: Arc<UniversalGraph> = Arc::new(UniversalGraph::new());
 
-    info!("⏳[MAIN]  Синхронизация пулов начата...");
-    //let start = std::time::Instant::now();
+    // Клонируем для потоков и вызовов
+    let graph_for_event = Arc::clone(&graph);
+    let graph_for_sync = Arc::clone(&graph);
+    let graph_for_paths = Arc::clone(&graph);
 
-    // Клонируем Arc перед передачей в sync_pools
-    let graph_for_sync: Arc<UniversalGraph> = Arc::clone(&graph);
+    info!("⏳[MAIN]  Синхронизация пулов начата...");
 
     //==========================================  ПОДКЛЮЧАЕМ МОДУЛЬ ПОДПИСКИ  ==============================================================
 
@@ -203,6 +211,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("⏳[MAIN]  Создание подписчика на блоки...");
 
     let subscriber: Arc<UniswapEventSubscriber> =
+
         Arc::new(UniswapEventSubscriber::new(provider_http.clone()));
 
     let subscriber_clone = Arc::clone(&subscriber);
@@ -210,7 +219,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Запускаем polling_event как вечную фоновую задачу
     tokio::spawn(async move {
         if let Err(e) = subscriber_clone
-            .polling_event(graph.clone(), provider_ws_clone, block_receiver)
+            .polling_event( graph_for_event, provider_ws_clone, block_receiver)
             .await
         {
             error!(
@@ -259,6 +268,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 error!("❌ [ЦИКЛ {}] Ошибка синхронизации: {:?}", sync_counter, e);
             }
         }
+
+        info!("[MAIN] Бот завершил сканирование пулов");
+
+        //==============================  ВКЛЮЧАЕМ СВЕТ - НАХОДИМ ПУТЬ =========================================================
+
+
+        info!("[MAIN] Начинаем построение арбитражных путей ");
+
+        let mut path_builder = PathBuilder::new(aave_rx.clone());
+
+        path_builder.build_all_paths( &graph_for_paths);
+
+        info!(
+            "[MAIN] Построение путей завершено, найдено {} путей",
+            path_builder.paths.len()
+        );
+
+
         //==========================================  ОБНОВИМ КЕШ  ==============================================================
         {
             let cache = pool_cache.lock().await;
@@ -279,7 +306,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         sleep(sync_interval).await;
 
-        info!("[MAIN] Бот завершил сканирование пулов");
     }
     /*
 

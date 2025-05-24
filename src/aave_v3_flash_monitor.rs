@@ -8,7 +8,7 @@ use log::{error, info};
 use serde::{Deserialize, Serialize};
 use std::{collections::{HashMap, HashSet}, fs::File, sync::Arc};
 use std::{env, io::Write};
-use tokio::time::{Duration, sleep};
+use tokio::{sync::watch, time::{sleep, Duration}};
 
 abigen!(
     AavePoolDataProvider,
@@ -60,7 +60,7 @@ abigen!(
 
 
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct AaveTokenLiquidity {
     pub token_address: HashSet<Address>,
     pub token_info: HashMap<Address, (String, U256)>,
@@ -72,7 +72,11 @@ pub struct AaveLiquiditySnapshot {
     pub data: AaveTokenLiquidity,
 }
 
-pub async fn get_aave_data(provider: Arc<Provider<Http>>) -> Result<()> {
+pub async fn get_aave_data(
+    provider: Arc<Provider<Http>>,
+    aave_sender: watch::Sender<AaveTokenLiquidity>,
+    )-> Result<()> {
+
     let pool_address: Address = env::var("ARBITRUM_AAVE_V3_POOL_ADDRESS")?.parse()?;
     let data_provider_address: Address =
         env::var("ARBITRUM_AAVE_V3_POOL_DATA_PROVIDER_ADDRESS")?.parse()?;
@@ -116,6 +120,11 @@ pub async fn get_aave_data(provider: Arc<Provider<Http>>) -> Result<()> {
                     },
                 };
 
+                        // Отправляем обновлённые данные в канал watch
+                if let Err(e) = aave_sender.send(snapshot.data.clone()) {
+                    error!("❌ [AAVE] Ошибка отправки обновлённых данных через канал: {:?}", e);
+                }
+
                 match serde_json::to_string_pretty(&snapshot) {
                     Ok(json) => {
                         match File::create("aave_liquidity.json") {
@@ -152,6 +161,6 @@ pub async fn get_aave_data(provider: Arc<Provider<Http>>) -> Result<()> {
             }
         }
 
-        sleep(Duration::from_secs(30)).await;
+        sleep(Duration::from_secs(300)).await;
     }
 }
