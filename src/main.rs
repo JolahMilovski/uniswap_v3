@@ -14,6 +14,7 @@ use aave_v3_flash_monitor::AaveTokenLiquidity;
 use log::warn;
 use path_builder::PathBuilder;
 use provider::ProviderManager;
+use token::load_token_list_from_json;
 
 use crate::token::TokenInfo;
 use dashmap::{DashMap, DashSet};
@@ -27,7 +28,6 @@ use std::env;
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
-use token::load_token_cache;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
 use tokio::time::sleep;
@@ -114,34 +114,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
    
 
-    //==========================================  КЭШ ТОКЕНОВ И БЕЛЫЙ СПИСОК  ==========================================================================================================
+    //==========================================  КЭШ ТОКЕНОВ  ==========================================================================================================
+
 
     // ⛓ Инициализация токен-кэша
     pub type TokenCache = Arc<DashMap<Address, TokenInfo>>;
 
-    let token_cache: TokenCache = Arc::new(match load_token_cache().await {
-        Some(cache) => {
+    let token_cache: TokenCache = {
+        let raw_map = load_token_list_from_json();
+        if raw_map.is_empty() {
+            info!("[КЭШ] [MAIN] Token кэш не найден или пуст, создаём новый");
+            Arc::new(DashMap::new())
+        } else {
             info!("[КЭШ] [MAIN] Token кэш успешно загружен");
-            DashMap::from_iter(cache.into_iter())
+            Arc::new(DashMap::from_iter(raw_map.into_iter()))
         }
-        None => {
-            info!("[КЭШ] [MAIN] Token кэш не найден или поврежден, создаём новый");
-            DashMap::new()
-        }
-    });
+    };
+
+
+
+//======================================= ЗАГРУЖАЕМ БЕЛЫЙ СПИСОК ТОКЕНОВ ================================================================================================
+
 
     //  ✅ Загрузка token_list.json для фильтрации топовых токенов
     let token_whitelist_set: Arc<DashSet<Address>> = Arc::new(
-        token::load_token_list_from_json("token_list.json")
-            .keys()
-            .cloned()
-            .collect(),
-    );
-
+    token::load_token_whitelist("token_white_list.json")
+        .into_iter()
+        .collect(),
+);
     info!(
         "[MAIN] Загружено {} токенов из token_list.json",
         token_whitelist_set.len()
     );
+
+
+//===========================================  ЗАГРУЖАЕМ КЭШ АДРЕСОВ ПУЛОВ ===============================================================================================
+
+
 
     let pool_cache: Arc<Mutex<UniswapPoolCache>> = Arc::new(Mutex::new(
         match UniswapPoolCache::load_from_bin("uniswap_pool_addresses_cache.bin") {

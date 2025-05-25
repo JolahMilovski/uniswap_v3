@@ -4,20 +4,18 @@ use ethers::prelude::*;
 use ethers::types::Address;
 use log::error;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::HashMap, fs};
 use tokio::time::sleep;
 
-const TOKEN_CACHE_BIN_PATH: &str = "token_cache.bin";
-const TOKEN_CACHE_JSON_PATH: &str = "token_cache.json";
 
 abigen!(
     ERC20,
     r#"[{"constant":true,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"payable":false,"stateMutability":"view","type":"function"},
     {"constant":true,"inputs":[],"name":"symbol","outputs":[{"name":"","type":"string"}],"payable":false,"stateMutability":"view","type":"function"}]"#
 );
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenInfo {
     pub symbol: String,
@@ -26,11 +24,14 @@ pub struct TokenInfo {
 
 pub type TokenCache = Arc<DashMap<Address, TokenInfo>>;
 
+const TOKEN_CACHE_JSON_PATH: &str = "token_cache.json";
+
 pub async fn get_single_token_data<M: Middleware + 'static>(
-    address: H160,
+    address: Address,
     provider: Arc<M>,
     token_cache: &TokenCache,
-) -> Result<TokenInfo, anyhow::Error> {
+) -> Result<TokenInfo,anyhow::Error > {
+
     if let Some(cached) = token_cache.get(&address) {
         return Ok(cached.clone());
     }
@@ -66,32 +67,12 @@ pub async fn get_single_token_data<M: Middleware + 'static>(
 
     token_cache.insert(address, token_info.clone());
 
-    // Сохранение в файл (бин)
-    let serialized_map: HashMap<_, _> = token_cache
-        .iter()
-        .map(|kv| (*kv.key(), kv.value().clone()))
-        .collect();
-    if let Ok(data) = bincode::serialize(&serialized_map) {
-        if let Err(e) = std::fs::write(TOKEN_CACHE_BIN_PATH, &data) {
-            error!("[TOKEN][КЭШ] Ошибка записи BIN: {:?}", e);
-        }
+    // Сохранение в JSON
+    if let Err(e) = save_token_cache_to_json(token_cache).await {
+        error!("[TOKEN][КЭШ] Ошибка записи JSON: {:?}", e);
     }
 
     Ok(token_info)
-}
-
-pub async fn load_token_cache() -> Option<HashMap<Address, TokenInfo>> {
-    if let Ok(bytes) = tokio::fs::read("token_cache.bin").await {
-        match bincode::deserialize::<HashMap<Address, TokenInfo>>(&bytes) {
-            Ok(map) => Some(map),
-            Err(e) => {
-                error!("Ошибка при десериализации token_cache.bin: {:?}", e);
-                None
-            }
-        }
-    } else {
-        None
-    }
 }
 
 pub async fn save_token_cache_to_json(
@@ -106,15 +87,28 @@ pub async fn save_token_cache_to_json(
     Ok(())
 }
 
-pub fn load_token_list_from_json(path: &str) -> HashMap<Address, String> {
-    let json = fs::read_to_string(path).expect("Не удалось прочитать token_list.json");
-    let raw_map: HashMap<String, String> =
-        serde_json::from_str(&json).expect("Ошибка парсинга token_list.json");
+pub fn load_token_list_from_json() -> HashMap<Address, TokenInfo> {
+    let json = fs::read_to_string(TOKEN_CACHE_JSON_PATH)
+        .expect("Не удалось прочитать token_cache.json");
+    let raw_map: HashMap<String, TokenInfo> =
+        serde_json::from_str(&json).expect("Ошибка парсинга token_cache.json");
 
     raw_map
         .into_iter()
-        .filter_map(|(addr_str, symbol)| {
-            addr_str.parse::<Address>().ok().map(|addr| (addr, symbol))
+        .filter_map(|(addr_str, info)| {
+            addr_str.parse::<Address>().ok().map(|addr| (addr, info))
         })
         .collect()
 }
+
+pub fn load_token_whitelist(path: &str) -> HashSet<Address> {
+    let json = fs::read_to_string(path).expect("Не удалось прочитать token_white_list.json");
+    let raw_map: HashMap<String, String> =
+        serde_json::from_str(&json).expect("Ошибка парсинга token_white_list.json");
+
+    raw_map
+        .into_iter()
+        .filter_map(|(addr_str, _symbol)| addr_str.parse::<Address>().ok())
+        .collect()
+}
+

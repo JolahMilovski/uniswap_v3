@@ -62,7 +62,7 @@ impl UniswapPoolCache {
         })
     }
 
-    // Сохранение в JSON (уже принимает путь)
+    // Сохранение в JSON 
     pub fn save_to_json(&self, path: &str) -> std::io::Result<()> {
         let json = serde_json::to_string_pretty(&self)?;
         let mut file = File::create(path)?;
