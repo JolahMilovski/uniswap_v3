@@ -9,7 +9,7 @@ pub mod uniswap_graph;
 pub mod uniswap_v3;
 
 
-use aave_v3_flash_monitor::get_aave_data;
+use aave_v3_flash_monitor::get_aave_data_with_prices;
 use aave_v3_flash_monitor::AaveTokenLiquidity;
 use log::warn;
 use path_builder::PathBuilder;
@@ -112,19 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let provider_gas = provider_http.clone();
 
-    //==========================================  ИНИЦИАЛИЗАЦИЯ AAVE FLASH MONITOR  ====================================================================================================
-
-    // Создаём канал с пустой структурой
-    let (aave_tx, aave_rx) = watch::channel(AaveTokenLiquidity::default());
-
-    // Запускаем мониторинг, передавая Sender
-    tokio::spawn({
-        async move {
-            if let Err(e) = get_aave_data(provider_for_aave, aave_tx).await {
-                eprintln!("Error in Aave liquidity monitor: {:?}", e);
-            }
-        }
-    });
+   
 
     //==========================================  КЭШ ТОКЕНОВ И БЕЛЫЙ СПИСОК  ==========================================================================================================
 
@@ -189,38 +177,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let graph_for_event = Arc::clone(&graph);
     let graph_for_sync = Arc::clone(&graph);
     let graph_for_paths = Arc::clone(&graph);
+    let graph_for_aave = Arc::clone(&graph);
 
-    info!("⏳[MAIN]  Синхронизация пулов начата...");
 
+ //==========================================  ИНИЦИАЛИЗАЦИЯ AAVE FLASH MONITOR  ====================================================================================================
+    
+    //канал готовности графа    
+    let (graph_ready_tx, graph_ready_rx) = watch::channel(false);
+
+    // Создаём канал с пустой структурой
+    let (aave_tx, aave_rx) = watch::channel(AaveTokenLiquidity::default());
+
+    // Запускаем мониторинг, передавая Sender
+    tokio::spawn({
+        async move {
+            if let Err(e) = get_aave_data_with_prices(provider_for_aave, aave_tx, graph_for_aave.clone(),graph_ready_rx.clone(),).await {
+                
+                eprintln!("Error in Aave liquidity monitor: {:?}", e);
+            }
+        }
+    });
+    
     //==========================================  ПОДКЛЮЧАЕМ МОДУЛЬ ПОДПИСКИ  ============================================================================================================================
-
+    
     // Создаем канал для передачи новых блоков
     let (block_sender, block_receiver) = watch::channel(0);
-
+    
     // Запускаем подписку на новые блоки в отдельной задаче
     tokio::spawn(async move {
         if let Err(e) =
-            UniswapEventSubscriber::subscribe_to_new_blocks(&provider_ws, block_sender).await
+        UniswapEventSubscriber::subscribe_to_new_blocks(&provider_ws, block_sender).await
         {
             error!("Ошибка в подписке на блоки: {:?}", e);
         }
     });
-
+    
     sleep(std::time::Duration::from_secs(1)).await;
-
+    
     info!("⏳[MAIN]  Создание подписчика на блоки...");
-
+    
     let subscriber: Arc<UniswapEventSubscriber> =
-
-        Arc::new(UniswapEventSubscriber::new(provider_http.clone()));
-
+    
+    Arc::new(UniswapEventSubscriber::new(provider_http.clone()));
+    
     let subscriber_clone = Arc::clone(&subscriber);
-
+    
     // Запускаем polling_event как вечную фоновую задачу
     tokio::spawn(async move {
         if let Err(e) = subscriber_clone
-            .polling_event( graph_for_event, provider_ws_clone, block_receiver)
-            .await
+        .polling_event( graph_for_event, provider_ws_clone, block_receiver)
+        .await
         {
             error!(
                 "💥 [MAIN] Задача polling_event завершилась с ошибкой: {:?}",
@@ -230,14 +236,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             warn!("⚠️ [MAIN] Задача polling_event завершилась. Это не штатное поведение.");
         }
     });
-
+    
     //==========================================  ЗАПУСТИЛИ СКАНИРОВАНИЕ  ============================================================================================================================
-
+    
+        info!("⏳[MAIN]  Синхронизация пулов начата...");
     // Основной цикл для периодической синхронизации пулов
     // Настройки синхронизации
     let mut sync_counter: u64 = 0;
     let sync_interval = Duration::from_secs(1800); // 30 минут
 
+    let mut first_sync_done = false; //метка первого цикла синхронизации
     // Основной цикл
     loop {
         sync_counter += 1;
@@ -263,6 +271,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "✅ [ЦИКЛ {}] Синхронизация завершена за {:?}",
                     sync_counter, duration
                 );
+
+                 // <==== ВАЖНО: Сигналим AAVE-монитору, что граф готов ====
+                if !first_sync_done {
+                    if let Err(e) = graph_ready_tx.send(true) {
+                        error!("[MAIN] Не удалось отправить сигнал готовности графа: {:?}", e);
+                    } else {
+                        warn!("[MAIN] Сигнал готовности графа отправлен");
+                        first_sync_done = true;
+                    }
+                }
+
             }
             Err(e) => {
                 error!("❌ [ЦИКЛ {}] Ошибка синхронизации: {:?}", sync_counter, e);
@@ -308,7 +327,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     }
     /*
-
     loop {
         sleep(Duration::from_secs(60)).await;
     }
