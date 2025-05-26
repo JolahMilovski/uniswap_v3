@@ -9,7 +9,7 @@ pub mod uniswap_graph;
 pub mod uniswap_v3;
 
 
-use aave_v3_flash_monitor::get_aave_data_with_prices;
+use aave_v3_flash_monitor::get_aave_data;
 use aave_v3_flash_monitor::AaveTokenLiquidity;
 use log::warn;
 use path_builder::PathBuilder;
@@ -110,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let provider_ws_clone = provider_ws.clone();
     let provider_ws_for_sync = provider_ws.clone();
 
-    let provider_gas = provider_http.clone();
+    //let provider_gas = provider_http.clone();
 
    
 
@@ -166,17 +166,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     //====================================  ПОДКЛЮЧАЕМСЯ К ГАЗОВОЙ ТРУБЕ ===============================================================================================================================
+/*
+// Создаем канал для газа
+let (_gas_feed, gas_sender) = take_gas_price::GasPriceFeed::new();
 
-    // Создаем канал для газа
-    let (_gas_feed, gas_sender) = take_gas_price::GasPriceFeed::new();
+// Запускаем таск по обновлению цены газа
+tokio::spawn({
+    async move {
+        take_gas_price::start_gas_price_loop(provider_gas, gas_sender).await;
+    }
+});
 
-    // Запускаем таск по обновлению цены газа
-    tokio::spawn({
-        async move {
-            take_gas_price::start_gas_price_loop(provider_gas, gas_sender).await;
-        }
-    });
-
+*/
     //==========================================  ПОЖКЛЮЧАЕМ ГРАФ  И ЕГО КЛОНЫ  =========================================================================================================================
 
     //  Создаем UniversalGraph
@@ -186,13 +187,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let graph_for_event = Arc::clone(&graph);
     let graph_for_sync = Arc::clone(&graph);
     let graph_for_paths = Arc::clone(&graph);
-    let graph_for_aave = Arc::clone(&graph);
+    //let graph_for_aave = Arc::clone(&graph);
 
 
  //==========================================  ИНИЦИАЛИЗАЦИЯ AAVE FLASH MONITOR  ====================================================================================================
-    
-    //канал готовности графа    
-    let (graph_ready_tx, graph_ready_rx) = watch::channel(false);
+ 
 
     // Создаём канал с пустой структурой
     let (aave_tx, aave_rx) = watch::channel(AaveTokenLiquidity::default());
@@ -200,9 +199,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Запускаем мониторинг, передавая Sender
     tokio::spawn({
         async move {
-            if let Err(e) = get_aave_data_with_prices(provider_for_aave, aave_tx, graph_for_aave.clone(),graph_ready_rx.clone(),).await {
+            if let Err(e) = get_aave_data(provider_for_aave, aave_tx).await {
                 
-                eprintln!("Error in Aave liquidity monitor: {:?}", e);
+                eprintln!("[MAIN] Error in Aave liquidity monitor: {:?}", e);
             }
         }
     });
@@ -217,7 +216,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(e) =
         UniswapEventSubscriber::subscribe_to_new_blocks(&provider_ws, block_sender).await
         {
-            error!("Ошибка в подписке на блоки: {:?}", e);
+            error!("[MAIN] Ошибка в подписке на блоки: {:?}", e);
         }
     });
     
@@ -225,16 +224,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     info!("⏳[MAIN]  Создание подписчика на блоки...");
     
-    let subscriber: Arc<UniswapEventSubscriber> =
-    
-    Arc::new(UniswapEventSubscriber::new(provider_http.clone()));
+    let subscriber: Arc<UniswapEventSubscriber> = Arc::new(UniswapEventSubscriber::new(provider_http.clone()));
     
     let subscriber_clone = Arc::clone(&subscriber);
     
+    let block_receiver_clone_to_subscriber = block_receiver.clone();
     // Запускаем polling_event как вечную фоновую задачу
     tokio::spawn(async move {
         if let Err(e) = subscriber_clone
-        .polling_event( graph_for_event, provider_ws_clone, block_receiver)
+        .polling_event( graph_for_event, provider_ws_clone, &block_receiver_clone_to_subscriber)
         .await
         {
             error!(
@@ -248,20 +246,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     //==========================================  ЗАПУСТИЛИ СКАНИРОВАНИЕ  ============================================================================================================================
     
-        info!("⏳[MAIN]  Синхронизация пулов начата...");
+    info!("⏳[MAIN]  Синхронизация пулов начата...");
     // Основной цикл для периодической синхронизации пулов
     // Настройки синхронизации
     let mut sync_counter: u64 = 0;
     let sync_interval = Duration::from_secs(1800); // 30 минут
-
-    let mut first_sync_done = false; //метка первого цикла синхронизации
     // Основной цикл
     loop {
         sync_counter += 1;
         let cycle_start = std::time::Instant::now();
-
-        info!("🔄 [ЦИКЛ {}] Начало синхронизации пулов", sync_counter);
-
+        
+        info!("🔄 [MAIN_ЦИКЛ {}] Начало синхронизации пулов", sync_counter);
+        
         // Синхронизация пулов
         match uniswap_v3::sync_pools(
             graph_for_sync.clone(),
@@ -277,63 +273,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(_) => {
                 let duration = cycle_start.elapsed();
                 info!(
-                    "✅ [ЦИКЛ {}] Синхронизация завершена за {:?}",
+                    "✅ [MAIN_ЦИКЛ {}] Синхронизация завершена за {:?}",
                     sync_counter, duration
                 );
-
-                 // <==== ВАЖНО: Сигналим AAVE-монитору, что граф готов ====
-                if !first_sync_done {
-                    if let Err(e) = graph_ready_tx.send(true) {
-                        error!("[MAIN] Не удалось отправить сигнал готовности графа: {:?}", e);
-                    } else {
-                        warn!("[MAIN] Сигнал готовности графа отправлен");
-                        first_sync_done = true;
-                    }
-                }
-
             }
             Err(e) => {
-                error!("❌ [ЦИКЛ {}] Ошибка синхронизации: {:?}", sync_counter, e);
+                error!("❌ [MAIN_ЦИКЛ {}] Ошибка синхронизации: {:?}", sync_counter, e);
             }
         }
+        
+        info!("[MAIN_PATH_BUILDER] Бот завершил сканирование пулов");
+        
 
-        info!("[MAIN] Бот завершил сканирование пулов");
-
-//==============================  ВКЛЮЧАЕМ СВЕТ - НАХОДИМ ПУТЬ =======================================================================================================================
-
-
-        info!("[MAIN] Начинаем построение арбитражных путей ");
-
-        let mut path_builder = PathBuilder::new(aave_rx.clone());
-
-        path_builder.build_all_paths( &graph_for_paths);
-
-        info!(
-            "[MAIN] Построение путей завершено, найдено {} путей",
-            path_builder.paths.len()
-        );
+        
+               
+        //==========================================  ОБНОВИМ КЕШ  ============================================================================================================================
 
 
-//==========================================  ОБНОВИМ КЕШ  ============================================================================================================================
         {
-            let cache = pool_cache.lock().await;
+            let block_receiver_clone_to_cache = block_receiver.clone();
+
+            let last_block = *block_receiver_clone_to_cache.borrow(); // Берём последний известный номер блока из канала
+            
+            let mut cache = pool_cache.lock().await;
+            cache.last_verified_block = last_block;  // Обновляем номер блока в кеше
+            
             if let Err(e) = cache.save_to_bin("uniswap_pool_addresses_cache.bin") {
-                error!("[ЦИКЛ {}] Ошибка сохранения кэша: {:?}", sync_counter, e);
+                error!("[MAIN_ЦИКЛ {}] Ошибка сохранения кэша: {:?}", sync_counter, e);
             }
             if let Err(e) = cache.save_to_json("debug_uniswap_cache.json") {
                 error!("[ЦИКЛ {}] Ошибка сохранения JSON: {:?}", sync_counter, e);
             }
         }
 
+
+        
+        //==============================  ВКЛЮЧАЕМ СВЕТ - НАХОДИМ ПУТЬ =======================================================================================================================
+        
+        
+        info!("[MAIN_PATH_BUILDER] Начинаем построение арбитражных путей ");
+        
+        let mut path_builder = PathBuilder::new(aave_rx.clone());
+        
+        path_builder.build_all_paths( &graph_for_paths);
+        
+        info!(
+            "[MAIN_PATH_BUILDER] Построение путей завершено, найдено {} путей",
+            path_builder.paths.len()
+        );
+
+        
+        
         // Ожидание следующего цикла
         info!(
-            "⏳ [ЦИКЛ {}] Ожидание следующей синхронизации через {} минут...",
+            "⏳ [MAIN_ЦИКЛ {}] Ожидание следующей синхронизации через {} минут...",
             sync_counter,
             sync_interval.as_secs() / 60
         );
-
+        
         sleep(sync_interval).await;
-
+        
     }
     /*
     loop {

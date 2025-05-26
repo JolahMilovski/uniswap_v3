@@ -1,7 +1,5 @@
 use bincode::{deserialize, serialize};
 use ethers::types::Address;
-use ethers_providers::{Middleware, Provider, Ws};
-use log::info;
 use serde::Serialize;
 use std::io::{self, Read, Write};
 use std::{collections::HashSet, fs::File};
@@ -23,21 +21,7 @@ impl UniswapPoolCache {
     // Добавление адреса пула в кэш
     pub fn add_pool_address(&mut self, address: Address) {
         self.pool_addresses.insert(address);
-    }
-
-    // Обновление последнего проверенного блока
-    pub async fn update_last_verified_block(
-        &mut self,
-        provider: &Provider<Ws>,
-    ) -> Result<(), String> {
-        match provider.get_block_number().await {
-            Ok(block_number) => {
-                self.last_verified_block = block_number.as_u64(); // Обновляем значение в структуре
-                Ok(())
-            }
-            Err(e) => Err(format!("[КЭШ]Ошибка получения последнего блока: {:?}", e)),
-        }
-    }
+    } 
 
     // Сохранение кэша в бинарный файл
     pub fn save_to_bin(&self, path: &str) -> io::Result<()> {
@@ -70,22 +54,5 @@ impl UniswapPoolCache {
         Ok(())
     }
 
-    /// Обновляет кэш новыми пулами, сохраняя существующие
-    pub fn update_with_new_pools(
-        &mut self,
-        new_pools: &HashSet<Address>,
-        current_block: u64,
-    ) -> io::Result<()> {
-        let old_count = self.pool_addresses.len();
-        for addr in new_pools {
-            self.pool_addresses.insert(*addr);
-        }
-        self.last_verified_block = current_block;
-        info!(
-            "[КЭШ]Обновлен кэш пулов: было {} -> стало {}",
-            old_count,
-            self.pool_addresses.len()
-        );
-        self.save_to_bin("uniswap_pool_addresses_cache.bin")
-    }
+
 }

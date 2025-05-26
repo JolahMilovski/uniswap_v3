@@ -522,7 +522,7 @@ impl UniswapEventSubscriber {
         &self,
         graph: Arc<UniversalGraph>,
         provider_ws: Arc<Provider<Ws>>,
-        block_receiver: watch::Receiver<u64>, // Канал для получения блока
+        block_receiver: &watch::Receiver<u64>, // Канал для получения блока
     ) -> anyhow::Result<()> {
         let mut block_from: u64 = *block_receiver.borrow();
         let max_chunk_size: u64 = 200;

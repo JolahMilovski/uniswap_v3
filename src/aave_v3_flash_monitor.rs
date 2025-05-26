@@ -1,3 +1,4 @@
+use anyhow::Result;
 use chrono::Utc;
 use ethers::{
     prelude::*,
@@ -8,8 +9,6 @@ use serde::{Deserialize, Serialize};
 use std::{collections::{HashMap, HashSet}, fs::File, sync::Arc};
 use std::{env, io::Write};
 use tokio::{sync::watch, time::{sleep, Duration}};
-
-use crate::uniswap_graph::UniversalGraph;
 
 abigen!(
     AavePoolDataProvider,
@@ -64,7 +63,7 @@ abigen!(
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct AaveTokenLiquidity {
     pub token_address: HashSet<Address>,
-    pub token_info: HashMap<Address, (String, U256, U512)>,
+    pub token_info: HashMap<Address, (String, U256)>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -73,27 +72,17 @@ pub struct AaveLiquiditySnapshot {
     pub data: AaveTokenLiquidity,
 }
 
-pub async fn get_aave_data_with_prices(
+pub async fn get_aave_data(
     provider: Arc<Provider<Http>>,
     aave_sender: watch::Sender<AaveTokenLiquidity>,
-    graph: Arc<UniversalGraph>,
-    mut graph_ready_rx: watch::Receiver<bool>,
-) -> anyhow::Result<()> {
+    )-> Result<()> {
+
     let pool_address: Address = env::var("ARBITRUM_AAVE_V3_POOL_ADDRESS")?.parse()?;
-    let data_provider_address: Address = env::var("ARBITRUM_AAVE_V3_POOL_DATA_PROVIDER_ADDRESS")?.parse()?;
-    let weth_addr: Address = env::var("WETH")?.parse()?;
+    let data_provider_address: Address =
+        env::var("ARBITRUM_AAVE_V3_POOL_DATA_PROVIDER_ADDRESS")?.parse()?;
 
     let pool_data_provider = AavePoolDataProvider::new(data_provider_address, provider.clone());
     let pool_v3 = AavePool::new(pool_address, provider.clone());
-
-    // дожидаемся сигнала о готовности графа
-    loop {
-        if *graph_ready_rx.borrow() {
-            break;
-        }
-        info!("⏳ [AAVE] Ожидание завершения синхронизации графа...");
-        graph_ready_rx.changed().await?;
-    }
 
     loop {
         info!("🔄  [AAVE] Начинаем обновление ликвидности Aave");
@@ -109,24 +98,9 @@ pub async fn get_aave_data_with_prices(
                     match pool_v3.get_reserve_data(token.token_address).call().await {
                         Ok(reserve_data) => {
                             token_address.insert(token.token_address);
-
-                            // поиск цены в WETH через граф (гарантированно инициализирован)
-                            let mut price = ethers::types::U512::zero();
-                            for entry in graph.nodes.iter() {
-                                let pool_addr = *entry.key();
-                                let (t0, t1) = *entry.value();
-
-                                if (t0 == weth_addr && t1 == token.token_address) || (t0 == token.token_address && t1 == weth_addr) {
-                                    if let Some(pool) = graph.edges.get(&pool_addr) {
-                                        price = pool.uniswap_current_price;
-                                        break;
-                                    }
-                                }
-                            }
-
                             token_info.insert(
                                 token.token_address,
-                                (token.symbol.clone(), reserve_data.available_liquidity, price),
+                                (token.symbol.clone(), reserve_data.available_liquidity),
                             );
                         }
                         Err(e) => {
@@ -146,6 +120,7 @@ pub async fn get_aave_data_with_prices(
                     },
                 };
 
+                        // Отправляем обновлённые данные в канал watch
                 if let Err(e) = aave_sender.send(snapshot.data.clone()) {
                     error!("❌ [AAVE] Ошибка отправки обновлённых данных через канал: {:?}", e);
                 }
@@ -158,7 +133,7 @@ pub async fn get_aave_data_with_prices(
                                     error!("❌ [AAVE] Ошибка записи JSON в файл: {:?}", e);
                                 } else {
                                     info!(
-                                        "🟢 [AAVE] [{}] Сохранили {} токенов с ценами в aave_liquidity.json",
+                                        "🟢 [AAVE] [{}] Сохранили {} токенов в aave_liquidity.json",
                                         snapshot.timestamp,
                                         snapshot.data.token_info.len()
                                     );
@@ -166,7 +141,10 @@ pub async fn get_aave_data_with_prices(
                                 }
                             }
                             Err(e) => {
-                                error!("❌ [AAVE] Не удалось создать файл aave_liquidity.json: {:?}", e);
+                                error!(
+                                    "❌ [AAVE] Не удалось создать файл aave_liquidity.json: {:?}",
+                                    e
+                                );
                             }
                         }
                     }

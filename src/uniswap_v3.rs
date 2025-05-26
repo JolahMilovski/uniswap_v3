@@ -439,6 +439,9 @@ pub async fn sync_pools(
     start_block_from_env: u64,
     event_subscriber: Arc<UniswapEventSubscriber>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+
+
+
     // === Фаза 1: обработка пулов из кэша ========================================================================================================================================================================================================================
 
     let (original_addresses, original_count) = {
@@ -543,6 +546,8 @@ pub async fn sync_pools(
     let (factory_address, start_block) = {
         let pool_cache_lock = pool_cache.lock().await;
         let factory_address: Address = get_env_var("UNISWAP_V3_FACTORY").parse()?;
+
+        
         let start_block_in = if pool_cache_lock.pool_addresses.is_empty() {
             start_block_from_env
         } else {
