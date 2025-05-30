@@ -1,10 +1,13 @@
 use dashmap::DashMap;
 use ethers::types::{Address, U512};
+use im::OrdMap;
 use log::debug;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
+//use std::sync::Arc;
+ 
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct UniversalGraph {
@@ -46,8 +49,8 @@ pub struct UniswapPool {
     pub uniswap_tick_spacing: i32,
     pub uniswap_max_liquidity_per_tick: U512,
     pub uniswap_fee_tier: u32,
-    #[serde(skip_serializing_if = "DashMap::is_empty",serialize_with = "serialize_tick_map")]
-    pub tick_map: DashMap<i32, (i128, U512)>, // Изменили на DashMap
+    pub tick_map:OrdMap<i32, (i128, U512)>, // Изменили на DashMap
+    
     pub is_active: bool,
 }
 
@@ -79,16 +82,12 @@ impl UniversalGraph {
         uniswap_tick_spacing: i32,
         uniswap_max_liquidity_per_tick: U512,
         uniswap_fee_tier: u32,
-        tick_map: DashMap<i32, (i128, U512)>,
+        tick_map: OrdMap<i32, (i128, U512)>,
         is_active: bool,
     ) {
         self.nodes
             .insert(uniswap_pool_address, (uniswap_token_a, uniswap_token_b));
-
-        let dash_tick_map = DashMap::new();
-        for (tick, data) in tick_map {
-            dash_tick_map.insert(tick, data);
-        }
+      
 
         self.edges.insert(
             uniswap_pool_address,
@@ -110,44 +109,30 @@ impl UniversalGraph {
                 uniswap_tick_spacing,
                 uniswap_max_liquidity_per_tick,
                 uniswap_fee_tier,
-                tick_map: dash_tick_map,
+                tick_map,
                 is_active,
             },
         );
     }
       
     pub fn upsert_pool(&self, new_pool: UniswapPool) {
-
         if let Some(mut existing_pool) = self.edges.get_mut(&new_pool.uniswap_pool_address) {
             existing_pool.uniswap_liquidity = new_pool.uniswap_liquidity;
             existing_pool.uniswap_sqrt_price = new_pool.uniswap_sqrt_price;
             existing_pool.uniswap_current_price = new_pool.uniswap_current_price;
             existing_pool.uniswap_tick_current = new_pool.uniswap_tick_current;
             existing_pool.is_active = new_pool.is_active;
+            existing_pool.tick_map = existing_pool.tick_map.clone().union(new_pool.tick_map.clone());
 
-            // Обновляем tick_map
-            existing_pool.tick_map.clear();
-            for (tick, data) in new_pool.tick_map.into_iter() {
-                existing_pool.tick_map.insert(tick, data);
-            }
-
-            debug!(
-                "UNISAWP_GRAPH_Обновлен пул: {:?}",
-                new_pool.uniswap_pool_address
-            );
+            debug!("UNISAWP_GRAPH_Обновлен пул: {:?}", new_pool.uniswap_pool_address);
             self.nodes.insert(new_pool.uniswap_pool_address, (new_pool.uniswap_token_a, new_pool.uniswap_token_b));
-        }
-        
-        else
-        
-        {
+        } else {
             let pool_address = new_pool.uniswap_pool_address;
             let token_a = new_pool.uniswap_token_a;
             let token_b = new_pool.uniswap_token_b;
 
             self.edges.insert(pool_address, new_pool);
             self.nodes.insert(pool_address, (token_a, token_b));
-
         }
     }
 
@@ -201,20 +186,4 @@ impl UniversalGraph {
     }
 }
 
-fn serialize_tick_map<S>(
-    tick_map: &DashMap<i32, (i128, U512)>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    use serde::ser::SerializeMap;
-    let mut map = serializer.serialize_map(Some(tick_map.len()))?;
-    for entry in tick_map.iter() {
-        map.serialize_entry(
-            &entry.key().to_string(),
-            &(entry.value().0.to_string(), entry.value().1.to_string()),
-        )?;
-    }
-    map.end()
-}
+

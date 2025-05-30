@@ -11,7 +11,6 @@ use tokio::sync::watch;
 
 use crate::{aave_v3_flash_monitor::AaveTokenLiquidity, uniswap_graph::UniversalGraph};
 
-
 /// Структура представляющая путь арбитража
 /// Содержит последовательность токенов и пулов для выполнения арбитражной сделки
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,7 +179,6 @@ impl PathBuilder {
 
             // Если достигли максимальной длины пути (4 хопа), прекращаем поиск
             if current_hops == 4 {
-
                 return;
             }
         }
@@ -238,5 +236,4 @@ impl PathBuilder {
         serde_json::to_writer_pretty(file, self)?;
         Ok(())
     }
-
 }

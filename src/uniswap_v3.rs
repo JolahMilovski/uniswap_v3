@@ -8,7 +8,6 @@ use crate::uniswap_graph::UniversalGraph;
 
 use cfmms::dex::uniswap_v3::UniswapV3Dex;
 use cfmms::{dex::Dex, pool::Pool as CfmmsPool, sync::sync_pairs};
-use dashmap::DashMap;
 use dashmap::DashSet;
 use ethers::contract::abigen;
 use ethers::providers::Provider;
@@ -17,12 +16,11 @@ use ethers::types::H160;
 use ethers::types::{Address, U512};
 use ethers_providers::Ws;
 use futures::stream;
+use im::OrdMap;
 use log::error;
 use log::info;
 use log::warn;
-//use tokio::time::sleep;
 
-use std::collections::HashMap;
 use std::env;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -292,13 +290,15 @@ pub fn tick_to_sqrt_price(tick: i32) -> Result<U512, String> {
     Ok(ratio >> 32)
 }
 
-/// Получаем активные тики из пула Uniswap V3  
+
+
+/// Получаем активные тики из пула Uniswap V3
 pub async fn fetch_active_ticks(
     pool_address: Address,
     client: Arc<Provider<Ws>>,
     current_tick: i32,
     fee: u32,
-) -> Result<DashMap<i32, (i128, U512)>, anyhow::Error> {
+) -> Result<OrdMap<i32, (i128, U512)>, anyhow::Error> {
     let tick_lens_address: Address = env::var("UNISWAP_TICK_LENS_ADDRESS")?.parse()?;
     let tick_lens = Arc::new(TickLens::new(tick_lens_address, client.clone()));
 
@@ -306,9 +306,9 @@ pub async fn fetch_active_ticks(
 
     // Параметры батчинга по fee
     let (total_batches, words_per_batch) = match fee {
-           100 => (1, 1),
-           500 => (1, 1),
-          3000 => (1, 1),
+        100 => (1, 1),
+        500 => (1, 1),
+        3000 => (1, 1),
         10_000 => (1, 1),
         _ => (10, 5), // дефолт
     };
@@ -323,16 +323,17 @@ pub async fn fetch_active_ticks(
         let tick_lens = tick_lens.clone();
         let pool_address = pool_address;
         set.spawn(async move {
-            let mut ticks = HashMap::new();
+            let mut ticks = OrdMap::new();
             if let Ok(list) = tick_lens
                 .get_populated_ticks_in_word(pool_address, current_word.try_into().unwrap())
                 .call()
                 .await
             {
                 for tick in list {
-                    if let Ok(price) = tick_to_sqrt_price(tick.tick) {
-                        ticks.insert(tick.tick, (tick.liquidity_net, price));
-                    }
+                    ticks.insert(
+                        tick.tick,
+                        (tick.liquidity_net, U512::from(tick.liquidity_gross)),
+                    );
                 }
             }
             sleep(Duration::from_millis(10)).await;
@@ -347,7 +348,7 @@ pub async fn fetch_active_ticks(
         let pool_address = pool_address;
         let left_active = left_active.clone();
         set.spawn(async move {
-            let mut ticks = HashMap::new();
+            let mut ticks = OrdMap::new();
             for i in 0..words_per_batch {
                 let word = base_word - (i as i32);
                 if let Ok(list) = tick_lens
@@ -357,10 +358,11 @@ pub async fn fetch_active_ticks(
                 {
                     let mut count = 0;
                     for tick in list {
-                        if let Ok(price) = tick_to_sqrt_price(tick.tick) {
-                            ticks.insert(tick.tick, (tick.liquidity_net, price));
-                            count += 1;
-                        }
+                        ticks.insert(
+                            tick.tick,
+                            (tick.liquidity_net, U512::from(tick.liquidity_gross)),
+                        );
+                        count += 1;
                     }
                     left_active.fetch_add(count, Ordering::Relaxed);
                 }
@@ -377,7 +379,7 @@ pub async fn fetch_active_ticks(
         let pool_address = pool_address;
         let right_active = right_active.clone();
         set.spawn(async move {
-            let mut ticks = HashMap::new();
+            let mut ticks = OrdMap::new();
             for i in 0..words_per_batch {
                 let word = base_word + (i as i32);
                 if let Ok(list) = tick_lens
@@ -387,10 +389,11 @@ pub async fn fetch_active_ticks(
                 {
                     let mut count = 0;
                     for tick in list {
-                        if let Ok(price) = tick_to_sqrt_price(tick.tick) {
-                            ticks.insert(tick.tick, (tick.liquidity_net, price));
-                            count += 1;
-                        }
+                        ticks.insert(
+                            tick.tick,
+                            (tick.liquidity_net, U512::from(tick.liquidity_gross)),
+                        );
+                        count += 1;
                     }
                     right_active.fetch_add(count, Ordering::Relaxed);
                 }
@@ -400,22 +403,21 @@ pub async fn fetch_active_ticks(
         });
     }
 
-    let mut all_ticks = DashMap::new();
+    let mut all_ticks = OrdMap::new();
     while let Some(Ok(partial)) = set.join_next().await {
-        all_ticks.extend(partial);
+        all_ticks = all_ticks.union(partial);
     }
 
-    let non_zero_prices: usize = all_ticks
+    let non_zero_liquidity: usize = all_ticks
         .iter()
-        .filter(|entry| {
-            let (_, sqrt) = entry.value();
-            !sqrt.is_zero()
+        .filter(|(_, (liquidity_net, liquidity_gross))| {
+            !liquidity_net == 0 || !liquidity_gross.is_zero()
         })
         .count();
 
-    if !all_ticks.is_empty() && non_zero_prices > 0 {
+    if !all_ticks.is_empty() && non_zero_liquidity > 0 {
         info!(
-            "[UNISWAP_V3_СИНХРОНИЗАЦИЯ]{:?}] Fee: {}, Батчи: {}×{}, Тики: {} (←{} →{}), С ценой ≠ 0: {}",
+            "[UNISWAP_V3_СИНХРОНИЗАЦИЯ]{:?}] Fee: {}, Батчи: {}×{}, Тики: {} (←{} →{}), С ликвидностью ≠ 0: {}",
             pool_address,
             fee,
             total_batches,
@@ -423,12 +425,14 @@ pub async fn fetch_active_ticks(
             left_active.load(Ordering::Relaxed) + right_active.load(Ordering::Relaxed),
             left_active.load(Ordering::Relaxed),
             right_active.load(Ordering::Relaxed),
-            non_zero_prices
+            non_zero_liquidity
         );
     }
 
     Ok(all_ticks)
 }
+
+
 
 pub async fn sync_pools(
     graph: Arc<UniversalGraph>,
@@ -492,7 +496,7 @@ pub async fn sync_pools(
                             addr, token0, token1
                         );
 
-                        tokio::time::sleep(Duration::from_millis(200)).await;
+                       sleep(Duration::from_millis(200)).await;
 
                         if let Some(pool) = build_uniswap_v3_pool(
                             addr,
@@ -502,7 +506,7 @@ pub async fn sync_pools(
                         )
                         .await
                         {
-                            tokio::time::sleep(Duration::from_millis(200)).await;
+                           sleep(Duration::from_millis(200)).await;
 
                             if pool.is_active {
                                 graph.upsert_pool(pool.clone());

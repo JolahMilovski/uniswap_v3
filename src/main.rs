@@ -7,6 +7,7 @@ pub mod uniswap_cache;
 pub mod uniswap_events;
 pub mod uniswap_graph;
 pub mod uniswap_v3;
+//pub mod arb_scanner;
 
 
 use aave_v3_flash_monitor::get_aave_data;
@@ -27,7 +28,6 @@ use log::info;
 use std::env;
 use std::io::Write;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
 use tokio::time::sleep;
@@ -250,9 +250,9 @@ tokio::spawn({
     // Основной цикл для периодической синхронизации пулов
     // Настройки синхронизации
     let mut sync_counter: u64 = 0;
-    let sync_interval = Duration::from_secs(1800); // 30 минут
+    //let sync_interval = Duration::from_secs(1800); // 30 минут
     // Основной цикл
-    loop {
+
         sync_counter += 1;
         let cycle_start = std::time::Instant::now();
         
@@ -323,7 +323,10 @@ tokio::spawn({
         );
 
         
+        Ok(())
+
         
+        /* 
         // Ожидание следующего цикла
         info!(
             "⏳ [MAIN_ЦИКЛ {}] Ожидание следующей синхронизации через {} минут...",
@@ -334,7 +337,7 @@ tokio::spawn({
         sleep(sync_interval).await;
         
     }
-    /*
+   
     loop {
         sleep(Duration::from_secs(60)).await;
     }
