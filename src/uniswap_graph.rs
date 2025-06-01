@@ -4,11 +4,9 @@ use im::OrdMap;
 use log::debug;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{rename, File};
+use std::fs::{File, rename};
 use std::io::{self, Read, Write};
 use std::path::Path;
-
- 
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct UniversalGraph {
@@ -23,25 +21,20 @@ pub struct UniversalGraph {
 #[derive(Serialize, Deserialize)]
 struct UniversalGraphSnapshot {
     nodes: HashMap<Address, (Address, Address)>, // адрес пула : адреса токенов
-    edges: HashMap<Address, UniswapPool>, //адрес пула : данные пула
+    edges: HashMap<Address, UniswapPool>, // адрес пула : данные пула
 }
 
 #[derive(Serialize, Clone, Debug, Deserialize)]
 pub struct UniswapPool {
-    // Основные параметры пула
     pub uniswap_pool_address: Address,
     pub uniswap_dex: String,
-    // ТОКЕН А
     pub uniswap_token_a: Address,
     pub uniswap_token_a_decimals: u8,
     pub uniswap_token_a_symbol: String,
-    // ТОКЕН B
     pub uniswap_token_b: Address,
     pub uniswap_token_b_decimals: u8,
     pub uniswap_token_b_symbol: String,
-    // Ликвидность
     pub uniswap_liquidity: U512,
-    // Цена, тики, комиссии
     pub uniswap_sqrt_price: U512,
     pub uniswap_current_price: U512,
     pub uniswap_tick_current: i32,
@@ -50,13 +43,11 @@ pub struct UniswapPool {
     pub uniswap_tick_spacing: i32,
     pub uniswap_max_liquidity_per_tick: U512,
     pub uniswap_fee_tier: u32,
-    pub tick_map:OrdMap<i32, (i128, U512)>, // Изменили на DashMap
-    
+    pub tick_map: OrdMap<i32, (i128, U512)>,
     pub is_active: bool,
 }
 
 impl UniversalGraph {
-
     pub fn new() -> Self {
         UniversalGraph {
             nodes: DashMap::new(),
@@ -65,7 +56,7 @@ impl UniversalGraph {
     }
 
     pub fn add_pool(
-        &self, // Изменили на &self, так как DashMap уже обеспечивает внутреннюю синхронизацию
+        &self,
         uniswap_pool_address: Address,
         uniswap_dex: String,
         uniswap_token_a: Address,
@@ -88,7 +79,6 @@ impl UniversalGraph {
     ) {
         self.nodes
             .insert(uniswap_pool_address, (uniswap_token_a, uniswap_token_b));
-      
 
         self.edges.insert(
             uniswap_pool_address,
@@ -115,7 +105,7 @@ impl UniversalGraph {
             },
         );
     }
-      
+
     pub fn upsert_pool(&self, new_pool: UniswapPool) {
         if let Some(mut existing_pool) = self.edges.get_mut(&new_pool.uniswap_pool_address) {
             existing_pool.uniswap_liquidity = new_pool.uniswap_liquidity;
@@ -136,63 +126,66 @@ impl UniversalGraph {
             self.nodes.insert(pool_address, (token_a, token_b));
         }
     }
-    // Загружает граф из бинарного файла
-    pub fn load_from_bin(path: &str) -> io::Result<Self> {
-        // Открываем файл для чтения
-        let mut file = File::open(path)?;
-        // Создаем буфер для хранения данных
-        let mut buffer = Vec::new();
-        // Читаем весь файл в буфер
-        file.read_to_end(&mut buffer)?;
-        // Десериализуем буфер в структуру графа
-        bincode::deserialize(&buffer).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-    }
 
-    // Сохраняет граф в бинарный файл
-    pub fn save_to_bin(&self, path: &str) -> io::Result<()> {
-        // Создаем снимок текущего состояния графа
+    pub fn save_graph_to_json(&self, path: &str) -> std::io::Result<()> {
         let snapshot = self.snapshot();
-        // Сериализуем снимок в бинарный формат
-        let serialized =
-            bincode::serialize(&snapshot).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        // Создаем новый файл
-        let mut file = File::create(path)?;
-        // Записываем сериализованные данные в файл
-        file.write_all(&serialized)?;
-        Ok(())
-    }
-    
-    // Сохраняет граф в JSON файл
-    pub fn save_to_bin_json(&self, path: &str) -> std::io::Result<()> {
-        // Создаем снимок текущего состояния графа
-        let snapshot = self.snapshot();
-        // Преобразуем снимок в форматированный JSON
         let json = serde_json::to_string_pretty(&snapshot)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        // Создаем новый файл
-        let mut file = File::create(path)?;
-        // Записываем JSON в файл
-        file.write_all(json.as_bytes())?;
-        // Возвращаем успешный результат
+
+        // Записываем во временный файл для атомарности
+        let temp_path = format!("{}.tmp", path);
+        let mut temp_file = File::create(&temp_path)?;
+        temp_file.write_all(json.as_bytes())?;
+        temp_file.flush()?;
+
+        // Атомарно заменяем оригинальный файл
+        rename(temp_path, path)?;
         Ok(())
     }
 
-    // Создает снимок текущего состояния графа
+    pub fn update_pool_json(&self, pool_address: Address, path: &str) -> io::Result<()> {
+        // Загружаем текущий JSON, если он существует
+        let mut snapshot = if Path::new(path).exists() {
+            let mut file = File::open(path)?;
+            let mut contents = String::new();
+            file.read_to_string(&mut contents)?;
+            serde_json::from_str(&contents)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+        } else {
+            UniversalGraphSnapshot {
+                nodes: HashMap::new(),
+                edges: HashMap::new(),
+            }
+        };
+
+        // Обновляем данные для пула
+        if let Some(pool) = self.edges.get(&pool_address) {
+            snapshot.edges.insert(pool_address, pool.clone());
+            snapshot.nodes.insert(pool_address, self.nodes.get(&pool_address).map(|v| *v.value()).unwrap_or_default());
+        }
+
+        // Сериализуем обновлённый снимок
+        let json = serde_json::to_string_pretty(&snapshot)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        // Записываем во временный файл для атомарности
+        let temp_path = format!("{}.tmp", path);
+        let mut temp_file = File::create(&temp_path)?;
+        temp_file.write_all(json.as_bytes())?;
+        temp_file.flush()?;
+
+        // Атомарно заменяем оригинальный файл
+        rename(temp_path, path)?;
+        Ok(())
+    }
+
     fn snapshot(&self) -> UniversalGraphSnapshot {
         UniversalGraphSnapshot {
-            // Преобразуем узлы графа в коллекцию
             nodes: self
                 .nodes
                 .iter()
-                .map(
-                    |r: dashmap::mapref::multiple::RefMulti<
-                        '_,
-                        ethers::types::H160,
-                        (ethers::types::H160, ethers::types::H160),
-                    >| (*r.key(), *r.value()),
-                )
+                .map(|r| (*r.key(), *r.value()))
                 .collect(),
-            // Преобразуем ребра графа в коллекцию
             edges: self
                 .edges
                 .iter()
@@ -200,45 +193,4 @@ impl UniversalGraph {
                 .collect(),
         }
     }
-
-    // Обновляет JSON-файл только для указанного пула
-    pub fn update_pool_json(&self, pool_address: Address, path: &str) -> io::Result<()> {
-
-            // Загружаем текущий JSON, если он существует
-            let mut snapshot = if Path::new(path).exists() {
-                let mut file = File::open(path)?;
-                let mut contents = String::new();
-                file.read_to_string(&mut contents)?;
-                serde_json::from_str(&contents)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
-            } else {
-                UniversalGraphSnapshot {
-                    nodes: HashMap::new(),
-                    edges: HashMap::new(),
-                }
-            };
-
-            // Обновляем данные для пула
-            if let Some(pool) = self.edges.get(&pool_address) {
-                snapshot.edges.insert(pool_address, pool.clone());
-                snapshot.nodes.insert(pool_address, self.nodes.get(&pool_address).map(|v| *v.value()).unwrap_or_default());
-            }
-
-            // Сериализуем обновлённый снимок
-            let json = serde_json::to_string_pretty(&snapshot)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-            // Записываем во временный файл для атомарности
-            let temp_path = format!("{}.tmp", path);
-            let mut temp_file = File::create(&temp_path)?;
-            temp_file.write_all(json.as_bytes())?;
-            temp_file.flush()?;
-
-            // Атомарно заменяем оригинальный файл
-            rename(temp_path, path)?;            
-        
-        Ok(())
-    }
 }
-
-

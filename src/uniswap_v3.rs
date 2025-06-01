@@ -17,7 +17,6 @@ use ethers::types::{Address, U512};
 use ethers_providers::Ws;
 use futures::stream;
 use im::OrdMap;
-use log::error;
 use log::info;
 use log::warn;
 
@@ -443,12 +442,12 @@ pub async fn sync_pools(
     start_block_from_env: u64,
     event_subscriber: Arc<UniswapEventSubscriber>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-
-
+    let save_per_pool = env::var("SAVE_GRAPH_PER_POOL").map(|v| v == "true").unwrap_or(false);
 
     // === Фаза 1: обработка пулов из кэша ========================================================================================================================================================================================================================
 
     let (original_addresses, original_count) = {
+        
         let pool_cache_lock = pool_cache.lock().await;
         (
             pool_cache_lock.pool_addresses.clone(),
@@ -496,7 +495,7 @@ pub async fn sync_pools(
                             addr, token0, token1
                         );
 
-                       sleep(Duration::from_millis(200)).await;
+                        sleep(Duration::from_millis(200)).await;
 
                         if let Some(pool) = build_uniswap_v3_pool(
                             addr,
@@ -506,13 +505,21 @@ pub async fn sync_pools(
                         )
                         .await
                         {
-                           sleep(Duration::from_millis(200)).await;
+                            sleep(Duration::from_millis(200)).await;
 
                             if pool.is_active {
                                 graph.upsert_pool(pool.clone());
-
                                 phase1_active_count.fetch_add(1, Ordering::SeqCst);
                                 let _ = event_subscriber.add_pools_to_subscription(addr).await;
+
+                                // Сохраняем JSON граф для каждого пула, если включено
+                                if save_per_pool {
+                                    if let Err(e) = graph.save_graph_to_json("graph_final.json") {
+                                        warn!("[UNISWAP_V3_КЭШ] Ошибка сохранения JSON графа для пула {:?}: {:?}", addr, e);
+                                    } else {
+                                        info!("[UNISWAP_V3_КЭШ] JSON граф сохранён для пула {:?}", addr);
+                                    }
+                                }
                             }
                         }
                     }
@@ -534,24 +541,12 @@ pub async fn sync_pools(
 
     progress.finish_with_message("[UNISWAP_V3_КЭШ]✅ Пулы из кеша обработаны");
 
-    {
-        let graph_lock = graph.clone();
-        if let Err(e) = graph_lock.save_to_bin("graph_phase1.bin") {
-            error!("Ошибка сохранения графа после первой фазы (bin): {:?}", e);
-        }
-        if let Err(e) = graph_lock.save_to_bin_json("graph_phase1.json") {
-            error!("Ошибка сохранения графа после первой фазы (json): {:?}", e);
-        }
-        info!("[СОХРАНЕНИЕ] Граф успешно сохранен после первой фазы");
-    }
-
     // === Фаза 2: обработка новых пулов ========================================================================================================================================================================================
 
     let (factory_address, start_block) = {
         let pool_cache_lock = pool_cache.lock().await;
         let factory_address: Address = get_env_var("UNISWAP_V3_FACTORY").parse()?;
 
-        
         let start_block_in = if pool_cache_lock.pool_addresses.is_empty() {
             start_block_from_env
         } else {
@@ -580,57 +575,55 @@ pub async fn sync_pools(
     let phase2_active_count = Arc::new(AtomicUsize::new(0));
 
     stream::iter(all_new)
-    .for_each_concurrent(1, |pool| {
-        let provider = provider.clone();
-        let token_cache = Arc::clone(&token_cache);
-        let pool_cache = Arc::clone(&pool_cache);
-        let graph = Arc::clone(&graph);
-        let progress = progress2.clone();
-        let phase2_active_count = phase2_active_count.clone();
-        let token_whitelist = token_whitelist.clone();
-        let event_subscriber = Arc::clone(&event_subscriber);
-        let addr = pool.address();
+        .for_each_concurrent(1, |pool| {
+            let provider = provider.clone();
+            let token_cache = Arc::clone(&token_cache);
+            let pool_cache = Arc::clone(&pool_cache);
+            let graph = Arc::clone(&graph);
+            let progress = progress2.clone();
+            let phase2_active_count = phase2_active_count.clone();
+            let token_whitelist = token_whitelist.clone();
+            let event_subscriber = Arc::clone(&event_subscriber);
+            let addr = pool.address();
 
-        async move {
-            let pool_contract = UniswapV3Pool::new(addr, provider.clone());
-            let token0_call = pool_contract.token_0();
-            let token1_call = pool_contract.token_1();
+            async move {
+                let pool_contract = UniswapV3Pool::new(addr, provider.clone());
+                let token0_call = pool_contract.token_0();
+                let token1_call = pool_contract.token_1();
 
-            match tokio::try_join!(token0_call.call(), token1_call.call()) {
-                Ok((token0, token1)) if token_whitelist.contains(&token0) && token_whitelist.contains(&token1) => {
-                    info!("[UNISWAP_V3_СИНХРОНИЗАЦИЯ] Новый пул {:?} проходит whitelist: {:?} ↔ {:?}", addr, token0, token1);
+                match tokio::try_join!(token0_call.call(), token1_call.call()) {
+                    Ok((token0, token1)) if token_whitelist.contains(&token0) && token_whitelist.contains(&token1) => {
+                        info!("[UNISWAP_V3_СИНХРОНИЗАЦИЯ] Новый пул {:?} проходит whitelist: {:?} ↔ {:?}", addr, token0, token1);
 
-                    let mut pool_cache_look = pool_cache.lock().await;
-                    if let Some(pool) = build_uniswap_v3_pool(addr, (token0, token1), provider.clone(), &token_cache).await {
-                        let _ = event_subscriber.add_pools_to_subscription(addr).await;
+                        let mut pool_cache_look = pool_cache.lock().await;
+                        if let Some(pool) = build_uniswap_v3_pool(addr, (token0, token1), provider.clone(), &token_cache).await {
+                            let _ = event_subscriber.add_pools_to_subscription(addr).await;
 
-                        if pool.is_active {
-                            pool_cache_look.add_pool_address(addr);
-                            graph.upsert_pool(pool.clone());
-                            phase2_active_count.fetch_add(1, Ordering::SeqCst);
+                            if pool.is_active {
+                                pool_cache_look.add_pool_address(addr);
+                                graph.upsert_pool(pool.clone());
+                                phase2_active_count.fetch_add(1, Ordering::SeqCst);
+
+                                // Сохраняем JSON граф для каждого пула, если включено
+                                if save_per_pool {
+                                    if let Err(e) = graph.save_graph_to_json("graph_final.json") {
+                                        warn!("[UNISWAP_V3_СИНХРОНИЗАЦИЯ] Ошибка сохранения JSON графа для пула {:?}: {:?}", addr, e);
+                                    } else {
+                                        info!("[UNISWAP_V3_СИНХРОНИЗАЦИЯ] JSON граф сохранён для пула {:?}", addr);
+                                    }
+                                }
+                            }
                         }
                     }
+                    Ok(_) => info!("[UNISWAP_V3_СИНХРОНИЗАЦИЯ] Пропуск нового пула {:?}: токены не в whitelist", addr),
+                    Err(e) => warn!("[СИНХРОНИЗАЦИЯ] Ошибка проверки токенов пула {:?}: {:?}", addr, e),
                 }
-                Ok(_) => info!("[UNISWAP_V3_СИНХРОНИЗАЦИЯ] Пропуск нового пула {:?}: токены не в whitelist", addr),
-                Err(e) => warn!("[СИНХРОНИЗАЦИЯ] Ошибка проверки токенов пула {:?}: {:?}", addr, e),
+                progress.inc(1);
             }
-            progress.inc(1);
-        }
-    })
-    .await;
+        })
+        .await;
 
     progress2.finish_with_message("[UNISWAP_V3_СИНХРОНИЗАЦИЯ]✅ Новые пулы обработаны");
-
-    {
-        let graph_lock = graph.clone();
-        if let Err(e) = graph_lock.save_to_bin("graph_final.bin") {
-            error!("Ошибка сохранения графа после второй фазы (bin): {:?}", e);
-        }
-        if let Err(e) = graph_lock.save_to_bin_json("graph_final.json") {
-            error!("Ошибка сохранения графа после второй фазы (json): {:?}", e);
-        }
-        info!("[СОХРАНЕНИЕ] Граф успешно сохранен после второй фазы");
-    }
 
     info!(
         "[UNISWAP_V3_ИТОГ] Обработано: {} пулов из кэша, {} новых пулов",
@@ -640,6 +633,7 @@ pub async fn sync_pools(
 
     Ok(())
 }
+
 
 pub async fn build_uniswap_v3_pool(
     pool_address: Address,

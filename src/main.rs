@@ -16,6 +16,7 @@ use log::warn;
 use path_builder::PathBuilder;
 use provider::ProviderManager;
 use token::load_token_list_from_json;
+use tokio::signal;
 
 use crate::token::TokenInfo;
 use dashmap::{DashMap, DashSet};
@@ -28,6 +29,7 @@ use log::info;
 use std::env;
 use std::io::Write;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
 use tokio::time::sleep;
@@ -189,6 +191,23 @@ tokio::spawn({
     let graph_for_paths = Arc::clone(&graph);
     //let graph_for_aave = Arc::clone(&graph);
 
+    //=======================================  Обработки Ctrl+C =============================================================================================
+    let graph_for_shutdown = Arc::clone(&graph);
+    tokio::spawn(
+        
+        async move {
+
+        signal::ctrl_c().await.expect("[MAIN] Ошибка в обработке сигнала Ctrl+C");
+        info!("[MAIN] Получен сигнал Ctrl+C, сохраняем граф в JSON...");
+        if let Err(e) = graph_for_shutdown.save_graph_to_json("uniswap_graph_snapshot.json") {
+            error!("[MAIN] Ошибка при сохранении графа в JSON: {:?}", e);
+        } else {
+            info!("[MAIN] Граф успешно сохранен в uniswap_graph_snapshot.json");
+        }
+          sleep(Duration::from_secs(5)).await;
+        std::process::exit(0);
+    }); 
+
 
  //==========================================  ИНИЦИАЛИЗАЦИЯ AAVE FLASH MONITOR  ====================================================================================================
  
@@ -311,21 +330,26 @@ tokio::spawn({
         //==============================  ВКЛЮЧАЕМ СВЕТ - НАХОДИМ ПУТЬ =======================================================================================================================
         
         
-        info!("[MAIN_PATH_BUILDER] Начинаем построение арбитражных путей ");
-        
-        let mut path_builder = PathBuilder::new(aave_rx.clone());
-        
-        path_builder.build_all_paths( &graph_for_paths);
-        
-        info!(
-            "[MAIN_PATH_BUILDER] Построение путей завершено, найдено {} путей",
-            path_builder.paths.len()
-        );
+      // Построение арбитражных путей
+    info!("[MAIN_PATH_BUILDER] Начинаем построение арбитражных путей");
+    
+    let path_build_start = std::time::Instant::now();
+    let mut path_builder = PathBuilder::new(aave_rx.clone());
+    path_builder.build_all_paths(&graph_for_paths);
+    let path_build_duration = path_build_start.elapsed();
+    
+    info!(
+        "✅ [MAIN_PATH_BUILDER] Построение путей завершено за {:?} секунд, найдено {:?} путей",
+        path_build_duration.as_secs_f64(),
+        path_builder.paths.len()
+    );
+       
+       
 
-        
-        Ok(())
-
-        
+    
+         loop {
+        sleep(std::time::Duration::from_secs(60)).await;
+    }
         /* 
         // Ожидание следующего цикла
         info!(

@@ -472,10 +472,7 @@ impl UniswapEventSubscriber {
                 pool.uniswap_tick_current,
                 pool.uniswap_current_price
             );
-                        // Обновляем JSON для этого пула
-            if let Err(e) = graph.update_pool_json(pool_address, "graph_final.json") {
-                warn!("[UNISWAP_EVENT] Ошибка обновления JSON для пула {:?}: {}", pool_address, e);
-            }
+          
         }
         Ok(())
     }
