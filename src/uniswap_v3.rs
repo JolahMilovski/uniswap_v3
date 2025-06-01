@@ -472,7 +472,7 @@ pub async fn sync_pools(
     );
 
     stream::iter(original_addresses)
-        .for_each_concurrent(2, |addr| {
+        .for_each_concurrent(3, |addr| {
             let provider = provider.clone();
             let token_cache = Arc::clone(&token_cache);
             let graph = Arc::clone(&graph);

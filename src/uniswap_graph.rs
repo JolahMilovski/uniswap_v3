@@ -4,9 +4,10 @@ use im::OrdMap;
 use log::debug;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{rename, File};
 use std::io::{self, Read, Write};
-//use std::sync::Arc;
+use std::path::Path;
+
  
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -135,37 +136,51 @@ impl UniversalGraph {
             self.nodes.insert(pool_address, (token_a, token_b));
         }
     }
+    // Загружает граф из бинарного файла
+    pub fn load_from_bin(path: &str) -> io::Result<Self> {
+        // Открываем файл для чтения
+        let mut file = File::open(path)?;
+        // Создаем буфер для хранения данных
+        let mut buffer = Vec::new();
+        // Читаем весь файл в буфер
+        file.read_to_end(&mut buffer)?;
+        // Десериализуем буфер в структуру графа
+        bincode::deserialize(&buffer).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    }
 
+    // Сохраняет граф в бинарный файл
     pub fn save_to_bin(&self, path: &str) -> io::Result<()> {
+        // Создаем снимок текущего состояния графа
         let snapshot = self.snapshot();
+        // Сериализуем снимок в бинарный формат
         let serialized =
             bincode::serialize(&snapshot).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        // Создаем новый файл
         let mut file = File::create(path)?;
+        // Записываем сериализованные данные в файл
         file.write_all(&serialized)?;
         Ok(())
     }
     
-
-
-    pub fn load_from_bin(path: &str) -> io::Result<Self> {
-        let mut file = File::open(path)?;
-        let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer)?;
-
-        bincode::deserialize(&buffer).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-    }
-
+    // Сохраняет граф в JSON файл
     pub fn save_to_bin_json(&self, path: &str) -> std::io::Result<()> {
+        // Создаем снимок текущего состояния графа
         let snapshot = self.snapshot();
+        // Преобразуем снимок в форматированный JSON
         let json = serde_json::to_string_pretty(&snapshot)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        // Создаем новый файл
         let mut file = File::create(path)?;
+        // Записываем JSON в файл
         file.write_all(json.as_bytes())?;
+        // Возвращаем успешный результат
         Ok(())
     }
 
+    // Создает снимок текущего состояния графа
     fn snapshot(&self) -> UniversalGraphSnapshot {
         UniversalGraphSnapshot {
+            // Преобразуем узлы графа в коллекцию
             nodes: self
                 .nodes
                 .iter()
@@ -177,12 +192,52 @@ impl UniversalGraph {
                     >| (*r.key(), *r.value()),
                 )
                 .collect(),
+            // Преобразуем ребра графа в коллекцию
             edges: self
                 .edges
                 .iter()
                 .map(|r| (*r.key(), r.value().clone()))
                 .collect(),
         }
+    }
+
+    // Обновляет JSON-файл только для указанного пула
+    pub fn update_pool_json(&self, pool_address: Address, path: &str) -> io::Result<()> {
+
+            // Загружаем текущий JSON, если он существует
+            let mut snapshot = if Path::new(path).exists() {
+                let mut file = File::open(path)?;
+                let mut contents = String::new();
+                file.read_to_string(&mut contents)?;
+                serde_json::from_str(&contents)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            } else {
+                UniversalGraphSnapshot {
+                    nodes: HashMap::new(),
+                    edges: HashMap::new(),
+                }
+            };
+
+            // Обновляем данные для пула
+            if let Some(pool) = self.edges.get(&pool_address) {
+                snapshot.edges.insert(pool_address, pool.clone());
+                snapshot.nodes.insert(pool_address, self.nodes.get(&pool_address).map(|v| *v.value()).unwrap_or_default());
+            }
+
+            // Сериализуем обновлённый снимок
+            let json = serde_json::to_string_pretty(&snapshot)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+            // Записываем во временный файл для атомарности
+            let temp_path = format!("{}.tmp", path);
+            let mut temp_file = File::create(&temp_path)?;
+            temp_file.write_all(json.as_bytes())?;
+            temp_file.flush()?;
+
+            // Атомарно заменяем оригинальный файл
+            rename(temp_path, path)?;            
+        
+        Ok(())
     }
 }
 
