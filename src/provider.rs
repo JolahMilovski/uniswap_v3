@@ -19,13 +19,13 @@ impl ProviderManager {
     pub async fn new(rps_limit: u32) -> Arc<Self> {
         // Загружаем URL из переменных окружения
         let ws_urls = vec![
-            get_env_var("WS_PROVIDER_URL_ALCHEMY_FIRST"),
+            //t_env_var("WS_PROVIDER_URL_ALCHEMY_FIRST"),
             get_env_var("WS_PROVIDER_URL_ALCHEMY_SECOND"),
             get_env_var("WS_PROVIDER_URL_INFURA_FIRST"),
         ];
 
         let http_urls = vec![
-            get_env_var("HTTP_PROVIDER_URL_ALCHEMY_FIRST"),
+           //et_env_var("HTTP_PROVIDER_URL_ALCHEMY_FIRST"),
             get_env_var("HTTP_PROVIDER_URL_ALCHEMY_SECOND"),
             get_env_var("HTTP_PROVIDER_URL_INFURA_FIRST"),
         ];

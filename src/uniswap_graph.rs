@@ -2,7 +2,7 @@ use dashmap::DashMap;
 use ethers::types::{Address, U512};
 use im::OrdMap;
 use log::debug;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fs::{File, rename};
 use std::io::{self, Read, Write};
@@ -37,15 +37,20 @@ pub struct UniswapPool {
     pub uniswap_token_b: Address,
     pub uniswap_token_b_decimals: u8,
     pub uniswap_token_b_symbol: String,
+      #[serde(serialize_with = "serialize_u512")]
     pub uniswap_liquidity: U512,
+      #[serde(serialize_with = "serialize_u512")]
     pub uniswap_sqrt_price: U512,
+      #[serde(serialize_with = "serialize_u512")]
     pub uniswap_current_price: U512,
     pub uniswap_tick_current: i32,
     pub uniswap_tick_lower: i32,
     pub uniswap_tick_upper: i32,
     pub uniswap_tick_spacing: i32,
+      #[serde(serialize_with = "serialize_u512")]
     pub uniswap_max_liquidity_per_tick: U512,
     pub uniswap_fee_tier: u32,
+    #[serde(serialize_with = "serialize_tick_map")]
     pub tick_map: OrdMap<i32, (i128, U512)>,
     pub is_active: bool,
 }
@@ -196,4 +201,55 @@ impl UniversalGraph {
                 .collect(),
         }
     }
+}
+
+
+// Сериализатор для U512 в десятичную строку
+fn serialize_u512<S>(value: &U512, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(&value.to_string())
+}
+/*
+// Сериализатор для i32 в десятичное число
+fn serialize_i32<S>(value: &i32, serializer: S) -> Result<S::Ok, S::Error>
+where
+S: Serializer,
+{
+    serializer.serialize_i32(*value)``
+}
+
+// Сериализатор для u32 в десятичное число
+fn serialize_u32<S>(value: &u32, serializer: S) -> Result<S::Ok, S::Error>
+where
+S: Serializer,
+{
+    serializer.serialize_u32(*value)
+}
+
+// Сериализатор для u8 в десятичное число
+fn serialize_u8<S>(value: &u8, serializer: S) -> Result<S::Ok, S::Error>
+where
+S: Serializer,
+{
+    serializer.serialize_u8(*value)
+}
+*/
+
+// Сериализатор для OrdMap
+fn serialize_tick_map<S>(value: &OrdMap<i32, (i128, U512)>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    use serde::ser::SerializeMap;
+    
+    let mut map = serializer.serialize_map(Some(value.len()))?;
+    for (k, (net, gross)) in value.iter() {
+        map.serialize_entry(
+            &k.to_string(), // Ключ как строка
+            &(net.to_string(), gross.to_string()) // Значения как строки
+        )?;
+    }
+    map.end()
 }

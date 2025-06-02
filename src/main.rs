@@ -13,6 +13,7 @@ pub mod uniswap_v3;
 use aave_v3_flash_monitor::get_aave_data;
 use aave_v3_flash_monitor::AaveTokenLiquidity;
 use log::warn;
+use log::Record;
 use path_builder::PathBuilder;
 use provider::ProviderManager;
 use token::load_token_list_from_json;
@@ -27,12 +28,14 @@ use ethers::types::Address;
 use log::error;
 use log::info;
 use std::env;
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
 use tokio::time::sleep;
+
 use uniswap_cache::UniswapPoolCache;
 use uniswap_events::UniswapEventSubscriber;
 use uniswap_graph::UniversalGraph;
@@ -44,9 +47,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let start_block = get_env_var("START_BLOCK").parse::<u64>()?;
 
-    //подключаем логирование
+    // Инициализация логгера с кастомным форматом и записью в файл
+    let log_file = Arc::new(Mutex::new(
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("log.md")?
+    ));
+
+    // Клонируем Arc для использования в замыкании
+    let log_file_for_format = Arc::clone(&log_file);
+
     Builder::from_env(Env::default().default_filter_or("info"))
-        .format(|buf, record| {
+        .format(move |buf, record: &Record| {
             // Определяем цвета и стили
             let level_color = match record.level() {
                 log::Level::Error => "\x1b[31;1m", // Красный жирный
@@ -68,26 +81,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Цвет модуля
             let module_color = "\x1b[31;1m"; // Серый жирный
 
-            // Сброс стилей
-            let reset = "\x1b[0m";
 
-            // Форматируем сообщение
-            writeln!(
-                buf,
-                "{}{} {}{} {}{} {}[{}]{} {}{}{}",
+
+            // Форматируем сообщение для консоли
+            let message = format!(
+                "{} {} {} {}[{}]{} {}{}{}",
                 level_color,
                 level_emoji,
                 chrono::Local::now().format("%H:%M:%S%.3f"),
-                reset,
                 level_color,
                 record.level(),
-                reset,
                 module_color,
                 record.module_path().unwrap_or("unknown"),
-                reset,
                 level_color,
                 record.args(),
-            )
+            );
+
+       
+            // Записываем в консоль
+            writeln!(buf, "{}", message)?;
+
+            // Асинхронная запись в файл
+            let log_file = Arc::clone(&log_file_for_format);
+            tokio::spawn(async move {
+                let mut file = log_file.lock().await;
+                if let Err(e) = file.write_all((message + "\n").as_bytes()) {
+                    eprintln!("Ошибка записи в log.md: {:?}", e);
+                }
+                if let Err(e) = file.flush() {
+                    eprintln!("Ошибка сброса буфера в log.md: {:?}", e);
+                }
+            });
+
+            Ok(())
         })
         .filter_module("tokio", log::LevelFilter::Warn) // Уменьшаем шум от tokio
         .filter_module("hyper", log::LevelFilter::Warn) // Уменьшаем шум от hyper
@@ -340,11 +366,11 @@ tokio::spawn({
         "✅ [MAIN_PATH_BUILDER] Построение путей завершено за {:?} секунд, найдено {:?} путей",
         path_build_duration.as_secs_f64(),
         path_builder.paths.len()
-    );        
+    );
     
-    loop {
-        sleep(std::time::Duration::from_secs(60)).await;
-    }
+    Ok(())       
+    
+    
         /* 
         // Ожидание следующего цикла
         info!(
