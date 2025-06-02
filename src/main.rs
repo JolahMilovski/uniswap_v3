@@ -192,13 +192,13 @@ tokio::spawn({
     //let graph_for_aave = Arc::clone(&graph);
 
     //=======================================  Обработки Ctrl+C =============================================================================================
+
     let graph_for_shutdown = Arc::clone(&graph);
     tokio::spawn(
         
         async move {
 
         signal::ctrl_c().await.expect("[MAIN] Ошибка в обработке сигнала Ctrl+C");
-        info!("[MAIN] Получен сигнал Ctrl+C, сохраняем граф в JSON...");
         if let Err(e) = graph_for_shutdown.save_graph_to_json("uniswap_graph_snapshot.json") {
             error!("[MAIN] Ошибка при сохранении графа в JSON: {:?}", e);
         } else {
@@ -216,8 +216,8 @@ tokio::spawn({
     let (aave_tx, aave_rx) = watch::channel(AaveTokenLiquidity::default());
 
     // Запускаем мониторинг, передавая Sender
-    tokio::spawn({
-        async move {
+    tokio::spawn(
+        { async move {
             if let Err(e) = get_aave_data(provider_for_aave, aave_tx).await {
                 
                 eprintln!("[MAIN] Error in Aave liquidity monitor: {:?}", e);
@@ -266,6 +266,7 @@ tokio::spawn({
     //==========================================  ЗАПУСТИЛИ СКАНИРОВАНИЕ  ============================================================================================================================
     
     info!("⏳[MAIN]  Синхронизация пулов начата...");
+
     // Основной цикл для периодической синхронизации пулов
     // Настройки синхронизации
     let mut sync_counter: u64 = 0;
@@ -302,9 +303,7 @@ tokio::spawn({
         }
         
         info!("[MAIN] Бот завершил сканирование пулов");
-        
-
-        
+               
                
         //==========================================  ОБНОВИМ КЕШ  ============================================================================================================================
 
@@ -325,7 +324,6 @@ tokio::spawn({
             }
         }
 
-
         
         //==============================  ВКЛЮЧАЕМ СВЕТ - НАХОДИМ ПУТЬ =======================================================================================================================
         
@@ -342,12 +340,9 @@ tokio::spawn({
         "✅ [MAIN_PATH_BUILDER] Построение путей завершено за {:?} секунд, найдено {:?} путей",
         path_build_duration.as_secs_f64(),
         path_builder.paths.len()
-    );
-       
-       
-
+    );        
     
-         loop {
+    loop {
         sleep(std::time::Duration::from_secs(60)).await;
     }
         /* 

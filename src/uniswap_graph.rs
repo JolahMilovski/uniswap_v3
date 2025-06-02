@@ -8,6 +8,14 @@ use std::fs::{File, rename};
 use std::io::{self, Read, Write};
 use std::path::Path;
 
+
+#[derive(Serialize, Deserialize)]
+struct UniversalGraphSnapshot {
+    nodes: HashMap<Address, (Address, Address)>, // адрес пула : адреса токенов
+    edges: HashMap<Address, UniswapPool>, // адрес пула : данные пула
+}
+
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct UniversalGraph {
     /// Ключ: адрес пула  
@@ -18,11 +26,6 @@ pub struct UniversalGraph {
     pub edges: DashMap<Address, UniswapPool>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct UniversalGraphSnapshot {
-    nodes: HashMap<Address, (Address, Address)>, // адрес пула : адреса токенов
-    edges: HashMap<Address, UniswapPool>, // адрес пула : данные пула
-}
 
 #[derive(Serialize, Clone, Debug, Deserialize)]
 pub struct UniswapPool {

@@ -5,6 +5,7 @@ use std::{
     sync::Arc,
 };
 
+use dashmap::DashMap;
 use ethers::types::Address;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
@@ -29,7 +30,7 @@ pub struct PathBuilder {
     pub paths: Vec<ArbitragePath>,
     /// Индекс для быстрого поиска путей по адресу пула
     /// Ключ - адрес пула, значение - индексы путей в векторе paths
-    pub pool_to_paths: HashMap<Address, Vec<usize>>,
+    pub pool_to_paths: DashMap<Address, Vec<usize>>,
     /// Множество адресов токенов, доступных для flash loan в Aave
     aave_tokens: HashSet<Address>,
 }
@@ -48,7 +49,7 @@ impl PathBuilder {
         Self {
             aave_tokens: aave_tokens_borrow,
             paths: Vec::new(),
-            pool_to_paths: HashMap::new(),
+            pool_to_paths: DashMap::new(),
         }
     }
 
@@ -100,7 +101,7 @@ impl PathBuilder {
     /// * `graph` - Граф Uniswap с информацией о пулах
     /// 
     /// # Возвращает
-    /// HashMap где ключ - адрес токена, значение - вектор кортежей (связанный_токен, адрес_пула)
+    /// DashMap где ключ - адрес токена, значение - вектор кортежей (связанный_токен, адрес_пула)
     /// 
     /// # Логика
     /// Для каждого пула в графе создает двунаправленные связи между токенами
