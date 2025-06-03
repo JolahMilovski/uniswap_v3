@@ -201,6 +201,7 @@ pub struct PoolEventInfo {
     pub address: Address,
     pub tick_updates: DashSet<i32>,
     pub current_tick: i32,
+    pub block_number: u64,
 }
 
 impl UniswapEventSubscriber {
@@ -323,11 +324,19 @@ pub async fn fetch_events(
     for log in logs {
         let address = log.address;
         let block_number = log.block_number.map_or("неизвестен".to_string(), |n| n.as_u64().to_string());
-        let entry = event_map.entry(address).or_insert(PoolEventInfo {
+
+    let entry = event_map.entry(address).or_insert_with(|| {
+
+    let block_number_u64 = log.block_number.map(|n| n.as_u64()).unwrap_or(0);
+
+        PoolEventInfo {
             address,
             tick_updates: DashSet::new(),
             current_tick: 0,
-        });
+            block_number: block_number_u64,
+        }
+    });
+
 
         // Сравнение темы события как H256
         match log.topics.first() {
@@ -433,30 +442,50 @@ pub async fn fetch_events(
 
 
 
+    /// Получает данные о тиках пула Uniswap V3
     pub async fn fetch_tick_data(
         &self,
-        pool_event_info: &PoolEventInfo,
-        pool_address: Address,
-        provider: Arc<Provider<Ws>>,
-        graph: Arc<UniversalGraph>,
+
+
+
+
+        pool_event_info: &PoolEventInfo,      // Информация о событиях пула
+        pool_address: Address,                 // Адрес пула в сети
+        provider: Arc<Provider<Ws>>,          // Web3 провайдер для взаимодействия с сетью
+        graph: Arc<UniversalGraph>,           // Граф с информацией о пулах
     ) -> anyhow::Result<EventPoolUpdate> {
+        // Создаем экземпляр контракта пула
         let pool_contract = UniswapV3Pool::new(pool_address, provider.clone());
+        
+        // Пауза для избежания превышения лимита запросов
         sleep(Duration::from_millis(200)).await;
+        
+        // Получаем основные данные пула: ликвидность и slot0
         let (liquidity, slot0, _, _, _) = process_pool_data(pool_address, pool_contract.clone().into())
             .await
             .context(format!(
                 "[UNISWAP_EVENT] Не удалось получить данные пула для: {:?}", 
                 pool_address
             ))?;
+            
+        // Извлекаем текущий тик из slot0
         let current_tick = slot0.1;
+        
+        // Получаем информацию о пуле из графа
         let pool_info = graph.edges.get(&pool_address)
             .ok_or_else(|| anyhow::anyhow!("Пул {:?} не найден в графе", pool_address))?;
+            
+        // Еще одна пауза перед следующей серией запросов
         sleep(Duration::from_millis(200)).await;
+        
+        // Преобразуем обновленные тики в вектор
         let tick_indices: Vec<i32> = pool_event_info
             .tick_updates
             .iter()
             .map(|tick| *tick)
             .collect();
+            
+        // Создаем футуры для параллельного запроса данных по каждому тику
         let tick_futures: Vec<_> = tick_indices
             .into_iter()
             .map(|tick| {
@@ -467,23 +496,35 @@ pub async fn fetch_events(
                 }
             })
             .collect();
+            
+        // Выполняем все запросы параллельно
         let tick_results = futures::future::join_all(tick_futures).await;
+        
+        // Создаем упорядоченную карту для хранения данных тиков
         let mut tick_map = OrdMap::new();
+        
+        // Заполняем карту данными полученных тиков
         for result in tick_results {
             if let Some((tick, data)) = result {
                 tick_map.insert(tick, (data.1, U512::from(data.0)));
             }
         }
-        info!("[UNISWAP_EVENT] Обновлено {} тиков для пула {:?}", tick_map.len(), pool_address);
 
+        // Преобразуем sqrt_price в U512
         let sqrt_price = U512::from(slot0.0);
+        
+        // Вычисляем текущую цену на основе sqrt_price и десятичных знаков токенов
         let current_price = calculate_current_price(sqrt_price, pool_info.uniswap_token_a_decimals, pool_info.uniswap_token_b_decimals)
             .map_err(anyhow::Error::msg)?;
+            
+        // Логируем информацию об обновлении пула
         info!(
             "[{}] Обновление пула: {:?}, Ликвидность: {}, Текущий тик: {}, Цена: {}",
-            "UNISWAP_EVENT".bright_blue(),
+            "UNISWAP_EVENT".green(),
             pool_address, liquidity, current_tick, current_price
         );
+        
+        // Возвращаем структуру с обновленными данными пула
         Ok(EventPoolUpdate {
             liquidity,
             sqrt_price_x96: slot0.0,
@@ -493,6 +534,8 @@ pub async fn fetch_events(
         })
     }
 
+
+    /// Функция для обновления графа на основе событий
     pub async fn update_graph_from_event(
         &self,
         pool_event_info: &PoolEventInfo,
@@ -500,54 +543,89 @@ pub async fn fetch_events(
         pool_address: Address,
         provider: Arc<Provider<Ws>>,
     ) -> anyhow::Result<()> {
+        // Загружаем свежие данные из Uniswap V3
         let pool_update = self
             .fetch_tick_data(pool_event_info, pool_address, provider.clone(), graph.clone())
             .await?;
 
+        // Проверяем наличие пула в графе
         if let Some(mut pool) = graph.edges.get_mut(&pool_address) {
+            info!(
+                "[{}] Для пула: {:?}. Обновление графа начато.", "EVENT_UPDATE_GRAPH".red(), 
+                pool_address
+            );
+
+            // Обновление данных
             pool.uniswap_liquidity = pool_update.liquidity;
             pool.uniswap_sqrt_price = pool_update.sqrt_price_x96.into();
             pool.uniswap_tick_current = pool_update.current_tick;
             pool.uniswap_current_price = pool_update.current_price;
+
+            // Tick map объединяется
             pool.tick_map = pool.tick_map.clone().union(pool_update.tick_map);
+
+            // Финальный лог об обновлении
             info!(
-                "[{}] Обновлен пул: {:?}, Ликвидность: {}, Цена (sqrt): {}, Текущий тик: {}, Цена: {}",
-                "UNISWAP_EVENT".bright_blue(),
+                "[{}] Обновлен пул {} данными блока {} : Ликвидность: {}, Цена (sqrt): {}, Текущий тик: {}, Цена: {}",
+                "UNISWAP_EVENT".green(),
                 pool_address,
+                pool_event_info.block_number,
                 pool.uniswap_liquidity,
                 pool.uniswap_sqrt_price,
                 pool.uniswap_tick_current,
                 pool.uniswap_current_price
             );
+        } else {
+            // Пул не найден в графе — предупреждение
+            warn!(
+                "[EVENT_UPDATE_GRAPH] Пул {:?} не найден в графе. Обновление пропущено.",
+                pool_address
+            );
         }
-        Ok(())
-    }
 
+        Ok(())
+    }   
+
+    /// Функция для обработки событий Uniswap V3
     pub async fn polling_event(
         &self,
         graph: Arc<UniversalGraph>,
         provider_ws: Arc<Provider<Ws>>,
         block_receiver: &watch::Receiver<u64>,
     ) -> anyhow::Result<()> {
+        // Получаем начальный блок из приемника блоков
         let mut block_from = *block_receiver.borrow();
+        // Максимальный размер чанка для запроса событий
         let max_chunk_size: u64 = 200;
+
         loop {
+            // Получаем список подписанных пулов
             let subscribed_pools = self.subscribed_pools.clone();
+            // Проверяем, есть ли пулы для обработки
             if subscribed_pools.is_empty() {
                 warn!("[UNISWAP_EVENT] Нет пулов для обработки");
                 sleep(Duration::from_secs(3)).await;
                 continue;
             }
+
+            // Получаем текущий последний блок
             let block_to = *block_receiver.borrow();
+            // Проверяем корректность диапазона блоков
             if block_to < block_from {
                 sleep(Duration::from_secs(1)).await;
                 continue;
             }
+
+            // Инициализируем переменные для обработки чанков
             let mut current_from = block_from;
             let mut all_events = Vec::new();
+
+            // Обрабатываем блоки чанками
             while current_from <= block_to {
+                // Вычисляем конец текущего чанка
                 let current_to = current_from.min(block_to + max_chunk_size - 1);
 
+                // Получаем события для текущего чанка
                 match self.fetch_events(current_from, current_to).await {
                     Ok(events) => {
                         all_events.extend(events);
@@ -560,12 +638,19 @@ pub async fn fetch_events(
                 current_from = current_to + 1;
                 sleep(Duration::from_millis(100)).await;
             }
+
+            // Создаем список уникальных адресов пулов из событий
             let unique_pools: Vec<_> = all_events
                 .iter()
                 .map(|e| format!("{:?}", e.address))
                 .collect();
+
+            // Обрабатываем каждое событие
             for pool_event in all_events {
+                // Получаем адрес пула из события
                 let pool_address = pool_event.address;
+
+                // Обновляем граф на основе события
                 if let Err(e) = self
                     .update_graph_from_event(
                         &pool_event,
@@ -583,6 +668,8 @@ pub async fn fetch_events(
                     );
                 }
             }
+
+            // Логируем информацию об обработанных блоках
             info!(
                 "[{}] Обработаны блоки {}–{}, пулов: {}",
                 "UNISWAP_EVENT".bright_blue(),
@@ -590,7 +677,10 @@ pub async fn fetch_events(
                 block_to,
                 unique_pools.len()
             );
+
+            // Обновляем начальный блок для следующей итерации
             block_from = block_to + 1;
+            // Делаем паузу перед следующей итерацией
             sleep(Duration::from_secs(1)).await;
         }
     }
