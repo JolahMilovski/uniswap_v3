@@ -437,6 +437,7 @@ pub async fn fetch_events(
         );
     }
     Ok(event_map.into_values().collect())
+    
 }
 
 
@@ -445,10 +446,6 @@ pub async fn fetch_events(
     /// Получает данные о тиках пула Uniswap V3
     pub async fn fetch_tick_data(
         &self,
-
-
-
-
         pool_event_info: &PoolEventInfo,      // Информация о событиях пула
         pool_address: Address,                 // Адрес пула в сети
         provider: Arc<Provider<Ws>>,          // Web3 провайдер для взаимодействия с сетью
@@ -543,17 +540,14 @@ pub async fn fetch_events(
         pool_address: Address,
         provider: Arc<Provider<Ws>>,
     ) -> anyhow::Result<()> {
+
         // Загружаем свежие данные из Uniswap V3
         let pool_update = self
             .fetch_tick_data(pool_event_info, pool_address, provider.clone(), graph.clone())
             .await?;
 
         // Проверяем наличие пула в графе
-        if let Some(mut pool) = graph.edges.get_mut(&pool_address) {
-            info!(
-                "[{}] Для пула: {:?}. Обновление графа начато.", "EVENT_UPDATE_GRAPH".red(), 
-                pool_address
-            );
+    if let Some(mut pool) = graph.edges.get_mut(&pool_address) {
 
             // Обновление данных
             pool.uniswap_liquidity = pool_update.liquidity;
@@ -567,7 +561,7 @@ pub async fn fetch_events(
             // Финальный лог об обновлении
             info!(
                 "[{}] Обновлен пул {} данными блока {} : Ликвидность: {}, Цена (sqrt): {}, Текущий тик: {}, Цена: {}",
-                "UNISWAP_EVENT".green(),
+                "UNISWAP_EVENT".on_red().black(),
                 pool_address,
                 pool_event_info.block_number,
                 pool.uniswap_liquidity,

@@ -18,6 +18,7 @@ use path_builder::PathBuilder;
 use provider::ProviderManager;
 use token::load_token_list_from_json;
 use tokio::signal;
+use tokio::spawn;
 
 use crate::token::TokenInfo;
 use dashmap::{DashMap, DashSet};
@@ -215,12 +216,13 @@ tokio::spawn({
     let graph_for_event = Arc::clone(&graph);
     let graph_for_sync = Arc::clone(&graph);
     let graph_for_paths = Arc::clone(&graph);
+    let graph_for_shutdown = Arc::clone(&graph);
     //let graph_for_aave = Arc::clone(&graph);
 
     //=======================================  Обработки Ctrl+C =============================================================================================
 
-    let graph_for_shutdown = Arc::clone(&graph);
-    tokio::spawn(
+    spawn
+    (
         
         async move {
 
@@ -242,8 +244,10 @@ tokio::spawn({
     let (aave_tx, aave_rx) = watch::channel(AaveTokenLiquidity::default());
 
     // Запускаем мониторинг, передавая Sender
-    tokio::spawn(
-        { async move {
+    tokio::spawn
+    (
+        { 
+            async move {
             if let Err(e) = get_aave_data(provider_for_aave, aave_tx).await {
                 
                 eprintln!("[MAIN] Error in Aave liquidity monitor: {:?}", e);
@@ -251,23 +255,24 @@ tokio::spawn({
         }
     });
     
-    //==========================================  ПОДКЛЮЧАЕМ МОДУЛЬ ПОДПИСКИ  ============================================================================================================================
+    //==========================================  ПОДКЛЮЧАЕМ МОДУЛЬ ПУЛИНГА ===============================================================================================================
     
     // Создаем канал для передачи новых блоков
     let (block_sender, block_receiver) = watch::channel(0);
     
     // Запускаем подписку на новые блоки в отдельной задаче
-    tokio::spawn(async move {
-        if let Err(e) =
-        UniswapEventSubscriber::subscribe_to_new_blocks(&provider_ws, block_sender).await
-        {
-            error!("[MAIN] Ошибка в подписке на блоки: {:?}", e);
-        }
-    });
+    spawn
+        (   
+            async move {
+                if let Err(e) =
+                UniswapEventSubscriber::subscribe_to_new_blocks(&provider_ws, block_sender).await
+                {
+                    error!("[MAIN] Ошибка в подписке на блоки: {:?}", e);
+                }
+        });
     
-    sleep(std::time::Duration::from_secs(1)).await;
     
-    info!("⏳[MAIN]  Создание подписчика на блоки...");
+    info!("⏳[MAIN] Создание модуля пулинга");
     
     let subscriber: Arc<UniswapEventSubscriber> = Arc::new(UniswapEventSubscriber::new(provider_http.clone()));
     
@@ -275,8 +280,12 @@ tokio::spawn({
     
     let block_receiver_clone_to_subscriber = block_receiver.clone();
     // Запускаем polling_event как вечную фоновую задачу
-    tokio::spawn(async move {
+    spawn
+    (
+        async move {
+
         if let Err(e) = subscriber_clone
+
         .polling_event( graph_for_event, provider_ws_clone, &block_receiver_clone_to_subscriber)
         .await
         {

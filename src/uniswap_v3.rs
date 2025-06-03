@@ -441,6 +441,8 @@ pub async fn sync_pools(
     start_block_from_env: u64,
     event_subscriber: Arc<UniswapEventSubscriber>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+
+
     let save_per_pool = env::var("SAVE_GRAPH_PER_POOL").map(|v| v == "true").unwrap_or(false);
 
     // === Фаза 1: обработка пулов из кэша ========================================================================================================================================================================================================================
@@ -598,7 +600,7 @@ pub async fn sync_pools(
                             }
                         }
                     }
-                    Ok(_) => info!("[UNISWAP_V3_СИНХРОНИЗАЦИЯ] Пропуск нового пула {:?}: токены не в whitelist", addr),
+                    Ok(_) => {}, 
                     Err(e) => warn!("[СИНХРОНИЗАЦИЯ] Ошибка проверки токенов пула {:?}: {:?}", addr, e),
                 }
                 let processed = phase2_processed.fetch_add(1, Ordering::SeqCst) + 1;
