@@ -4,7 +4,6 @@ use ethers::prelude::*;
 use ethers::types::Address;
 use log::error;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::HashMap, fs};
@@ -182,42 +181,6 @@ pub fn load_token_list_from_json() -> HashMap<Address, TokenInfo> {
             // Пытаемся распарсить строку как Ethereum адрес
             // Если не удается - пропускаем эту запись
             addr_str.parse::<Address>().ok().map(|addr| (addr, info))
-        })
-        .collect()
-}
-
-/// Загружает whitelist токенов из JSON файла
-/// Whitelist содержит проверенные токены, которые безопасно использовать
-/// # Аргументы
-/// * `path` - Путь к JSON файлу с whitelist
-/// # Возвращает
-/// HashSet с адресами разрешенных токенов
-/// # Паника
-/// Функция паникует если файл не найден или содержит невалидный JSON
-/// # Формат файла
-/// Ожидается JSON объект где ключи - адреса токенов, значения - символы
-/// Пример: {"0x1234...": "USDC", "0x5678...": "WETH"}
-/// # Логика
-/// 1. Читает JSON файл
-/// 2. Парсит как HashMap<String, String>
-/// 3. Извлекает только ключи (адреса токенов)
-/// 4. Конвертирует строки в Address типы
-/// 5. Возвращает HashSet для быстрой проверки принадлежности
-pub fn load_token_whitelist(path: &str) -> HashSet<Address> {
-    // Читаем JSON файл с whitelist
-    let json = fs::read_to_string(path).expect("Не удалось прочитать token_white_list.json");
-    
-    // Парсим как HashMap где ключи - адреса, значения - символы токенов
-    let raw_map: HashMap<String, String> =
-        serde_json::from_str(&json).expect("Ошибка парсинга token_white_list.json");
-
-    // Извлекаем только адреса токенов и конвертируем в Address типы
-    raw_map
-        .into_iter()
-        .filter_map(|(addr_str, _symbol)| {
-            // Пытаемся распарсить строку как Ethereum адрес
-            // Символ токена игнорируем, нам нужны только адреса
-            addr_str.parse::<Address>().ok()
         })
         .collect()
 }

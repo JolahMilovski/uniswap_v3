@@ -1,3 +1,4 @@
+use colored::Colorize;
 use ethers::prelude::Provider;
 use ethers::types::U256;
 use ethers_providers::{Http, Middleware};
@@ -28,7 +29,7 @@ pub async fn start_gas_price_loop(
         match provider.get_gas_price().await {
             Ok(price) => {
                 // Логируем цену газа в терминал сразу при получении
-                info!(" [GET_GAS_PRICE] ЦЕНА ГАЗА: {} wei", price);
+                info!(" [ {} ] ЦЕНА ГАЗА: {} wei","GET_GAS_PRICE".black().on_blue(), price);
 
                 // Отправляем в канал
                 let _ = sender.send(price);
@@ -37,6 +38,6 @@ pub async fn start_gas_price_loop(
                 eprintln!(" [GET_GAS_PRICE] Failed to fetch gas price: {:?}", e);
             }
         }
-        sleep(Duration::from_secs(1)).await;
+        sleep(Duration::from_secs(120)).await;
     }
 }

@@ -35,12 +35,12 @@ pub struct PathBuilder {
     aave_tokens: HashSet<Address>,
 }
 
-impl PathBuilder {    
+impl PathBuilder {
     /// Создает новый экземпляр PathBuilder
-    /// 
+    ///
     /// # Аргументы
     /// * `aave_rx` - Receiver для получения обновлений о ликвидности токенов в Aave
-    /// 
+    ///
     /// # Возвращает
     /// Новый экземпляр PathBuilder с пустыми путями и токенами из Aave
     pub fn new(aave_rx: watch::Receiver<AaveTokenLiquidity>) -> Self {
@@ -55,10 +55,10 @@ impl PathBuilder {
 
     /// Основная функция для построения всех возможных путей арбитража
     /// Очищает предыдущие результаты и строит новые пути на основе текущего графа
-    /// 
+    ///
     /// # Аргументы
     /// * `graph` - Граф Uniswap, содержащий информацию о пулах и токенах
-    /// 
+    ///
     /// # Логика работы
     /// 1. Очищает предыдущие пути и индексы
     /// 2. Строит список связей между токенами
@@ -96,17 +96,20 @@ impl PathBuilder {
     }
 
     /// Строит список связей между токенами на основе графа пулов Uniswap
-    /// 
+    ///
     /// # Аргументы
     /// * `graph` - Граф Uniswap с информацией о пулах
-    /// 
+    ///
     /// # Возвращает
     /// DashMap где ключ - адрес токена, значение - вектор кортежей (связанный_токен, адрес_пула)
-    /// 
+    ///
     /// # Логика
     /// Для каждого пула в графе создает двунаправленные связи между токенами
     /// Это позволяет быстро найти все токены, с которыми можно обменять данный токен
-    fn build_related_list(&self, graph: &UniversalGraph) -> HashMap<Address, Vec<(Address, Address)>> {
+    fn build_related_list(
+        &self,
+        graph: &UniversalGraph,
+    ) -> HashMap<Address, Vec<(Address, Address)>> {
         let mut related_list = HashMap::new();
 
         // Проходим по всем пулам в графе
@@ -115,12 +118,14 @@ impl PathBuilder {
             let (token0, token1) = *entry.value();
 
             // Добавляем связь token0 -> token1 через данный пул
-            related_list.entry(token0)
+            related_list
+                .entry(token0)
                 .or_insert_with(Vec::new)
                 .push((token1, pool_address));
 
             // Добавляем обратную связь token1 -> token0 через тот же пул
-            related_list.entry(token1)
+            related_list
+                .entry(token1)
                 .or_insert_with(Vec::new)
                 .push((token0, pool_address));
         }
@@ -130,7 +135,7 @@ impl PathBuilder {
 
     /// Рекурсивная функция для поиска циклических путей арбитража
     /// Ищет пути длиной 3-4 хопа, которые начинаются и заканчиваются одним токеном
-    /// 
+    ///
     /// # Аргументы
     /// * `start_token` - Начальный токен (должен совпадать с конечным для замыкания цикла)
     /// * `current_token` - Текущий токен в процессе поиска
@@ -139,7 +144,7 @@ impl PathBuilder {
     /// * `current_path` - Текущий путь токенов
     /// * `current_pools` - Текущий путь пулов
     /// * `current_hops` - Количество текущих хопов (переходов между токенами)
-    /// 
+    ///
     /// # Логика работы
     /// 1. Проверяет, является ли текущий путь валидным арбитражем (3-4 хопа, замкнутый цикл)
     /// 2. Если да - сохраняет путь и обновляет индексы
@@ -222,17 +227,20 @@ impl PathBuilder {
     }
 
     /// Сохраняет текущее состояние PathBuilder в JSON файл
-    /// 
+    ///
     /// # Аргументы
     /// * `file_path` - Путь к файлу для сохранения
-    /// 
+    ///
     /// # Возвращает
     /// Result с ошибкой в случае проблем с записью файла
-    /// 
+    ///
     /// # Использование
     /// Позволяет сохранить найденные пути арбитража для последующего анализа
     /// или использования другими компонентами системы
-    pub fn save_to_json(&self, file_path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn save_to_json(
+        &self,
+        file_path: impl AsRef<Path>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let file = File::create(file_path)?;
         serde_json::to_writer_pretty(file, self)?;
         Ok(())

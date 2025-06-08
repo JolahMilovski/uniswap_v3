@@ -6,9 +6,16 @@ use ethers::{
 };
 use log::{error, info};
 use serde::{Deserialize, Serialize};
-use std::{collections::{HashMap, HashSet}, fs::File, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fs::File,
+    sync::Arc,
+};
 use std::{env, io::Write};
-use tokio::{sync::watch, time::{sleep, Duration}};
+use tokio::{
+    sync::watch,
+    time::{Duration, sleep},
+};
 
 abigen!(
     AavePoolDataProvider,
@@ -58,8 +65,6 @@ abigen!(
     }]"#
 );
 
-
-
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct AaveTokenLiquidity {
     pub token_address: HashSet<Address>,
@@ -75,8 +80,7 @@ pub struct AaveLiquiditySnapshot {
 pub async fn get_aave_data(
     provider: Arc<Provider<Http>>,
     aave_sender: watch::Sender<AaveTokenLiquidity>,
-    )-> Result<()> {
-
+) -> Result<()> {
     let pool_address: Address = env::var("ARBITRUM_AAVE_V3_POOL_ADDRESS")?.parse()?;
     let data_provider_address: Address =
         env::var("ARBITRUM_AAVE_V3_POOL_DATA_PROVIDER_ADDRESS")?.parse()?;
@@ -89,7 +93,10 @@ pub async fn get_aave_data(
 
         match pool_data_provider.get_all_reserves_tokens().call().await {
             Ok(reserves) => {
-                info!("✅  [AAVE] Получено {} токенов из data provider", reserves.len());
+                info!(
+                    "✅  [AAVE] Получено {} токенов из data provider",
+                    reserves.len()
+                );
 
                 let mut token_address = HashSet::with_capacity(reserves.len());
                 let mut token_info = HashMap::with_capacity(reserves.len());
@@ -120,9 +127,12 @@ pub async fn get_aave_data(
                     },
                 };
 
-                        // Отправляем обновлённые данные в канал watch
+                // Отправляем обновлённые данные в канал watch
                 if let Err(e) = aave_sender.send(snapshot.data.clone()) {
-                    error!("❌ [AAVE] Ошибка отправки обновлённых данных через канал: {:?}", e);
+                    error!(
+                        "❌ [AAVE] Ошибка отправки обновлённых данных через канал: {:?}",
+                        e
+                    );
                 }
 
                 match serde_json::to_string_pretty(&snapshot) {
@@ -137,7 +147,7 @@ pub async fn get_aave_data(
                                         snapshot.timestamp,
                                         snapshot.data.token_info.len()
                                     );
-                                    info!("📤 [AAVE] Данные: \n{}", json);
+                                    //info!("📤 [AAVE] Данные: \n{}", json);//!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!1
                                 }
                             }
                             Err(e) => {

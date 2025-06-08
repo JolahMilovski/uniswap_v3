@@ -8,13 +8,11 @@ use std::fs::{File, rename};
 use std::io::{self, Read, Write};
 use std::path::Path;
 
-
 #[derive(Serialize, Deserialize)]
 struct UniversalGraphSnapshot {
     nodes: HashMap<Address, (Address, Address)>, // адрес пула : адреса токенов
-    edges: HashMap<Address, UniswapPool>, // адрес пула : данные пула
+    edges: HashMap<Address, UniswapPool>,        // адрес пула : данные пула
 }
-
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct UniversalGraph {
@@ -26,7 +24,6 @@ pub struct UniversalGraph {
     pub edges: DashMap<Address, UniswapPool>,
 }
 
-
 #[derive(Serialize, Clone, Debug, Deserialize)]
 pub struct UniswapPool {
     pub uniswap_pool_address: Address,
@@ -37,17 +34,17 @@ pub struct UniswapPool {
     pub uniswap_token_b: Address,
     pub uniswap_token_b_decimals: u8,
     pub uniswap_token_b_symbol: String,
-      #[serde(serialize_with = "serialize_u512")]
+    #[serde(serialize_with = "serialize_u512")]
     pub uniswap_liquidity: U512,
-      #[serde(serialize_with = "serialize_u512")]
+    #[serde(serialize_with = "serialize_u512")]
     pub uniswap_sqrt_price: U512,
-      #[serde(serialize_with = "serialize_u512")]
+    #[serde(serialize_with = "serialize_u512")]
     pub uniswap_current_price: U512,
     pub uniswap_tick_current: i32,
     pub uniswap_tick_lower: i32,
     pub uniswap_tick_upper: i32,
     pub uniswap_tick_spacing: i32,
-      #[serde(serialize_with = "serialize_u512")]
+    #[serde(serialize_with = "serialize_u512")]
     pub uniswap_max_liquidity_per_tick: U512,
     pub uniswap_fee_tier: u32,
     #[serde(serialize_with = "serialize_tick_map")]
@@ -121,10 +118,19 @@ impl UniversalGraph {
             existing_pool.uniswap_current_price = new_pool.uniswap_current_price;
             existing_pool.uniswap_tick_current = new_pool.uniswap_tick_current;
             existing_pool.is_active = new_pool.is_active;
-            existing_pool.tick_map = existing_pool.tick_map.clone().union(new_pool.tick_map.clone());
+            existing_pool.tick_map = existing_pool
+                .tick_map
+                .clone()
+                .union(new_pool.tick_map.clone());
 
-            debug!("UNISAWP_GRAPH_Обновлен пул: {:?}", new_pool.uniswap_pool_address);
-            self.nodes.insert(new_pool.uniswap_pool_address, (new_pool.uniswap_token_a, new_pool.uniswap_token_b));
+            debug!(
+                "UNISAWP_GRAPH_Обновлен пул: {:?}",
+                new_pool.uniswap_pool_address
+            );
+            self.nodes.insert(
+                new_pool.uniswap_pool_address,
+                (new_pool.uniswap_token_a, new_pool.uniswap_token_b),
+            );
         } else {
             let pool_address = new_pool.uniswap_pool_address;
             let token_a = new_pool.uniswap_token_a;
@@ -157,8 +163,7 @@ impl UniversalGraph {
             let mut file = File::open(path)?;
             let mut contents = String::new();
             file.read_to_string(&mut contents)?;
-            serde_json::from_str(&contents)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            serde_json::from_str(&contents).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
         } else {
             UniversalGraphSnapshot {
                 nodes: HashMap::new(),
@@ -169,7 +174,13 @@ impl UniversalGraph {
         // Обновляем данные для пула
         if let Some(pool) = self.edges.get(&pool_address) {
             snapshot.edges.insert(pool_address, pool.clone());
-            snapshot.nodes.insert(pool_address, self.nodes.get(&pool_address).map(|v| *v.value()).unwrap_or_default());
+            snapshot.nodes.insert(
+                pool_address,
+                self.nodes
+                    .get(&pool_address)
+                    .map(|v| *v.value())
+                    .unwrap_or_default(),
+            );
         }
 
         // Сериализуем обновлённый снимок
@@ -189,11 +200,7 @@ impl UniversalGraph {
 
     fn snapshot(&self) -> UniversalGraphSnapshot {
         UniversalGraphSnapshot {
-            nodes: self
-                .nodes
-                .iter()
-                .map(|r| (*r.key(), *r.value()))
-                .collect(),
+            nodes: self.nodes.iter().map(|r| (*r.key(), *r.value())).collect(),
             edges: self
                 .edges
                 .iter()
@@ -202,7 +209,6 @@ impl UniversalGraph {
         }
     }
 }
-
 
 // Сериализатор для U512 в десятичную строку
 fn serialize_u512<S>(value: &U512, serializer: S) -> Result<S::Ok, S::Error>
@@ -238,17 +244,20 @@ S: Serializer,
 */
 
 // Сериализатор для OrdMap
-fn serialize_tick_map<S>(value: &OrdMap<i32, (i128, U512)>, serializer: S) -> Result<S::Ok, S::Error>
+fn serialize_tick_map<S>(
+    value: &OrdMap<i32, (i128, U512)>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
     use serde::ser::SerializeMap;
-    
+
     let mut map = serializer.serialize_map(Some(value.len()))?;
     for (k, (net, gross)) in value.iter() {
         map.serialize_entry(
-            &k.to_string(), // Ключ как строка
-            &(net.to_string(), gross.to_string()) // Значения как строки
+            &k.to_string(),                        // Ключ как строка
+            &(net.to_string(), gross.to_string()), // Значения как строки
         )?;
     }
     map.end()
