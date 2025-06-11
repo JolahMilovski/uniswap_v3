@@ -4,17 +4,19 @@ use ethers::{
     prelude::*,
     types::{Address, U256},
 };
-use log::{error, info};
-use serde::{Deserialize, Serialize};
+use log::{error, info, debug};
+use serde::{Deserialize, Serialize, Deserializer};
+use serde_with::{serde_as, DisplayFromStr};
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
     sync::Arc,
+    io::{Read, Write},
 };
-use std::{env, io::Write};
+use std::{env};
 use tokio::{
     sync::watch,
-    time::{Duration, sleep},
+    time::{interval, Duration},
 };
 
 abigen!(
@@ -65,9 +67,11 @@ abigen!(
     }]"#
 );
 
+#[serde_as]
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct AaveTokenLiquidity {
     pub token_address: HashSet<Address>,
+    #[serde_as(as = "HashMap<_, (String, DisplayFromStr)>")]
     pub token_info: HashMap<Address, (String, U256)>,
 }
 
@@ -84,37 +88,71 @@ pub async fn get_aave_data(
     let pool_address: Address = env::var("ARBITRUM_AAVE_V3_POOL_ADDRESS")?.parse()?;
     let data_provider_address: Address =
         env::var("ARBITRUM_AAVE_V3_POOL_DATA_PROVIDER_ADDRESS")?.parse()?;
+    info!("[AAVE] Используется пул: {:?}, провайдер данных: {:?}", pool_address, data_provider_address);
 
     let pool_data_provider = AavePoolDataProvider::new(data_provider_address, provider.clone());
     let pool_v3 = AavePool::new(pool_address, provider.clone());
 
+    // Десериализация aave_liquidity.json
+    let mut liquidity_data = AaveTokenLiquidity::default();
+    match File::open("aave_liquidity.json") {
+        Ok(mut file) => {
+            let mut contents = String::new();
+            if let Ok(_) = file.read_to_string(&mut contents) {
+                match serde_json::from_str::<AaveLiquiditySnapshot>(&contents) {
+                    Ok(snapshot) => {
+                        liquidity_data = snapshot.data;
+                        info!("[AAVE] Загружено {} токенов из aave_liquidity.json", liquidity_data.token_address.len());
+                        if let Err(e) = aave_sender.send(liquidity_data.clone()) {
+                            error!("[AAVE] Ошибка отправки данных из JSON через канал: {}", e);
+                        } else {
+                            info!("[AAVE] Данные из JSON отправлены в канал");
+                        }
+                    }
+                    Err(e) => error!("[AAVE] Ошибка десериализации aave_liquidity.json: {:?}", e),
+                }
+            } else {
+                error!("[AAVE] Не удалось прочитать aave_liquidity.json");
+            }
+        }
+        Err(e) => error!("[AAVE] Не удалось открыть aave_liquidity.json: {:?}", e),
+    }
+
+    // Интервал опроса блокчейна (2 минуты)
+    let mut interval = interval(Duration::from_secs(120));
+
     loop {
-        info!("🔄  [AAVE] Начинаем обновление ликвидности Aave");
+        interval.tick().await;
+        info!("🔄 [AAVE] Начинаем обновление ликвидности Aave");
 
         match pool_data_provider.get_all_reserves_tokens().call().await {
             Ok(reserves) => {
-                info!(
-                    "✅  [AAVE] Получено {} токенов из data provider",
-                    reserves.len()
-                );
+                info!("✅ [AAVE] Получено {} токенов из data provider", reserves.len());
+                let token_addresses: Vec<String> = reserves.iter().map(|t| format!("{:?}", t.token_address)).collect();
+                info!("[AAVE] Адреса токенов: {:?}", token_addresses);
 
                 let mut token_address = HashSet::with_capacity(reserves.len());
                 let mut token_info = HashMap::with_capacity(reserves.len());
 
                 for token in &reserves {
+                    info!("[AAVE] Обработка токена: {}, адрес: {:?}", token.symbol, token.token_address);
+                    info!("[AAVE] Вызов get_reserve_data для токена: {}", token.symbol);
                     match pool_v3.get_reserve_data(token.token_address).call().await {
                         Ok(reserve_data) => {
+                            info!("[AAVE] Успешно получены данные для токена: {}", token.symbol);
                             token_address.insert(token.token_address);
                             token_info.insert(
                                 token.token_address,
                                 (token.symbol.clone(), reserve_data.available_liquidity),
                             );
+                            info!("[AAVE] Токен {}: адрес {:?}, ликвидность {}", token.symbol, token.token_address, reserve_data.available_liquidity);
                         }
                         Err(e) => {
                             error!(
-                                "❌ [AAVE] Ошибка при получении ликвидности для токена {}: {:?}",
-                                token.symbol, e
+                                "❌ [AAVE] [{}] Ошибка при получении ликвидности для токена {}: {:?}", 
+                                Utc::now().to_rfc3339(), token.symbol, e
                             );
+                            continue;
                         }
                     }
                 }
@@ -127,12 +165,10 @@ pub async fn get_aave_data(
                     },
                 };
 
-                // Отправляем обновлённые данные в канал watch
                 if let Err(e) = aave_sender.send(snapshot.data.clone()) {
-                    error!(
-                        "❌ [AAVE] Ошибка отправки обновлённых данных через канал: {:?}",
-                        e
-                    );
+                    error!("[AAVE] Ошибка отправки обновленных данных через канал: {}", e);
+                } else {
+                    info!("[AAVE] Данные о {} токенах отправлены в канал", snapshot.data.token_address.len());
                 }
 
                 match serde_json::to_string_pretty(&snapshot) {
@@ -140,37 +176,31 @@ pub async fn get_aave_data(
                         match File::create("aave_liquidity.json") {
                             Ok(mut file) => {
                                 if let Err(e) = file.write_all(json.as_bytes()) {
-                                    error!("❌ [AAVE] Ошибка записи JSON в файл: {:?}", e);
+                                    error!("[AAVE] Ошибка записи в JSON: {:?}", e);
                                 } else {
                                     info!(
-                                        "🟢 [AAVE] [{}] Сохранили {} токенов в aave_liquidity.json",
+                                        "🟢 [AAVE] [{}] Сохранено {} токенов в aave_liquidity.json",
                                         snapshot.timestamp,
                                         snapshot.data.token_info.len()
                                     );
-                                    //info!("📤 [AAVE] Данные: \n{}", json);//!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!1
+                                    info!("📤 [AAVE] Данные: \n{}", json);
                                 }
                             }
                             Err(e) => {
-                                error!(
-                                    "❌ [AAVE] Не удалось создать файл aave_liquidity.json: {:?}",
-                                    e
-                                );
+                                error!("[AAVE] Не удалось создать файл aave_liquidity.json: {:?}", e);
                             }
                         }
                     }
                     Err(e) => {
-                        error!("❌ [AAVE] Ошибка сериализации JSON: {:?}", e);
+                        error!("[AAVE] Ошибка сериализации JSON: {:?}", e);
                     }
                 }
             }
             Err(e) => {
-                error!(
-                    "❌ [AAVE] Ошибка получения списка резервов из data provider: {:?}",
-                    e
-                );
+                error!("[AAVE] Ошибка получения списка резервов из data provider: {:?}", e);
             }
         }
 
-        sleep(Duration::from_secs(1200)).await;
+        info!("[AAVE] Ожидание следующего обновления");
     }
 }

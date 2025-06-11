@@ -604,86 +604,83 @@ pub async fn fetch_tick_data(
     /// 
     /// # Возвращаемое значение
     /// * `anyhow::Result<()>` - Результат выполнения операции
-    pub async fn polling_event(
+ pub async fn polling_event(
         &self,
         block_receiver: &watch::Receiver<u64>,
         event_tx: mpsc::Sender<PoolEventInfo>,
-        graph: Arc<UniversalGraph>, // Канал для отправки событий
+        graph: Arc<UniversalGraph>,
+        arb_event_tx: mpsc::Sender<PoolEventInfo>,
     ) -> anyhow::Result<()> {
-
-        // Инициализация начального блока и параметров
         let mut block_from = *block_receiver.borrow();
-        let max_chunk_size: u64 = 200; // Максимальный размер чанка для запроса событий
+        let max_chunk_size: u64 = 200;
         let mut block_receiver = block_receiver.clone();
-
-        loop {
-            // Ожидаем обновление номера блока
-            if block_receiver.changed().await.is_err() {
-                warn!("[UNISWAP_EVENT_POLLING] Канал блоков закрыт");
-                break;
-            }
-
-            let block_to = *block_receiver.borrow();
-
-            // Получаем список отслеживаемых пулов
-            let subscribed_pools = self.subscribed_pools.clone();
-            if subscribed_pools.is_empty() {
-                block_from = block_to + 1;
-                continue;
-            }
-
-            // Проверка корректности диапазона блоков
-            if block_to < block_from {
-                warn!(
-                    "[UNISWAP_EVENT_POLLING] Некорректный диапазон: from {} > to {}",
-                    block_from, block_to
-                );
-                continue;
-            }
-
-            // Инициализация переменных для сбора событий
-            let mut current_from = block_from;
-            let mut all_events = Vec::new();
-
-            // Сбор событий по чанкам для оптимизации запросов
-            while current_from <= block_to {
-                // Вычисляем границы текущего чанка
-                let current_to = (current_from + max_chunk_size - 1).min(block_to);
-
-                // Получаем события для текущего чанка
-                match self.fetch_events(current_from, current_to).await {
-                    Ok(events) => {
-                        all_events.extend(events);
-                    }
-                    Err(e) => {
-                        warn!(
-                            "[UNISWAP_EVENT_POLLING] Ошибка получения событий за блоки {}–{}: {}",
-                            current_from, current_to, e
-                        );
-                    }
-                }
-
-                current_from = current_to + 1;
-            }
-                sleep(Duration::from_millis(100));
-            // Обработка и отправка собранных событий
-            if !all_events.is_empty() {
-                // Агрегируем события для оптимизации
-                let aggregated_events = self.aggregate_events(all_events, graph.clone());
-                // Отправляем каждое агрегированное событие в канал
-                for pool_event in aggregated_events {
-                    if let Err(e) = event_tx.send(pool_event).await {
-                        error!("[UNISWAP_EVENT_POLLING] Ошибка отправки в канал событий: {}", e);
-                    }
-                }
-            }
-
-            // Обновляем начальный блок для следующей итерации
-            block_from = block_to + 1;
-        }
-    sleep(Duration::from_secs(1));
-        Ok(())
+        /* 
+        */
+loop {
+    if block_receiver.changed().await.is_err() {
+        warn!("[UNISWAP_EVENT_POLLING] Канал блоков закрыт");
+        break;
     }
+    
+    let block_to = *block_receiver.borrow();
+    if block_to < block_from {
+        warn!(
+            "[UNISWAP_EVENT_POLLING] Некорректный диапазон: from {} > to {}",
+            block_from, block_to
+        );
+        continue;
+    }
+    
+    let subscribed_pools = self.subscribed_pools.clone();
+    if subscribed_pools.is_empty() {
+        block_from = block_to + 1;
+        continue;
+    }
+    
+    let mut current_from = block_from;
+    let mut all_events = Vec::new();
+    
+    while current_from <= block_to {
+        let current_to = (current_from + max_chunk_size - 1).min(block_to);
+        match self.fetch_events(current_from, current_to).await {
+            Ok(events) => {
+                all_events.extend(events);
+            }
+            Err(e) => {
+                warn!(
+                    "[UNISWAP_EVENT_POLLING] Ошибка получения событий за блоки {}–{}: {}",
+                    current_from, current_to, e
+                );
+            }
+        }
+        current_from = current_to + 1;
+    }
+    
+    let mut sent_events = 0;
+    let aggregated_events = self.aggregate_events(all_events, graph.clone());
+    for pool_event in aggregated_events {
+        let event_for_workers = pool_event.clone();
+        let event_for_simulator = pool_event;
+        
+        if let Err(e) = event_tx.send(event_for_workers).await {
+            error!("[UNISWAP_EVENT_POLLING] Ошибка отправки в канал воркеров: {}", e);
+        }
+        if let Err(e) = arb_event_tx.send(event_for_simulator).await {
+            error!("[UNISWAP_EVENT_POLLING] Ошибка отправки в канал симулятора: {}", e);
+        }
+        sent_events += 1;
+    }
+    
+    if sent_events > 0 {
+        info!("[UNISWAP_EVENT_POLLING] Отправлено событий: {}", sent_events);
+    }
+    
+    block_from = block_to + 1;
+    sleep(Duration::from_secs(1));
+}
+Ok(())
+    }
+
 
 /// Метод для агрегации событий пула
 fn aggregate_events(&self, events: Vec<PoolEventInfo>, graph: Arc<UniversalGraph>) -> Vec<PoolEventInfo> {
@@ -734,6 +731,19 @@ fn aggregate_events(&self, events: Vec<PoolEventInfo>, graph: Arc<UniversalGraph
 
 
     /// 🧠 Метод запуска воркеров и диспетчера
+        /// Метод запуска диспетчера и пула воркеров для обработки событий Uniswap
+        /// 
+        /// # Аргументы
+        /// * `self` - Arc указатель на экземпляр структуры
+        /// * `event_rx` - Приемник событий пула (канал для получения PoolEventInfo)
+        /// * `graph` - Arc указатель на универсальный граф
+        /// * `provider` - Arc указатель на Web3 провайдер
+        /// * `num_workers` - Количество воркеров для параллельной обработки
+        ///
+        /// # Принцип работы
+        /// 1. Создает пул воркеров заданного размера
+        /// 2. Каждому воркеру выделяется свой канал для получения событий
+        /// 3. Диспетчер распределяет входящие события между воркерами по кругу
         pub async fn start_dispatcher_and_workers(
             self: Arc<Self>,
             mut event_rx: mpsc::Receiver<PoolEventInfo>,
@@ -741,34 +751,57 @@ fn aggregate_events(&self, events: Vec<PoolEventInfo>, graph: Arc<UniversalGraph
             provider: Arc<Provider<Ws>>,
             num_workers: usize,
         ) {
+            // Вектор для хранения отправителей событий каждому воркеру
             let mut worker_senders = Vec::new();
 
+            // Создаем и запускаем заданное количество воркеров
             for i in 0..num_workers {
+                // Создаем неограниченный канал для каждого воркера
                 let (tx, rx): (
                     UnboundedSender<PoolEventInfo>,
                     UnboundedReceiver<PoolEventInfo>,
                 ) = tokio::sync::mpsc::unbounded_channel();
                 worker_senders.push(tx);
 
+                // Клонируем необходимые Arc указатели для воркера
                 let graph = Arc::clone(&graph);
                 let provider = Arc::clone(&provider);
-                let subscriber = Arc::clone(&self); // 👈 передаём self
+                let subscriber = Arc::clone(&self);
 
+                // Запускаем воркер в отдельной задаче
                 tokio::spawn(async move {
                     subscriber.worker_loop(rx, graph, provider, i).await;
                 });
             }
 
+            // Основной цикл диспетчера
             let mut current_worker = 0;
             while let Some(event) = event_rx.recv().await {
+                // Отправляем событие текущему воркеру
                 let _ = worker_senders[current_worker].send(event);
+                // Переключаемся на следующего воркера по кругу
                 current_worker = (current_worker + 1) % num_workers;
             }
 
             warn!("[DISPATCHER_UNISWAP_EVENT] Канал событий закрыт, dispatcher завершён");
         }
 
-        /// 🧠 Метод воркера (теперь с self)
+        /// Основной цикл обработки событий для воркера
+        /// 
+        /// # Аргументы
+        /// * `self` - Arc указатель на текущий объект
+        /// * `rx` - Приемник событий для данного воркера (UnboundedReceiver)
+        /// * `graph` - Arc указатель на универсальный граф
+        /// * `provider` - Arc указатель на Web3 провайдер
+        /// * `worker_id` - Уникальный идентификатор воркера
+        ///
+        /// # Принцип работы
+        /// 1. В бесконечном цикле ожидает новые события из канала
+        /// 2. При получении события:
+        ///    - Извлекает адрес пула из события
+        ///    - Пытается обновить граф на основе полученного события
+        ///    - Логирует результат обработки (успех/ошибка)
+        /// 3. При закрытии канала завершает работу
         async fn worker_loop(
             self: Arc<Self>,
             mut rx: UnboundedReceiver<PoolEventInfo>,

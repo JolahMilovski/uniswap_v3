@@ -3,7 +3,7 @@ use ethers::types::{Address, U512};
 use im::OrdMap;
 use log::debug;
 use serde::{Deserialize, Serialize, Serializer};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, rename};
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -155,6 +155,11 @@ impl UniversalGraph {
         // Атомарно заменяем оригинальный файл
         rename(temp_path, path)?;
         Ok(())
+    }
+
+    /// Создает JSON-файл с текущим состоянием графа
+    pub fn get_pool_addresses(&self) -> HashSet<Address> {
+        self.nodes.iter().map(|r| *r.key()).collect()
     }
 
     pub fn update_pool_json(&self, pool_address: Address, path: &str) -> io::Result<()> {

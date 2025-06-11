@@ -9,6 +9,7 @@ pub mod uniswap_graph;
 pub mod uniswap_v3;
 pub mod arb_scanner;
 pub mod token_white_list;
+pub mod arb_simulator; // Добавляем новый модуль
 
 use aave_v3_flash_monitor::AaveTokenLiquidity;
 use aave_v3_flash_monitor::get_aave_data;
@@ -34,22 +35,22 @@ use std::env;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::Arc;
-use std::time::Duration;
 
 use tokio::sync::Mutex;
 use tokio::sync::watch;
-use tokio::time::sleep;
 
+use arb_simulator::ArbitrageSimulator;
 use uniswap_cache::UniswapPoolCache;
 use uniswap_events::UniswapEventSubscriber;
 use uniswap_graph::UniversalGraph;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    
     //==========================================  подключаем .ENV  и ЛОГ ==========================================================================================================
     dotenv().ok();
 
-    let start_block = get_env_var("START_BLOCK").parse::<u64>()?;
+    //let start_block = get_env_var("START_BLOCK").parse::<u64>()?;
 
     // Инициализация логгера с кастомным форматом и записью в файл
     let log_file = Arc::new(Mutex::new(
@@ -78,8 +79,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 log::Level::Error => "",   // Огонь для ошибок
                 log::Level::Warn => "⚠️",  // Предупреждение
                 log::Level::Info => "🔥",  // Информация
-                log::Level::Debug => "🐞", // Жук для дебага
-                log::Level::Trace => "🔬", // Лупа для трассировки
+                log::Level::Debug => "🐶", // Жук для дебага
+                log::Level::Trace => "🔬", // Лупа для ответа
             };
 
             // Цвет модуля
@@ -96,7 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 module_color,
                 record.module_path().unwrap_or("unknown"),
                 level_color,
-                record.args(),
+                record.args()
             );
 
             // Записываем в консоль
@@ -138,7 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Клонируем WS  провайдеров
     let provider_ws_for_sync = provider_ws.clone();
     let dispatcher_provider = provider_ws.clone();
-    let provider_gas = provider_http.clone();
+    //let provider_gas = provider_http.clone();
 
     //==========================================  КЭШ ТОКЕНОВ  ==========================================================================================================
 
@@ -158,14 +159,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     //======================================= ЗАГРУЖАЕМ БЕЛЫЙ СПИСОК ТОКЕНОВ ================================================================================================
 
-        //  ✅ Загрузка белого списка токенов
+    //  ✅ Загрузка белого списка токенов
     let token_whitelist_set: Arc<DashSet<Address>> = Arc::new(token_white_list::load_token_whitelist());
     info!(
         "[MAIN] Загружено {} токенов из белого списка",
         token_whitelist_set.len()
     );
 
-    //===========================================  ЗАГРУЖАЕМ КЭШ АДРЕСОВ ПУЛОВ ===============================================================================================
+//===========================================  ЗАГРУЖАЕМ КЭШ АДРЕСОВ ПУЛОВ ===============================================================================================
 
     let pool_cache: Arc<Mutex<UniswapPoolCache>> = Arc::new(Mutex::new(
         match UniswapPoolCache::load_from_bin("uniswap_pool_addresses_cache.bin") {
@@ -180,20 +181,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     ));
 
-    //====================================  ПОДКЛЮЧАЕМСЯ К ГАЗОВОЙ ТРУБЕ ===============================================================================================================================
-    /**/
-    // Создаем канал для газа
-    let (_gas_feed, gas_sender) = take_gas_price::GasPriceFeed::new();
+//====================================  ПОДКЛЮЧАЕМСЯ К ГАЗОВОЙ ТРУБЕ ===============================================================================================================================
+/*
+// Создаем канал для газа
+let (_gas_feed, gas_sender) = take_gas_price::GasPriceFeed::new();
 
-    // Запускаем таск по обновлению цены газа
-    tokio::spawn({
-        async move {
-            take_gas_price::start_gas_price_loop(provider_gas, gas_sender).await;
-        }
-    });
+// Запускаем таск по обновлению цены газа
+tokio::spawn({
+    async move {
+        take_gas_price::start_gas_price_loop(provider_gas, gas_sender).await;
+    }
+});
+*/
 
-    
-    //==========================================  ПОДКЛЮЧАЕМ ГРАФ  И ЕГО КЛОНЫ  =========================================================================================================================
+//==========================================  ПОДКЛЮЧАЕМ ГРАФ  И ЕГО КЛОНЫ  =========================================================================================================================
 
     //  Создаем UniversalGraph
     let graph: Arc<UniversalGraph> = Arc::new(UniversalGraph::new());
@@ -204,7 +205,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let graph_for_shutdown = Arc::clone(&graph);
     let dispatcher_graph = Arc::clone(&graph);
     let pulling_graph = Arc::clone(&graph);
-    //let graph_for_aave = Arc::clone(&graph);
 
     //=======================================  Обработки Ctrl+C =============================================================================================
 
@@ -217,29 +217,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             info!("[MAIN] Граф успешно сохранен в uniswap_graph_snapshot.json");
         }
-        sleep(Duration::from_secs(5)).await;
         std::process::exit(0);
     });
 
-    //==========================================  ИНИЦИАЛИЗАЦИЯ AAVE FLASH MONITOR  ====================================================================================================
+//==========================================  ИНИЦИАЛИЗАЦИЯ AAVE FLASH MONITOR  ====================================================================================================
 
-    // Создаём канал с пустой структурой
-    let (aave_tx, aave_rx) = watch::channel(AaveTokenLiquidity::default());
+// Создаём канал с пустой структурой
+let (aave_tx,mut aave_rx) = watch::channel(AaveTokenLiquidity::default());
 
-    // Запускаем мониторинг, передавая Sender
-    tokio::spawn({
-        async move {
-            if let Err(e) = get_aave_data(provider_for_aave, aave_tx).await {
-                eprintln!("[MAIN] Error in Aave liquidity monitor: {:?}", e);
-            }
+// Запускаем мониторинг, передавая Sender
+tokio::spawn({
+    async move {
+        if let Err(e) = get_aave_data(provider_for_aave, aave_tx).await {
+            eprintln!("[MAIN] Error in Aave liquidity monitor: {:?}", e);
         }
-    });
+    }
+});
 
-    //==========================================  ПОДКЛЮЧАЕМ МОДУЛЬ ПУЛИНГА ===============================================================================================================
+info!("[MAIN] Ожидание данных ликвидности Aave...");
+aave_rx.changed().await?;
+info!("[MAIN] Данные ликвидности Aave получены");
 
+//==========================================  ПОДКЛЮЧАЕМ МОДУЛЬ ПУЛИНГА ===============================================================================================================
+/**/
     // Создаем канал для передачи новых блоков
     let (block_sender, block_receiver) = watch::channel(0);
+    // Канал для событий воркеров
     let (event_tx, event_rx) = mpsc::channel::<PoolEventInfo>(2048);
+    // Канал для событий симулятора
+    let (arb_event_tx, arb_event_rx) = mpsc::channel::<PoolEventInfo>(2048);
+    // Клонируем event_tx для polling_event
+    let event_tx_for_polling = event_tx.clone();
 
     // Запускаем подписку на новые блоки в отдельной задаче
     spawn(async move {
@@ -254,14 +262,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let subscriber: Arc<UniswapEventSubscriber> =
         Arc::new(UniswapEventSubscriber::new(provider_http.clone()));
-
     let subscriber_clone = Arc::clone(&subscriber);
 
     let block_receiver_clone_to_subscriber = block_receiver.clone();
-    // Запускаем polling_event как вечную фоновую задачу
+    // Запускаем polling_event
     spawn(async move {
         if let Err(e) = subscriber_clone
-            .polling_event(&block_receiver_clone_to_subscriber, event_tx, pulling_graph)
+            .polling_event(&block_receiver_clone_to_subscriber, event_tx_for_polling, pulling_graph, arb_event_tx,)
             .await
         {
             error!(
@@ -288,14 +295,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 NUM_WORKERS,
             )
             .await;
-    });
+    }); 
+
     //==============================================  ЗАПУСТИЛИ СКАНИРОВАНИЕ  =====================================================================================================
 
     info!("⏳[MAIN]  Синхронизация пулов начата...");
 
-   
-
     info!("🔄 [MAIN_ЦИКЛ ] Начало синхронизации пулов");
+   
 
     // Синхронизация пулов
     match uniswap_v3::sync_pools(
@@ -304,40 +311,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &token_cache,
         pool_cache.clone(),
         &token_whitelist_set,
-        start_block,
         subscriber.clone(),
     )
     .await
     {
-        Ok(_) => {info!("✅ [MAIN_ЦИКЛ ] Синхронизация завершена ")
-                
-            
+        Ok(_) => {
+            info!("✅ [MAIN_ЦИКЛ ] Синхронизация завершена ");
         }
         Err(_e) => {
-            error!(
-                "❌ [ MAIN_ЦИКЛ ] Ошибка синхронизации");
+            error!("❌ [ MAIN_ЦИКЛ ] Ошибка синхронизации");
         }
     }
 
     info!("[MAIN] Бот завершил сканирование пулов");
 
-    //==========================================  ОБНОВИМ КЕШ  ============================================================================================================================
+    //==========================================  ОБНОВИМ КЕШ АДРЕСОВ ПУЛОВ ============================================================================================================================
 
     {
-        let block_receiver_clone_to_cache = block_receiver.clone();
+    // Клонируем приемник блоков для использования в кеше
+    let block_receiver_clone_to_cache = block_receiver.clone();
 
-        let last_block = *block_receiver_clone_to_cache.borrow(); // Берём последний известный номер блока из канала
+    // Получаем текущий номер последнего блока
+    let last_block = *block_receiver_clone_to_cache.borrow(); 
 
-        let mut cache = pool_cache.lock().await;
-        cache.last_verified_block = last_block; // Обновляем номер блока в кеше
+    // Блокируем мьютекс кеша пулов для безопасного обновления
+    let mut cache = pool_cache.lock().await;
+    cache.last_verified_block = last_block; // Обновляем номер блока в кеше
 
-        if let Err(e) = cache.save_to_bin("uniswap_pool_addresses_cache.bin") {
-            error!(
-                "[ MAIN_ЦИКЛ ] Ошибка сохранения кэша: {:?}",e );
-        }
-        if let Err(e) = cache.save_to_json("debug_uniswap_cache.json") {
-            error!("[ MAIN_ЦИКЛ ] Ошибка сохранения JSON: {:?}", e);
-        }
+    // Получаем все адреса пулов из графа в виде HashSet
+    let pool_addresses_from_graph: std::collections::HashSet<Address> = graph_for_sync.get_pool_addresses();
+        
+    // Создаем новый экземпляр кеша с обновленными данными
+    let updated_cache = UniswapPoolCache {
+        pool_addresses: pool_addresses_from_graph,
+        last_verified_block: last_block,
+    };
+
+    // Сохраняем обновленный кеш в бинарный файл с новым именем
+    if let Err(e) = updated_cache.save_to_bin("uniswap_pool_addresses_cache_update.bin") {
+        error!("[ MAIN_ЦИКЛ ] Ошибка сохранения обновленного кэша в uniswap_pool_addresses_cache_update.bin: {:?}", e);
+    } else {
+        info!("[ MAIN_ЦИКЛ ] Обновленный кэш успешно сохранен в uniswap_pool_addresses_cache_update.bin");
+    }
+
+    // Сохраняем текущий кеш в основной бинарный файл
+    if let Err(e) = cache.save_to_bin("uniswap_pool_addresses_cache.bin") {
+        error!(
+            "[ MAIN_ЦИКЛ ] Ошибка сохранения кэша: {:?}",e );
+    }
+
+    // Сохраняем кеш в JSON формате для отладки
+    if let Err(e) = cache.save_to_json("debug_uniswap_cache.json") {
+        error!("[ MAIN_ЦИКЛ ] Ошибка сохранения JSON: {:?}", e);
+    }
     }
 
     //==============================  ВКЛЮЧАЕМ СВЕТ - НАХОДИМ ПУТЬ =======================================================================================================================
@@ -347,7 +373,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let path_build_start = std::time::Instant::now();
     let mut path_builder = PathBuilder::new(aave_rx.clone());
-    path_builder.build_all_paths(&graph_for_paths);
+    path_builder.build_all_paths(graph_for_paths);
+    let path_builder = Arc::new(path_builder);
+    let path_builder_clone = Arc::clone(&path_builder);
     let path_build_duration = path_build_start.elapsed();
 
     info!(
@@ -356,19 +384,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         path_builder.paths.len()
     );
 
-    Ok(())      
-        
-        /*
-    loop {
-        sleep(Duration::from_secs(6000)).await;
-    }
-    */
+    //==========================================  АРБИТРАЖИРУЕМ САБАТАЖ  ===============================================================================================================
 
+    // Запускаем симулятор после построения путей
+    let mut arb_simulator = ArbitrageSimulator::new(
+        path_builder_clone,
+        aave_rx.clone(),
+        graph.clone(),
+        arb_event_rx,
+    );
+    tokio::spawn(async move {
+        info!("[ARB_SIMULATOR] Симулятор арбитража запущен после построения путей");
+        arb_simulator.run().await;
+    });
+
+    Ok(())
 }
 
 pub fn get_env_var(var_name: &str) -> String {
     env::var(var_name)
         .unwrap_or_else(|_| panic!("[MAIN]Environment variable {} not found", var_name))
 }
-
-//========================================= ЗАВЕРШЕНИЯ =============================================================================================================================================
