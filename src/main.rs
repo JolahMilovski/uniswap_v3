@@ -9,7 +9,8 @@ pub mod uniswap_graph;
 pub mod uniswap_v3;
 pub mod arb_scanner;
 pub mod token_white_list;
-pub mod arb_simulator; // Добавляем новый модуль
+pub mod arb_simulator; 
+pub mod tick_fetcher;
 
 use aave_v3_flash_monitor::AaveTokenLiquidity;
 use aave_v3_flash_monitor::get_aave_data;
@@ -35,6 +36,7 @@ use std::env;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::Mutex;
 use tokio::sync::watch;
@@ -50,82 +52,94 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //==========================================  подключаем .ENV  и ЛОГ ==========================================================================================================
     dotenv().ok();
 
-    //let start_block = get_env_var("START_BLOCK").parse::<u64>()?;
+   // let start_block = get_env_var("START_BLOCK").parse::<u64>()?;
 
-    // Инициализация логгера с кастомным форматом и записью в файл
-    let log_file = Arc::new(Mutex::new(
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("log.md")?,
+   //============================================== ПОДКЛЮЧАЕМ ЛОГГЕР =========================================================================================================
+   
+   // Инициализация логгера с кастомным форматом и записью в файл
+   let log_file = Arc::new(Mutex::new(
+       OpenOptions::new()
+       .create(true)
+       .append(true)
+       .open("log.md")?,
     ));
-
+    
     // Клонируем Arc для использования в замыкании
     let log_file_for_format = Arc::clone(&log_file);
-
+    
     Builder::from_env(Env::default().default_filter_or("info"))
-        .format(move |buf, record: &Record| {
-            // Определяем цвета и стили
-            let level_color = match record.level() {
-                log::Level::Error => "\x1b[31;1m", // Красный жирный
-                log::Level::Warn => "\x1b[95;1m",  // Пурпурный жирный
-                log::Level::Info => "\x1b[36;1m",  // Зеленый жирный
-                log::Level::Debug => "\x1b[36;1m", // Голубой жирный
-                log::Level::Trace => "\x1b[35;1m", // Пурпурный жирный
-            };
+    .format(move |buf, record: &Record| {
+        // Определяем цвета и стили
+        let level_color = match record.level() {
+            log::Level::Error => "\x1b[31;1m", // Красный жирный
+            log::Level::Warn => "\x1b[95;1m",  // Пурпурный жирный
+            log::Level::Info => "\x1b[36;1m",  // Зеленый жирный
+            log::Level::Debug => "\x1b[36;1m", // Голубой жирный
+            log::Level::Trace => "\x1b[35;1m", // Пурпурный жирный
+        };
+        
+        // Эмодзи для уровней
+        let level_emoji = match record.level() {
+            log::Level::Error => "",   // Огонь для ошибок
+            log::Level::Warn => "⚠️",  // Предупреждение
+            log::Level::Info => "🔥",  // Информация
+            log::Level::Debug => "🐶", // Жук для дебага
+            log::Level::Trace => "🔬", // Лупа для ответа
+        };
+        
+        // Цвет модуля
+        let module_color = "\x1b[31;1m"; // Серый жирный
+        
+        // Форматируем сообщение для консоли
+        let message = format!(
+            "{} {} {} {}[{}]{} {}{}{}",
+            level_color,
+            level_emoji,
+            chrono::Local::now().format("%H:%M:%S%.3f"),
+            level_color,
+            record.level(),
+            module_color,
+            record.module_path().unwrap_or("unknown"),
+            level_color,
+            record.args()
+        );
+        
+        // Записываем в консоль
+        writeln!(buf, "{}", message)?;
+        
+        // Асинхронная запись в файл
+        let log_file = Arc::clone(&log_file_for_format);
+        tokio::spawn(async move {
+            let mut file = log_file.lock().await;
+            if let Err(e) = file.write_all((message + "\n").as_bytes()) {
+                eprintln!("Ошибка записи в log.md: {:?}", e);
+            }
+            if let Err(e) = file.flush() {
+                eprintln!("Ошибка сброса буфера в log.md: {:?}", e);
+            }
+        });
+        
+        Ok(())
+    })
+    .filter_module("tokio", log::LevelFilter::Warn) // Уменьшаем шум от tokio
+    .filter_module("hyper", log::LevelFilter::Warn) // Уменьшаем шум от hyper
+    .init();
 
-            // Эмодзи для уровней
-            let level_emoji = match record.level() {
-                log::Level::Error => "",   // Огонь для ошибок
-                log::Level::Warn => "⚠️",  // Предупреждение
-                log::Level::Info => "🔥",  // Информация
-                log::Level::Debug => "🐶", // Жук для дебага
-                log::Level::Trace => "🔬", // Лупа для ответа
-            };
+//============================================== ПОДКЛЮЧАЕМ СЕРДЦА =========================================================================================================
+   
+    let _heartbeat = tokio::spawn(async move {
+        loop {
+            info!("Heartbeat 💀 💀 💀 💀 💀 💀 💀 💀 💀 💀 💀 💀 💀 💀 💀 💀 💀 💀 💀 💀 💀 💀- still running");
+            tokio::time::sleep(Duration::from_secs(200)).await;
+        }
+    });
 
-            // Цвет модуля
-            let module_color = "\x1b[31;1m"; // Серый жирный
+    
+//==========================================  ПОДКЛЮЧАЕМ ПРОВАЙДЕРОВ  ================================================================================================================
 
-            // Форматируем сообщение для консоли
-            let message = format!(
-                "{} {} {} {}[{}]{} {}{}{}",
-                level_color,
-                level_emoji,
-                chrono::Local::now().format("%H:%M:%S%.3f"),
-                level_color,
-                record.level(),
-                module_color,
-                record.module_path().unwrap_or("unknown"),
-                level_color,
-                record.args()
-            );
-
-            // Записываем в консоль
-            writeln!(buf, "{}", message)?;
-
-            // Асинхронная запись в файл
-            let log_file = Arc::clone(&log_file_for_format);
-            tokio::spawn(async move {
-                let mut file = log_file.lock().await;
-                if let Err(e) = file.write_all((message + "\n").as_bytes()) {
-                    eprintln!("Ошибка записи в log.md: {:?}", e);
-                }
-                if let Err(e) = file.flush() {
-                    eprintln!("Ошибка сброса буфера в log.md: {:?}", e);
-                }
-            });
-
-            Ok(())
-        })
-        .filter_module("tokio", log::LevelFilter::Warn) // Уменьшаем шум от tokio
-        .filter_module("hyper", log::LevelFilter::Warn) // Уменьшаем шум от hyper
-        .init();
-
-    //==========================================  ПОДКЛЮЧАЕМ ПРОВАЙДЕРОВ  ================================================================================================================
-
-    info!(" [MAIN] Подключаемся к блокчейну");
+    info!(" [ MAIN ] Подключаемся к блокчейну");
     //создали менеджера провайдеров
-    let provider_manager = ProviderManager::new(199).await; //лимит по запросам в new
+    let provider_manager = ProviderManager::new(200).await; //лимит по запросам в new
 
     // Получение WS провайдера
     let provider_ws = provider_manager.get_ws().await;
@@ -149,10 +163,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let token_cache: TokenCache = {
         let raw_map = load_token_list_from_json();
         if raw_map.is_empty() {
-            info!("[КЭШ] [MAIN] Token кэш не найден или пуст, создаём новый");
+            info!("[ MAIN ] Token кэш не найден или пуст, создаём новый");
             Arc::new(DashMap::new())
         } else {
-            info!("[КЭШ] [MAIN] Token кэш успешно загружен");
+            info!("[ MAIN ] Token кэш успешно загружен");
             Arc::new(DashMap::from_iter(raw_map.into_iter()))
         }
     };
@@ -162,24 +176,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //  ✅ Загрузка белого списка токенов
     let token_whitelist_set: Arc<DashSet<Address>> = Arc::new(token_white_list::load_token_whitelist());
     info!(
-        "[MAIN] Загружено {} токенов из белого списка",
+        "[ MAIN ] Загружено {} токенов из белого списка",
         token_whitelist_set.len()
     );
 
 //===========================================  ЗАГРУЖАЕМ КЭШ АДРЕСОВ ПУЛОВ ===============================================================================================
 
-    let pool_cache: Arc<Mutex<UniswapPoolCache>> = Arc::new(Mutex::new(
+    let pool_cache: Arc<UniswapPoolCache> = Arc::new(
+        
         match UniswapPoolCache::load_from_bin("uniswap_pool_addresses_cache.bin") {
             Ok(cache) => {
-                info!("[КЭШ][MAIN] Кэш пулов успешно загружен с диска");
+                info!("[ MAIN ] Кэш пулов успешно загружен с диска");
                 cache
             }
             Err(_) => {
-                info!("[КЭШ][MAIN] Кэш пулов не найден, создаём новый");
+                info!("[ MAIN ] Кэш пулов не найден, создаём новый");
                 UniswapPoolCache::new()
             }
         },
-    ));
+    );
 
 //====================================  ПОДКЛЮЧАЕМСЯ К ГАЗОВОЙ ТРУБЕ ===============================================================================================================================
 /*
@@ -206,16 +221,16 @@ tokio::spawn({
     let dispatcher_graph = Arc::clone(&graph);
     let pulling_graph = Arc::clone(&graph);
 
-    //=======================================  Обработки Ctrl+C =============================================================================================
+//=======================================  Обработки Ctrl+C =============================================================================================
 
     spawn(async move {
         signal::ctrl_c()
             .await
-            .expect("[MAIN] Ошибка в обработке сигнала Ctrl+C");
+            .expect("[ MAIN ] Ошибка в обработке сигнала Ctrl+C");
         if let Err(e) = graph_for_shutdown.save_graph_to_json("uniswap_graph_snapshot.json") {
-            error!("[MAIN] Ошибка при сохранении графа в JSON: {:?}", e);
+            error!("[ MAIN ] Ошибка при сохранении графа в JSON: {:?}", e);
         } else {
-            info!("[MAIN] Граф успешно сохранен в uniswap_graph_snapshot.json");
+            info!("[ MAIN ] Граф успешно сохранен в uniswap_graph_snapshot.json");
         }
         std::process::exit(0);
     });
@@ -223,23 +238,23 @@ tokio::spawn({
 //==========================================  ИНИЦИАЛИЗАЦИЯ AAVE FLASH MONITOR  ====================================================================================================
 
 // Создаём канал с пустой структурой
-let (aave_tx,mut aave_rx) = watch::channel(AaveTokenLiquidity::default());
+let (aave_tx, aave_rx) = watch::channel(AaveTokenLiquidity::default());
 
 // Запускаем мониторинг, передавая Sender
-tokio::spawn({
+spawn({
     async move {
         if let Err(e) = get_aave_data(provider_for_aave, aave_tx).await {
-            eprintln!("[MAIN] Error in Aave liquidity monitor: {:?}", e);
+            eprintln!("[ MAIN ] Error in Aave liquidity monitor: {:?}", e);
         }
     }
 });
 
-info!("[MAIN] Ожидание данных ликвидности Aave...");
-aave_rx.changed().await?;
-info!("[MAIN] Данные ликвидности Aave получены");
+
+// Не ждём здесь первого обновления, просто продолжаем работу
+info!("[ MAIN ] Мониторинг ликвидности Aave запущен в фоне");
 
 //==========================================  ПОДКЛЮЧАЕМ МОДУЛЬ ПУЛИНГА ===============================================================================================================
-/**/
+
     // Создаем канал для передачи новых блоков
     let (block_sender, block_receiver) = watch::channel(0);
     // Канал для событий воркеров
@@ -254,11 +269,11 @@ info!("[MAIN] Данные ликвидности Aave получены");
         if let Err(e) =
             UniswapEventSubscriber::subscribe_to_new_blocks(&provider_ws, block_sender).await
         {
-            error!("[MAIN] Ошибка в подписке на блоки: {:?}", e);
+            error!("[ MAIN ] Ошибка в подписке на блоки: {:?}", e);
         }
     });
 
-    info!("⏳[MAIN] Создание модуля пулинга");
+    info!("⏳[ MAIN ] Создание модуля пулинга");
 
     let subscriber: Arc<UniswapEventSubscriber> =
         Arc::new(UniswapEventSubscriber::new(provider_http.clone()));
@@ -272,18 +287,18 @@ info!("[MAIN] Данные ликвидности Aave получены");
             .await
         {
             error!(
-                "💥 [MAIN] Задача polling_event завершилась с ошибкой: {:?}",
+                "💥 [ MAIN ] Задача polling_event завершилась с ошибкой: {:?}",
                 e
             );
         } else {
-            warn!("⚠️ [MAIN] Задача polling_event завершилась. Это не штатное поведение.");
+            warn!("⚠️ [ MAIN ] Задача polling_event завершилась. Это не штатное поведение.");
         }
     });
 
-    // =============================================================🔧  Запуск ДИСПЕТЧЕРА воркеров  ===========================================================================
+// =============================================================🔧  Запуск ДИСПЕТЧЕРА воркеров  ===========================================================================
 
-    const NUM_WORKERS: usize = 6;
-
+    const NUM_WORKERS: usize = 1;
+    info!("⏳[ MAIN ] Запуск диспетчера воркеров, создали {} воркеров", NUM_WORKERS);
     let subscriber_clone_for_dispatcher = Arc::clone(&subscriber);
 
     spawn(async move {
@@ -297,14 +312,11 @@ info!("[MAIN] Данные ликвидности Aave получены");
             .await;
     }); 
 
-    //==============================================  ЗАПУСТИЛИ СКАНИРОВАНИЕ  =====================================================================================================
+//==============================================  ЗАПУСТИЛИ СКАНИРОВАНИЕ  =====================================================================================================
 
-    info!("⏳[MAIN]  Синхронизация пулов начата...");
-
-    info!("🔄 [MAIN_ЦИКЛ ] Начало синхронизации пулов");
-   
-
-    // Синхронизация пулов
+    info!("⏳[ MAIN ]  Синхронизация пулов начата...");
+    
+     // Синхронизация пулов
     match uniswap_v3::sync_pools(
         graph_for_sync.clone(),
         provider_ws_for_sync.clone(),
@@ -323,48 +335,48 @@ info!("[MAIN] Данные ликвидности Aave получены");
         }
     }
 
-    info!("[MAIN] Бот завершил сканирование пулов");
+    info!("[ MAIN ] Бот завершил сканирование пулов");
 
-    //==========================================  ОБНОВИМ КЕШ АДРЕСОВ ПУЛОВ ============================================================================================================================
+//==========================================  ОБНОВИМ КЕШ АДРЕСОВ ПУЛОВ ============================================================================================================================
 
-    {
+ {
     // Клонируем приемник блоков для использования в кеше
     let block_receiver_clone_to_cache = block_receiver.clone();
 
     // Получаем текущий номер последнего блока
-    let last_block = *block_receiver_clone_to_cache.borrow(); 
+    let last_block = *block_receiver_clone_to_cache.borrow();
 
-    // Блокируем мьютекс кеша пулов для безопасного обновления
-    let mut cache = pool_cache.lock().await;
-    cache.last_verified_block = last_block; // Обновляем номер блока в кеше
+    // Получаем все адреса пулов из графа в виде Vec с дедупликацией
+    let pool_addresses_from_graph: Vec<Address> = {
+        let mut addresses: Vec<Address> = graph_for_sync.get_pool_addresses().into_iter().collect();
+        addresses.sort_unstable();
+        addresses.dedup();
+        addresses
+    };
 
-    // Получаем все адреса пулов из графа в виде HashSet
-    let pool_addresses_from_graph: std::collections::HashSet<Address> = graph_for_sync.get_pool_addresses();
-        
-    // Создаем новый экземпляр кеша с обновленными данными
+    // Создаем новый экземпляр кэша с обновленными данными
     let updated_cache = UniswapPoolCache {
         pool_addresses: pool_addresses_from_graph,
         last_verified_block: last_block,
     };
 
-    // Сохраняем обновленный кеш в бинарный файл с новым именем
+    // Сохраняем обновленный кэш в бинарный файл с новым именем
     if let Err(e) = updated_cache.save_to_bin("uniswap_pool_addresses_cache_update.bin") {
         error!("[ MAIN_ЦИКЛ ] Ошибка сохранения обновленного кэша в uniswap_pool_addresses_cache_update.bin: {:?}", e);
     } else {
         info!("[ MAIN_ЦИКЛ ] Обновленный кэш успешно сохранен в uniswap_pool_addresses_cache_update.bin");
     }
 
-    // Сохраняем текущий кеш в основной бинарный файл
-    if let Err(e) = cache.save_to_bin("uniswap_pool_addresses_cache.bin") {
-        error!(
-            "[ MAIN_ЦИКЛ ] Ошибка сохранения кэша: {:?}",e );
+    // Сохраняем кэш в основной бинарный файл
+    if let Err(e) = updated_cache.save_to_bin("uniswap_pool_addresses_cache.bin") {
+        error!("[ MAIN_ЦИКЛ ] Ошибка сохранения кэша: {:?}", e);
     }
 
-    // Сохраняем кеш в JSON формате для отладки
-    if let Err(e) = cache.save_to_json("debug_uniswap_cache.json") {
+    // Сохраняем кэш в JSON формате для отладки
+    if let Err(e) = updated_cache.save_to_json("debug_uniswap_cache.json") {
         error!("[ MAIN_ЦИКЛ ] Ошибка сохранения JSON: {:?}", e);
     }
-    }
+}
 
     //==============================  ВКЛЮЧАЕМ СВЕТ - НАХОДИМ ПУТЬ =======================================================================================================================
 
@@ -403,5 +415,5 @@ info!("[MAIN] Данные ликвидности Aave получены");
 
 pub fn get_env_var(var_name: &str) -> String {
     env::var(var_name)
-        .unwrap_or_else(|_| panic!("[MAIN]Environment variable {} not found", var_name))
+        .unwrap_or_else(|_| panic!("[ MAIN ]Environment variable {} not found", var_name))
 }

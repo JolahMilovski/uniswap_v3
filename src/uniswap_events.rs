@@ -16,7 +16,7 @@ use ethers::{
 };
 use futures::{future::join_all, StreamExt};
 use im::OrdMap;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use tokio::{
     sync::{
         mpsc::{self, UnboundedReceiver, UnboundedSender},
@@ -206,49 +206,80 @@ pub struct PoolEventInfo {
 }
 
 impl UniswapEventSubscriber {
-    pub fn new(provider: Arc<Provider<Http>>) -> Self {
-        Self {
+
+       pub fn new(provider: Arc<Provider<Http>>) -> Self {
+        debug!("[ UNISWAP_EVENTS_DEBUG_NEW_1 ] Создание нового экземпляра UniswapEventSubscriber");
+        let subscriber = Self {
             provider,
             subscribed_pools: DashSet::new(),
             last_processed_block: Arc::new(AtomicU64::new(0)),
-        }
+        };
+        debug!("[ UNISWAP_EVENTS_DEBUG_NEW_2 ] Экземпляр UniswapEventSubscriber создан");
+        subscriber
     }
 
+    /// Подписывается на получение новых блоков из блокчейна через WebSocket соединение
+    /// 
+    /// # Описание
+    /// Функция устанавливает постоянное соединение с блокчейном для получения информации о новых блоках.
+    /// При обрыве соединения автоматически выполняет переподключение после заданной задержки.
+    /// Отслеживает и отправляет номера новых блоков через канал watch::Sender.
+    /// 
+    /// # Аргументы
+    /// * `provider_ws` - WebSocket провайдер для подключения к блокчейну
+    /// * `block_sender` - Канал для отправки номеров новых блоков
+    /// 
+    /// # Возвращаемое значение
+    /// * `anyhow::Result<()>` - Результат выполнения операции
+    /// 
+    /// # Детали реализации
+    /// * Использует бесконечный цикл для поддержания постоянного соединения
+    /// * Отслеживает последний отправленный блок для избежания дубликатов
+    /// * Логирует каждый 100-й блок для мониторинга
+    /// * При ошибках переподключается через 1 секунду
     pub async fn subscribe_to_new_blocks(
         provider_ws: &Arc<Provider<Ws>>,
         block_sender: watch::Sender<u64>,
     ) -> anyhow::Result<()> {
-        info!("[BLOCKS] Запускаем подписку на новые блоки...");
+        debug!("[ UNISWAP_EVENTS_DEBUG ] Начало subscribe_to_new_blocks");
+        info!("[ UNISWAP_EVENTS_BLOCKS ] Запускаем подписку на новые блоки...");
         const RECONNECT_DELAY: Duration = Duration::from_secs(1);
         let mut last_sent_block: u64 = 0;
         loop {
             match provider_ws.subscribe_blocks().await {
                 Ok(mut stream) => {
-                    
+                    debug!("[ UNISWAP_EVENTS_BLOCKS_DEBUG ] Успешная подписка на поток блоков");
                     while let Some(block) = stream.next().await {
+                        debug!("[ UNISWAP_EVENTS_BLOCKS_DEBUG ] Получен новый блок: {:?}", block.number);
                         if let Some(number) = block.number {
                             let n = number.as_u64();
                             if n != last_sent_block {
+                                debug!("[ UNISWAP_EVENTS_BLOCKS_DEBUG ] Отправка блока {} в канал", n);
                                 last_sent_block = n;
                                 let _ = block_sender.send(n);
                             }
-                            if n % 100 == 0 {
-                                info!("[BLOCKS] Новый блок: {}", n);
+                            if n % 10 == 0 {
+                                info!("[ UNISWAP_EVENTS_BLOCKS ] Новый блок: {}", n);
+                                debug!("[ UNISWAP_EVENTS_BLOCKS_DEBUG ] Логирование блока: {}", n);
                             }
                         }
                     }
-                    info!("[BLOCKS] Поток блоков завершился. Переподключение...");
+                    info!("[ UNISWAP_EVENTS_BLOCKS ] Поток блоков завершился. Переподключение...");
                 }
                 Err(e) => {
-                    info!("[BLOCKS] Ошибка подписки: {e}. Переподключение...");
+                    error!("[ UNISWAP_EVENTS_BLOCKS_ERROR ] Ошибка подписки: {e}. Переподключение...");
                 }
             }
-            tokio::time::sleep(RECONNECT_DELAY).await;
+            debug!("[ UNISWAP_EVENTS_BLOCKS_DEBUG ] Ожидание {} секунд перед переподключением", RECONNECT_DELAY.as_secs());
+            sleep(RECONNECT_DELAY);
         }
     }
 
+
+
     fn get_event_topics() -> Vec<H256> {
-        vec![
+        debug!("[ UNISWAP_EVENTS_GET_TOPIC_DEBUG ] Получение топиков событий");
+        let topics = vec![
             H256::from_slice(&keccak256(
                 b"Swap(address,address,int256,int256,uint160,uint128,int24)",
             )),
@@ -261,61 +292,90 @@ impl UniswapEventSubscriber {
             H256::from_slice(&keccak256(
                 b"Flash(address,address,uint256,uint256,uint256,uint256)",
             )),
-        ]
+        ];
+        debug!("[ UNISWAP_EVENTS_GET_TOPIC_DEBUG ] Возвращено {} топиков", topics.len());
+        topics
     }
 
+    /// Получает события из блокчейна для подписанных пулов Uniswap V3
+    /// 
+    /// # Аргументы
+    /// * `from_block` - Начальный блок для получения событий
+    /// * `to_block` - Конечный блок для получения событий
+    /// 
+    /// # Возвращает
+    /// * `Result<Vec<PoolEventInfo>>` - Вектор с информацией о событиях для каждого пула
     pub async fn fetch_events(
         &self,
         from_block: u64,
         to_block: u64,
     ) -> anyhow::Result<Vec<PoolEventInfo>> {
+        debug!("[ UNISWAP_FETCH_EVENTS_DEBUG ] Начало fetch_events, from_block: {}, to_block: {}", from_block, to_block);
+        
+        // Проверка корректности диапазона блоков
         if from_block > to_block {
             warn!(
-                " [UNISWAP_EVENT] Ошибка: from_block ({}) больше to_block ({})",
+                "[ UNISWAP_FETCH_EVENT_WARN! ] Ошибка: from_block ({}) больше to_block ({})",
                 from_block, to_block
             );
+            return Ok(vec![]);
         }
 
+        // Получаем список адресов подписанных пулов
         let subscribed_pool_addresses: Vec<Address> = self
             .subscribed_pools
             .iter()
             .map(|entry| *entry.key())
             .collect();
+        debug!("[ UNISWAP_FETCH_EVENTS_DEBUG ] Подписано пулов: {}", subscribed_pool_addresses.len());
 
+        // Проверяем наличие подписанных пулов
         if subscribed_pool_addresses.is_empty() {
-            info!("[UNISWAP_EVENT] Нет подписанных пулов");
+            info!("[ UNISWAP_FETCH_EVENT ] Нет подписанных пулов");
             return Ok(vec![]);
         }
 
+        // Создаем фильтр для получения логов
+        debug!("[ UNISWAP_FETCH_EVENTS_DEBUG ] Создание фильтра для логов");
         let filter = Filter::new()
             .from_block(BlockNumber::Number(from_block.into()))
             .to_block(BlockNumber::Number(to_block.into()))
             .address(subscribed_pool_addresses)
             .topic0(Self::get_event_topics());
 
+        // Получаем логи из блокчейна
+        debug!("[ UNISWAP_FETCH_EVENTS_DEBUG ] Запрос логов через провайдер");
         let logs = match self.provider.get_logs(&filter).await {
-            Ok(logs) => logs,
+            Ok(logs) => {
+                debug!("[ UNISWAP_FETCH_EVENTS_DEBUG ] Получено {} логов", logs.len());
+                logs
+            }
             Err(e) => {
-                warn!("[UNISWAP_EVENT] Ошибка RPC: {}", e);
+                warn!("[ UNISWAP_EVENT_WARN! ] Ошибка RPC: {}", e);
                 Vec::new()
             }
         };
 
+        // Инициализируем структуры для хранения событий и счетчиков
         let mut event_map = HashMap::new();
         let mut swap_count = 0;
         let mut mint_count = 0;
         let mut burn_count = 0;
         let mut flash_count = 0;
 
+        // Обрабатываем каждый полученный лог
+        debug!("[ UNISWAP_FETCH_EVENTS_DEBUG ] Обработка полученных логов");
         for log in logs {
             let address = log.address;
             let block_number = log.block_number.map_or("неизвестен".to_string(), |n| {
                 n.as_u64().to_string()
             });
+            debug!("[ UNISWAP_FETCH_EVENTS_DEBUG ][{:?}] Обработка лога, блок: {}", address, block_number);
 
+            // Получаем или создаем запись для пула
             let entry = event_map.entry(address).or_insert_with(|| {
                 let block_number_u64 = log.block_number.map(|n| n.as_u64()).unwrap_or(0);
-
+                debug!("[ UNISWAP_FETCH_EVENTS_DEBUG ][{:?}] Создание нового PoolEventInfo, block_number: {}", address, block_number_u64);
                 PoolEventInfo {
                     address,
                     tick_updates: DashSet::new(),
@@ -324,17 +384,18 @@ impl UniswapEventSubscriber {
                 }
             });
 
-            // Сравнение темы события как H256
+            // Определяем тип события и обрабатываем его
             match log.topics.first() {
+                // Обработка события Swap
                 Some(topic) if *topic == SwapEvent::signature() => {
+                    debug!("[ UNISWAP_FETCH_EVENTS_DEBUG ][{:?}] Декодирование события Swap", address);
                     let raw_log = RawLog {
                         topics: log.topics.clone(),
                         data: log.data.to_vec(),
                     };
                     match <SwapEvent as EthLogDecode>::decode_log(&raw_log) {
                         Ok(swap) => {
-                            info!(
-                                "[UNISWAP_EVENT] Swap: пул {:?}, блок {}, amount0: {}, amount1: {}, sqrtPriceX96: {}, ликвидность: {}, тик: {}",
+                            info!("[ UNISWAP_FETCH_EVENT ] Swap: пул {:?}, блок {}, amount0: {}, amount1: {}, sqrtPriceX96: {}, ликвидность: {}, тик: {}",
                                 address,
                                 block_number,
                                 swap.amount0,
@@ -343,23 +404,25 @@ impl UniswapEventSubscriber {
                                 swap.liquidity,
                                 swap.tick
                             );
+                            debug!("[ UNISWAP_FETCH_EVENTS_DEBUG ][{:?}] Swap обработан, current_tick: {}", address, swap.tick);
                             entry.current_tick = swap.tick;
                             swap_count += 1;
                         }
                         Err(e) => {
-                            warn!("[UNISWAP_EVENT] Ошибка декодирования Swap: {:?}", e);
+                            warn!("[ UNISWA_FETCH_EVENT_WARN! ] [{:?}] Ошибка декодирования Swap: {:?}", address, e);
                         }
                     }
                 }
+                // Обработка события Mint
                 Some(topic) if *topic == MintEvent::signature() => {
+                    debug!("[ UNISWAP_FETCH_EVENTS_DEBUG ][{:?}] Декодирование события Mint", address);
                     let raw_log = RawLog {
                         topics: log.topics.clone(),
                         data: log.data.to_vec(),
                     };
                     match <MintEvent as EthLogDecode>::decode_log(&raw_log) {
                         Ok(mint) => {
-                            info!(
-                                "[UNISWAP_EVENT] Mint: пул {:?}, блок {}, tick_lower: {}, tick_upper: {}, ликвидность: {}, amount0: {}, amount1: {}",
+                            info!("[ UNISWAP_FETCH_EVENT ] Mint: пул {:?}, блок {}, tick_lower: {}, tick_upper: {}, ликвидность: {}, amount0: {}, amount1: {}",
                                 address,
                                 block_number,
                                 mint.tick_lower,
@@ -368,25 +431,27 @@ impl UniswapEventSubscriber {
                                 mint.amount0,
                                 mint.amount1
                             );
+                            debug!("[ UNISWAP_FETCH_EVENTS_DEBUG ][{:?}] Mint обработан, tick_lower: {}, tick_upper: {}", address, mint.tick_lower, mint.tick_upper);
                             entry
                                 .tick_updates
                                 .extend([mint.tick_lower, mint.tick_upper]);
                             mint_count += 1;
                         }
                         Err(e) => {
-                            warn!("[UNISWAP_EVENT] Ошибка декодирования Mint: {:?}", e);
+                            warn!("[ UNISWAP_FETCH_EVENTS_WARN!][{:?}] Ошибка декодирования Mint: {:?}", address, e);
                         }
                     }
                 }
+                // Обработка события Burn
                 Some(topic) if *topic == BurnEvent::signature() => {
+                    debug!("[ UNISWAP_FETCH_EVENTS_DEBUG ][{:?}] Декодирование события Burn", address);
                     let raw_log = RawLog {
                         topics: log.topics.clone(),
                         data: log.data.to_vec(),
                     };
                     match <BurnEvent as EthLogDecode>::decode_log(&raw_log) {
                         Ok(burn) => {
-                            info!(
-                                "[UNISWAP_EVENT] Burn: пул {:?}, блок {}, tick_lower: {}, tick_upper: {}, ликвидность: {}, amount0: {}, amount1: {}",
+                            info!("[ UNISWAP_FETCH_EVENT ] Burn: пул {:?}, блок {}, tick_lower: {}, tick_upper: {}, ликвидность: {}, amount0: {}, amount1: {}",
                                 address,
                                 block_number,
                                 burn.tick_lower,
@@ -395,25 +460,27 @@ impl UniswapEventSubscriber {
                                 burn.amount0,
                                 burn.amount1
                             );
+                            debug!("[ UNISWAP_FETCH_EVENTS_DEBUG ][{:?}] Burn обработан, tick_lower: {}, tick_upper: {}", address, burn.tick_lower, burn.tick_upper);
                             entry
                                 .tick_updates
                                 .extend([burn.tick_lower, burn.tick_upper]);
                             burn_count += 1;
                         }
                         Err(e) => {
-                            warn!("[UNISWAP_EVENT] Ошибка декодирования Burn: {:?}", e);
+                            warn!("[ UNISWAP_FETCH_EVENTS_WARN! ][{:?}] Ошибка декодирования Burn: {:?}", address, e);
                         }
                     }
                 }
+                // Обработка события Flash
                 Some(topic) if *topic == FlashEvent::signature() => {
+                    debug!("[ UNISWAP_FETCH_EVENTS_DEBUG ][{:?}] Декодирование события Flash", address);
                     let raw_log = RawLog {
                         topics: log.topics.clone(),
                         data: log.data.to_vec(),
                     };
                     match <FlashEvent as EthLogDecode>::decode_log(&raw_log) {
                         Ok(flash) => {
-                            info!(
-                                "[UNISWAP_EVENT] Flash: пул {:?}, блок {}, заимствовано {} token0, {} token1, уплачено {} token0, {} token1",
+                            info!("[ UNISWAP_FETCH_EVENT ] Flash: пул {:?}, блок {}, заимствовано {} token0, {} token1, уплачено {} token0, {} token1",
                                 address,
                                 block_number,
                                 flash.amount0,
@@ -421,25 +488,31 @@ impl UniswapEventSubscriber {
                                 flash.paid0,
                                 flash.paid1
                             );
+                            debug!("[ UNISWAP_FETCH_EVENTS_DEBUG ][{:?}] Flash обработан, amount0: {}, amount1: {}", address, flash.amount0, flash.amount1);
                             flash_count += 1;
                         }
                         Err(e) => {
-                            warn!("[UNISWAP_EVENT] Ошибка декодирования Flash: {:?}", e);
+                            warn!("[ UNISWAP_FETCH_EVENTS_DEBUG ][{:?}] Ошибка декодирования Flash: {:?}", address, e);
                         }
                     }
                 }
-                _ => {}
+                _ => {
+                    debug!("[ UNISWAP_EVENTS_DEBUG ][{:?}] Неизвестный топик события", address);
+                }
             }
         }
 
+        // Обновляем номер последнего обработанного блока
         self.last_processed_block.store(to_block, Ordering::Release);
+        debug!("[ UNISWAP_FETCH_EVENTS_DEBUG ] Обновлен last_processed_block: {}", to_block);
+
+        // Логируем итоговую статистику, если были обработаны какие-либо события
         if swap_count > 0 || mint_count > 0 || burn_count > 0 || flash_count > 0 {
             let pool_addresses: Vec<String> =
                 event_map.keys().map(|addr| format!("{:?}", addr)).collect();
             let pools_str = format!("{} пулов", pool_addresses.len());
-            info!(
-                "[{}][Блоки {}-{}] Обработано {} событий (Swap: {}, Mint: {}, Burn: {}, Flash: {}) для {}",
-                "UNISWAP_EVENT".bright_blue(),
+            info!("[{}][Блоки {}-{}] Обработано {} событий (Swap: {}, Mint: {}, Burn: {}, Flash: {}) для {}",
+                " UNISWAP_FETCH_EVENT ".bright_blue(),
                 from_block,
                 to_block,
                 swap_count + mint_count + burn_count + flash_count,
@@ -449,9 +522,17 @@ impl UniswapEventSubscriber {
                 flash_count,
                 pools_str
             );
+            debug!(" UNISWAP_FETCH_EVENTS_DEBUG ] Итог обработки: Swap: {}, Mint: {}, Burn: {}, Flash: {}", swap_count, mint_count, burn_count, flash_count);
         }
+
+        // Возвращаем результат
+        debug!("[ UNISWAP_FETCH_EVENTS_DEBUG ] Конец fetch_events, возвращено {} событий", event_map.len());
         Ok(event_map.into_values().collect())
     }
+
+
+
+
 
     /// Получает данные о тиках пула Uniswap V3
 pub async fn fetch_tick_data(
@@ -468,8 +549,7 @@ pub async fn fetch_tick_data(
     let (liquidity, slot0, tick_spacing, _, _) =
         process_pool_data(pool_address, pool_contract.clone().into())
             .await
-            .context(format!(
-                "[UNISWAP_EVENT] Не удалось получить данные пула для: {:?}",
+            .context(format!("[ UNISWAP_EVENT_FETCH_TICK ] Не удалось по данные пула для: {:?}",
                 pool_address
             ))?;
 
@@ -500,8 +580,7 @@ pub async fn fetch_tick_data(
                 let tick_data = contract.ticks(tick).call().await;
                 tick_data.map_or_else(
                     |_| {
-                        info!(
-                            "[UNISWAP_EVENT][{:?}] Ошибка при запросе тика {}: данные недоступны",
+                        info!("[ UNISWAP_EVENT_FETCH_TICK ][{:?}] Ошибка при запросе тика {}: данные недоступны",
                             pool_address, tick
                         );
                         None
@@ -511,8 +590,7 @@ pub async fn fetch_tick_data(
                         if (data.0 != 0 || data.1 != 0) && tick % tick_spacing == 0 {
                             Some((tick, data))
                         } else {
-                            info!(
-                                "[UNISWAP_EVENT][{:?}] Пропущен тик {} (нулевая ликвидность: gross: {}, net: {} или не кратен tick_spacing: {})",
+                            info!("[ UNISWAP_EVENT_FETCH_TICK ][{:?}] Пропущен тик {} (нулевая ликвидность: gross: {}, net: {} или не кратен tick_spacing: {})",
                                 pool_address, tick, data.0, data.1, tick_spacing
                             );
                             None
@@ -523,8 +601,12 @@ pub async fn fetch_tick_data(
         })
         .collect();
 
+
+     debug!("[ UNISWAP_EVENT_FETCH_TICK_DEBUG ][{:?}] Ожидание завершения запросов тиков", pool_address);
     // Выполняем все запросы параллельно
     let tick_results = join_all(tick_futures).await;
+        debug!("[ UNISWAP_EVENT_FETCH_TICK_DEBUG ][{:?}] Получено {} результатов тиков", pool_address, tick_results.len());
+
 
     // Создаем упорядоченную карту для хранения данных тиков
     let mut tick_map: OrdMap<i32, (i128, U512)> = OrdMap::new();
@@ -532,12 +614,16 @@ pub async fn fetch_tick_data(
     // Заполняем карту данными полученных тиков
     for result in tick_results {
         if let Some((tick, data)) = result {
+             debug!("[ UNISWAP_EVENTS_FETCH_TICK_DEBUG ][{:?}] Добавление тика {} в tick_map", pool_address, tick);
             tick_map.insert(tick, (data.1, U512::from(data.0)));
         }
     }
 
+    debug!("[ UNISWAP_EVENTS_FETCH_TICK_DEBUG ][{:?}] tick_map заполнен: {} тиков", pool_address, tick_map.len());
+
     // Преобразуем sqrt_price в U512
     let sqrt_price = U512::from(slot0.0);
+debug!("[ UNISWAP_EVENTS_FETCH_TICK_DEBUG ][{:?}] sqrt_price: {}", pool_address, sqrt_price);
 
     // Вычисляем текущую цену на основе sqrt_price и десятичных знаков токенов
     let current_price = calculate_current_price(
@@ -546,15 +632,15 @@ pub async fn fetch_tick_data(
         pool_info.uniswap_token_b_decimals,
     )
     .map_err(anyhow::Error::msg)?;
-
-    // Возвращаем структуру с обновленными данными пула
-    Ok(EventPoolUpdate {
-        liquidity,
-        sqrt_price_x96: slot0.0,
-        current_tick,
-        tick_map,
-        current_price,
-    })
+debug!("[ UNISWAP_EVENTS_FETCH_TICK_DEBUG][{:?}] sqrt_price: {}", pool_address, sqrt_price);
+// Возвращаем структуру с обновленными данными пула
+Ok(EventPoolUpdate {
+    liquidity,
+    sqrt_price_x96: slot0.0,
+    current_tick,
+    tick_map,
+    current_price,
+})
 }
 
 
@@ -566,6 +652,9 @@ pub async fn fetch_tick_data(
         pool_address: Address,
         provider: Arc<Provider<Ws>>,
     ) -> anyhow::Result<()> {
+
+        debug!("[ UNISWAP_EVENTS_UPDATE_GRAPH_DEBUG ][{:?}] Начало update_graph_from_event", pool_address);
+
         // Загружаем свежие данные из Uniswap V3
         let pool_update = self
             .fetch_tick_data(
@@ -576,26 +665,37 @@ pub async fn fetch_tick_data(
             )
             .await?;
 
+    debug!("[ UNISWAP_EVENTS_UPDATE_GRAPH_DEBUG ][{:?}] Данные тиков получены: liquidity: {}, current_tick: {}", pool_address, pool_update.liquidity, pool_update.current_tick);
+    debug!("[ UNISWAP_EVENTS_UPDATE_GRAPH_DEBUG ][{:?}] Попытка обновления пула в графе", pool_address);
+
         if let Some(mut pool) = graph.edges.get_mut(&pool_address) {
+    debug!("[ UNISWAP_EVENTS_UPDATE_GRAPH_DEBUG ][{:?}] Пул найден в графе, обновление данных", pool_address);
             // Обновление данных
             pool.uniswap_liquidity = pool_update.liquidity;
             pool.uniswap_sqrt_price = pool_update.sqrt_price_x96.into();
             pool.uniswap_tick_current = pool_update.current_tick;
             pool.uniswap_current_price = pool_update.current_price;
 
+    debug!("[ UNISWAP_EVENTS_UPDATE_GRAPH_DEBUG ][{:?}] Объединение tick_map", pool_address);
             // Tick map объединяется
             pool.tick_map = pool.tick_map.clone().union(pool_update.tick_map);
+
+    debug!("[ UNISWAP_EVENTS_UPDATE_GRAPH_DEBUG ][{:?}] Объединение завершено", pool_address);
         
         } else {
             // Пул не найден в графе — предупреждение
             warn!(
-                "[EVENT_UPDATE_GRAPH] Пул {:?} не найден в графе. Обновление пропущено.",
+                "[ UNISWAP_EVENTS_UPDATE_GRAPH_WARN! ] Пул {:?} не найден в графе. Обновление пропущено.",
                 pool_address
             );
         }
 
-        Ok(())
+        debug!("[ UNISWAP_EVENTS_UPDATE_GRAPH_DEBUG ][{:?}] Конец update_graph_from_event", pool_address);
+    Ok(())
+
     }
+
+
     /// Метод для отслеживания событий в пулах Uniswap
     /// 
     /// # Аргументы
@@ -604,98 +704,114 @@ pub async fn fetch_tick_data(
     /// 
     /// # Возвращаемое значение
     /// * `anyhow::Result<()>` - Результат выполнения операции
- pub async fn polling_event(
+pub async fn polling_event(
         &self,
         block_receiver: &watch::Receiver<u64>,
         event_tx: mpsc::Sender<PoolEventInfo>,
         graph: Arc<UniversalGraph>,
         arb_event_tx: mpsc::Sender<PoolEventInfo>,
     ) -> anyhow::Result<()> {
+        debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Начало polling_event");
         let mut block_from = *block_receiver.borrow();
+        debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Начальный блок: {}", block_from);
         let max_chunk_size: u64 = 200;
         let mut block_receiver = block_receiver.clone();
-        /* 
-        */
-loop {
-    if block_receiver.changed().await.is_err() {
-        warn!("[UNISWAP_EVENT_POLLING] Канал блоков закрыт");
-        break;
-    }
-    
-    let block_to = *block_receiver.borrow();
-    if block_to < block_from {
-        warn!(
-            "[UNISWAP_EVENT_POLLING] Некорректный диапазон: from {} > to {}",
-            block_from, block_to
-        );
-        continue;
-    }
-    
-    let subscribed_pools = self.subscribed_pools.clone();
-    if subscribed_pools.is_empty() {
-        block_from = block_to + 1;
-        continue;
-    }
-    
-    let mut current_from = block_from;
-    let mut all_events = Vec::new();
-    
-    while current_from <= block_to {
-        let current_to = (current_from + max_chunk_size - 1).min(block_to);
-        match self.fetch_events(current_from, current_to).await {
-            Ok(events) => {
-                all_events.extend(events);
+
+        loop {
+            debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Ожидание изменения номера блока");
+            if block_receiver.changed().await.is_err() {
+                warn!("[ UNISWAP_EVENT_POLLING_WARN! ] Канал блоков закрыт");
+                debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Канал блоков закрыт");
+                break;
             }
-            Err(e) => {
+
+            let block_to = *block_receiver.borrow();
+            debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Новый блок: {}", block_to);
+            if block_to < block_from {
                 warn!(
-                    "[UNISWAP_EVENT_POLLING] Ошибка получения событий за блоки {}–{}: {}",
-                    current_from, current_to, e
+                    "[ UNISWAP_EVENT_POLLING_WARN! ] Некорректный диапазон: from {} > to {}",
+                    block_from, block_to
                 );
+                debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Некорректный диапазон блоков");
+                continue;
             }
+
+            let subscribed_pools = self.subscribed_pools.clone();
+            debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Количество подписанных пулов: {}", subscribed_pools.len());
+            if subscribed_pools.is_empty() {
+                block_from = block_to + 1;
+                debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Пустой список подписанных пулов, block_from обновлен: {}", block_from);
+                continue;
+            }
+
+            let mut current_from = block_from;
+            let mut all_events = Vec::new();
+
+            while current_from <= block_to {
+                let current_to = (current_from + max_chunk_size - 1).min(block_to);
+                debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Обработка диапазона блоков: {}–{}", current_from, current_to);
+                match self.fetch_events(current_from, current_to).await {
+                    Ok(events) => {
+                        debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Получено {} событий для блоков {}–{}", events.len(), current_from, current_to);
+                        all_events.extend(events);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "[ UNISWAP_EVENT_POLLING_WARN ] Ошибка получения событий за блоки {}–{}: {}",
+                            current_from, current_to, e
+                        );
+                        debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Ошибка получения событий: {:?}", e);
+                    }
+                }
+                current_from = current_to + 1;
+            }
+
+            let mut sent_events = 0;
+            debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Агрегация событий, всего: {}", all_events.len());
+            let aggregated_events = self.aggregate_events(all_events, graph.clone());
+            debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Агрегировано {} событий", aggregated_events.len());
+
+            for pool_event in aggregated_events {
+                let event_for_workers = pool_event.clone();
+                let event_for_simulator = pool_event;
+                debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ][{:?}] Отправка события в каналы", event_for_workers.address);
+
+                if let Err(e) = event_tx.send(event_for_workers).await {
+                    error!("[ UNISWAP_EVENT_POLLING_ERROR ] Ошибка отправки в канал воркеров: {}", e);
+                }
+                if let Err(e) = arb_event_tx.send(event_for_simulator).await {
+                    error!("[ UNISWAP_EVENT_POLLING_ERROR ] Ошибка отправки в канал симулятора: {}", e);
+                }
+                sent_events += 1;
+            }
+
+            if sent_events > 0 {
+                info!("[ UNISWAP_EVENT_POLLING ] Отправлено событий: {}", sent_events);
+                debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Отправлено {} событий", sent_events);
+            }
+
+            block_from = block_to + 1;
+            debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] block_from обновлен: {}", block_from);
+            sleep(Duration::from_secs(1));
         }
-        current_from = current_to + 1;
+        debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Конец polling_event");
+        Ok(())
     }
-    
-    let mut sent_events = 0;
-    let aggregated_events = self.aggregate_events(all_events, graph.clone());
-    for pool_event in aggregated_events {
-        let event_for_workers = pool_event.clone();
-        let event_for_simulator = pool_event;
+
+    fn aggregate_events(&self, events: Vec<PoolEventInfo>, graph: Arc<UniversalGraph>) -> Vec<PoolEventInfo> {
+        let mut map: HashMap<Address, PoolEventInfo> = HashMap::new();
         
-        if let Err(e) = event_tx.send(event_for_workers).await {
-            error!("[UNISWAP_EVENT_POLLING] Ошибка отправки в канал воркеров: {}", e);
-        }
-        if let Err(e) = arb_event_tx.send(event_for_simulator).await {
-            error!("[UNISWAP_EVENT_POLLING] Ошибка отправки в канал симулятора: {}", e);
-        }
-        sent_events += 1;
-    }
-    
-    if sent_events > 0 {
-        info!("[UNISWAP_EVENT_POLLING] Отправлено событий: {}", sent_events);
-    }
-    
-    block_from = block_to + 1;
-    sleep(Duration::from_secs(1));
-}
-Ok(())
-    }
-
-
-/// Метод для агрегации событий пула
-fn aggregate_events(&self, events: Vec<PoolEventInfo>, graph: Arc<UniversalGraph>) -> Vec<PoolEventInfo> {
-    let mut map: HashMap<Address, PoolEventInfo> = HashMap::new();
-
-    for event in events {
-        let entry = map.entry(event.address).or_insert_with(|| PoolEventInfo {
-            address: event.address,
-            tick_updates: DashSet::new(),
-            current_tick: event.current_tick,
-            block_number: event.block_number,
-        });
-
-        // Получаем tick_spacing из графа
-        let tick_spacing = graph
+        for event in events {
+            let entry = map.entry(event.address).or_insert_with(|| {
+                PoolEventInfo {
+                    address: event.address,
+                    tick_updates: DashSet::new(),
+                    current_tick: event.current_tick,
+                    block_number: event.block_number,
+                }
+            });
+            
+            let tick_spacing = graph
             .edges
             .get(&event.address)
             .map(|pool| match pool.uniswap_fee_tier {
@@ -703,31 +819,32 @@ fn aggregate_events(&self, events: Vec<PoolEventInfo>, graph: Arc<UniversalGraph
                 500 => 10,
                 3000 => 60,
                 10_000 => 200,
-                _ => 60, // Значение по умолчанию
+                _ => 60,
             })
             .unwrap_or(60);
-
-        // Обновляем, если блок новее
+        
         if event.block_number >= entry.block_number {
             entry.current_tick = event.current_tick;
             entry.block_number = event.block_number;
         }
-
-        // Объединяем только тики, кратные tick_spacing
+        
         for tick in event.tick_updates.iter() {
             if *tick % tick_spacing == 0 {
+                debug!("[ UNISWAP_EVENTS_AGGREGATE_DEBUG ][{:?}] Добавление тика {} в tick_updates", event.address, *tick);
                 entry.tick_updates.insert(*tick);
             } else {
                 info!(
-                    "[UNISWAP_EVENT][{:?}] Пропущен тик {} в агрегации (не кратен tick_spacing: {})",
+                    "[ UNISWAP_AGGREGATE_EVENT ][{:?}] Пропущен тик {} в агрегации (не кратен tick_spacing: {})",
                     event.address, *tick, tick_spacing
                 );
             }
         }
     }
-
-    map.into_values().collect()
+    
+    let result = map.into_values().collect();
+    result
 }
+
 
 
     /// 🧠 Метод запуска воркеров и диспетчера
@@ -751,6 +868,7 @@ fn aggregate_events(&self, events: Vec<PoolEventInfo>, graph: Arc<UniversalGraph
             provider: Arc<Provider<Ws>>,
             num_workers: usize,
         ) {
+            debug!("[ UNISWAP_EVENTS_DISPATCHER_DEBUG ] Начало start_dispatcher_and_workers, num_workers: {}", num_workers);
             // Вектор для хранения отправителей событий каждому воркеру
             let mut worker_senders = Vec::new();
 
@@ -768,22 +886,27 @@ fn aggregate_events(&self, events: Vec<PoolEventInfo>, graph: Arc<UniversalGraph
                 let provider = Arc::clone(&provider);
                 let subscriber = Arc::clone(&self);
 
+                debug!("[ UNISWAP_EVENTS_DISPATCHER_DEBUG ] Создание канала для воркера {}", i);
                 // Запускаем воркер в отдельной задаче
                 tokio::spawn(async move {
+                     debug!("[ UNISWAP_EVENTS_DISPATCHER_DEBUG ] Воркер {} запущен", i);
                     subscriber.worker_loop(rx, graph, provider, i).await;
                 });
             }
 
             // Основной цикл диспетчера
             let mut current_worker = 0;
+            debug!("[ UNISWAP_EVENTS_DISPATCHER_DEBUG ] Запуск основного цикла диспетчера");
             while let Some(event) = event_rx.recv().await {
                 // Отправляем событие текущему воркеру
+                debug!("[ UNISWAP_EVENTS_DISPATCHER_DEBUG ] Отправка события текущему воркеру {}", current_worker);
                 let _ = worker_senders[current_worker].send(event);
                 // Переключаемся на следующего воркера по кругу
                 current_worker = (current_worker + 1) % num_workers;
+                debug!("[ UNISWAP_EVENTS_DISPATCHER_DEBUG ] Переключение на следующего воркера {}", current_worker);
             }
 
-            warn!("[DISPATCHER_UNISWAP_EVENT] Канал событий закрыт, dispatcher завершён");
+            warn!("[ DISPATCHER_UNISWAP_EVENT_WARN! ] Канал событий закрыт, dispatcher завершён");
         }
 
         /// Основной цикл обработки событий для воркера
@@ -803,28 +926,46 @@ fn aggregate_events(&self, events: Vec<PoolEventInfo>, graph: Arc<UniversalGraph
         ///    - Логирует результат обработки (успех/ошибка)
         /// 3. При закрытии канала завершает работу
         async fn worker_loop(
-            self: Arc<Self>,
-            mut rx: UnboundedReceiver<PoolEventInfo>,
-            graph: Arc<UniversalGraph>,
-            provider: Arc<Provider<Ws>>,
-            worker_id: usize,
-        ) {
-            while let Some(event) = rx.recv().await {
-                let pool_address = event.address;
-                if let Err(e) = self
-                    .update_graph_from_event(&event, graph.clone(), pool_address, provider.clone())
-                    .await
-                {
-                    error!(
-                        "[WORKER {}] Ошибка обновления пула {:?}: {:?}",
-                        worker_id, pool_address, e
-                    );
-                } else {
-                    info!("[{} {}] Обновил пул {:?}","WORKER_UNISWAP_EVENT".black().on_green(), worker_id, pool_address);
-                }
+        self: Arc<Self>,
+        mut rx: UnboundedReceiver<PoolEventInfo>,
+        graph: Arc<UniversalGraph>,
+        provider: Arc<Provider<Ws>>,
+        worker_id: usize,
+    ) {
+        debug!("[ UNISWAP_EVENTS_DEBUG ][ WORKER {}] Начало worker_loop", worker_id);
+        while let Some(event) = rx.recv().await {
+            let pool_address = event.address;
+            debug!("[ UNISWAP_EVENTS_DEBUG ][ WORKER {}][{:?}] Получено событие", worker_id, pool_address);
+            if let Err(e) = self
+                .update_graph_from_event(&event, graph.clone(), pool_address, provider.clone())
+                .await
+            {
+                error!(
+                    "[ WORKER_ERROR {}] Ошибка обновления пула {:?}: {:?}",
+                    worker_id, pool_address, e
+                );
+                debug!("[ UNISWAP_EVENTS_DEBUG ][ WORKER {}][{:?}] Ошибка обновления: {:?}", worker_id, pool_address, e);
+            } else {
+                info!(
+                    "[ {} {} ] Обновил пул {:?}",
+                    "WORKER_UNISWAP_EVENT".black().on_green(),
+                    worker_id,
+                    pool_address
+                );
+                debug!("[ UNISWAP_EVENTS_DEBUG ][ WORKER {}][{:?}] Пул успешно обновлен", worker_id, pool_address);
             }
-
-            warn!("[WORKER {}] Завершён", worker_id);
         }
-    
+
+        warn!("[ WORKER {}] Завершён", worker_id);
+        debug!("[ UNISWAP_EVENTS_DEBUG ][ WORKER {}] Конец worker_loop", worker_id);
+    }
+
+
 }
+    
+
+
+
+
+
+

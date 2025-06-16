@@ -54,6 +54,7 @@ pub struct UniswapPool {
 
 impl UniversalGraph {
     pub fn new() -> Self {
+        debug!("UNISWAP_GRAPH: Создание нового универсального графа");
         UniversalGraph {
             nodes: DashMap::new(),
             edges: DashMap::new(),
@@ -82,6 +83,15 @@ impl UniversalGraph {
         tick_map: OrdMap<i32, (i128, U512)>,
         is_active: bool,
     ) {
+        debug!(
+            "UNISWAP_GRAPH: Добавление пула {:?} с токенами {} ({:?}) и {} ({:?})",
+            uniswap_pool_address,
+            uniswap_token_a_symbol,
+            uniswap_token_a,
+            uniswap_token_b_symbol,
+            uniswap_token_b
+        );
+
         self.nodes
             .insert(uniswap_pool_address, (uniswap_token_a, uniswap_token_b));
 
@@ -109,10 +119,21 @@ impl UniversalGraph {
                 is_active,
             },
         );
+
+        debug!("UNISWAP_GRAPH: Пул {:?} успешно добавлен", uniswap_pool_address);
     }
 
     pub fn upsert_pool(&self, new_pool: UniswapPool) {
+        debug!("UNISWAP_GRAPH: Обновление/вставка пула {:?}",
+            new_pool.uniswap_pool_address
+        );
+
         if let Some(mut existing_pool) = self.edges.get_mut(&new_pool.uniswap_pool_address) {
+            debug!(
+                "UNISWAP_GRAPH: Найден существующий пул {:?}, обновляем данные",
+                new_pool.uniswap_pool_address
+            );
+
             existing_pool.uniswap_liquidity = new_pool.uniswap_liquidity;
             existing_pool.uniswap_sqrt_price = new_pool.uniswap_sqrt_price;
             existing_pool.uniswap_current_price = new_pool.uniswap_current_price;
@@ -124,7 +145,7 @@ impl UniversalGraph {
                 .union(new_pool.tick_map.clone());
 
             debug!(
-                "UNISAWP_GRAPH_Обновлен пул: {:?}",
+                "UNISWAP_GRAPH: Обновлен пул: {:?}",
                 new_pool.uniswap_pool_address
             );
             self.nodes.insert(
@@ -132,44 +153,74 @@ impl UniversalGraph {
                 (new_pool.uniswap_token_a, new_pool.uniswap_token_b),
             );
         } else {
+            debug!(
+                "UNISWAP_GRAPH: Пул {:?} не найден, создаем новый",
+                new_pool.uniswap_pool_address
+            );
+
             let pool_address = new_pool.uniswap_pool_address;
             let token_a = new_pool.uniswap_token_a;
             let token_b = new_pool.uniswap_token_b;
 
             self.edges.insert(pool_address, new_pool);
             self.nodes.insert(pool_address, (token_a, token_b));
+
+            debug!("UNISWAP_GRAPH: Новый пул {:?} успешно создан", pool_address);
         }
     }
 
     pub fn save_graph_to_json(&self, path: &str) -> std::io::Result<()> {
+        debug!("UNISWAP_GRAPH: Начало сохранения графа в JSON файл: {}", path);
+
         let snapshot = self.snapshot();
+        debug!("UNISWAP_GRAPH: Создан снимок графа с {} узлами и {} ребрами", 
+               snapshot.nodes.len(), snapshot.edges.len());
+
         let json = serde_json::to_string_pretty(&snapshot)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(|e| {
+                debug!("UNISWAP_GRAPH: Ошибка сериализации JSON: {}", e);
+                std::io::Error::new(std::io::ErrorKind::Other, e)
+            })?;
 
         // Записываем во временный файл для атомарности
         let temp_path = format!("{}.tmp", path);
+        debug!("UNISWAP_GRAPH: Запись во временный файл: {}", temp_path);
+
         let mut temp_file = File::create(&temp_path)?;
         temp_file.write_all(json.as_bytes())?;
         temp_file.flush()?;
 
         // Атомарно заменяем оригинальный файл
+        debug!("UNISWAP_GRAPH: Атомарная замена файла {} -> {}", temp_path, path);
         rename(temp_path, path)?;
+        
+        debug!("UNISWAP_GRAPH: Граф успешно сохранен в файл: {}", path);
         Ok(())
     }
 
     /// Создает JSON-файл с текущим состоянием графа
     pub fn get_pool_addresses(&self) -> HashSet<Address> {
-        self.nodes.iter().map(|r| *r.key()).collect()
+        debug!("UNISWAP_GRAPH: Получение адресов всех пулов");
+        let addresses: HashSet<Address> = self.nodes.iter().map(|r| *r.key()).collect();
+        debug!("UNISWAP_GRAPH: Найдено {} адресов пулов", addresses.len());
+        addresses
     }
 
     pub fn update_pool_json(&self, pool_address: Address, path: &str) -> io::Result<()> {
+        debug!("UNISWAP_GRAPH: Обновление JSON для пула {:?} в файле {}", pool_address, path);
+
         // Загружаем текущий JSON, если он существует
         let mut snapshot = if Path::new(path).exists() {
+            debug!("UNISWAP_GRAPH: Файл {} существует, загружаем текущие данные", path);
             let mut file = File::open(path)?;
             let mut contents = String::new();
             file.read_to_string(&mut contents)?;
-            serde_json::from_str(&contents).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            serde_json::from_str(&contents).map_err(|e| {
+                debug!("UNISWAP_GRAPH: Ошибка десериализации существующего JSON: {}", e);
+                io::Error::new(io::ErrorKind::Other, e)
+            })?
         } else {
+            debug!("UNISWAP_GRAPH: Файл {} не существует, создаем новый снимок", path);
             UniversalGraphSnapshot {
                 nodes: HashMap::new(),
                 edges: HashMap::new(),
@@ -178,6 +229,7 @@ impl UniversalGraph {
 
         // Обновляем данные для пула
         if let Some(pool) = self.edges.get(&pool_address) {
+            debug!("UNISWAP_GRAPH: Найден пул {:?} для обновления", pool_address);
             snapshot.edges.insert(pool_address, pool.clone());
             snapshot.nodes.insert(
                 pool_address,
@@ -186,32 +238,51 @@ impl UniversalGraph {
                     .map(|v| *v.value())
                     .unwrap_or_default(),
             );
+            debug!("UNISWAP_GRAPH: Данные пула {:?} обновлены в снимке", pool_address);
+        } else {
+            debug!("UNISWAP_GRAPH: Пул {:?} не найден в графе", pool_address);
         }
 
         // Сериализуем обновлённый снимок
+        debug!("UNISWAP_GRAPH: Сериализация обновленного снимка");
         let json = serde_json::to_string_pretty(&snapshot)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(|e| {
+                debug!("UNISWAP_GRAPH: Ошибка сериализации обновленного JSON: {}", e);
+                io::Error::new(io::ErrorKind::Other, e)
+            })?;
 
         // Записываем во временный файл для атомарности
         let temp_path = format!("{}.tmp", path);
+        debug!("UNISWAP_GRAPH: Запись обновленных данных во временный файл: {}", temp_path);
+
         let mut temp_file = File::create(&temp_path)?;
         temp_file.write_all(json.as_bytes())?;
         temp_file.flush()?;
 
         // Атомарно заменяем оригинальный файл
+        debug!("UNISWAP_GRAPH: Атомарная замена обновленного файла {} -> {}", temp_path, path);
         rename(temp_path, path)?;
+        
+        debug!("UNISWAP_GRAPH: JSON для пула {:?} успешно обновлен в файле {}", pool_address, path);
         Ok(())
     }
 
     fn snapshot(&self) -> UniversalGraphSnapshot {
-        UniversalGraphSnapshot {
+        debug!("UNISWAP_GRAPH: Создание снимка текущего состояния графа");
+        let nodes_count = self.nodes.len();
+        let edges_count = self.edges.len();
+        
+        let snapshot = UniversalGraphSnapshot {
             nodes: self.nodes.iter().map(|r| (*r.key(), *r.value())).collect(),
             edges: self
                 .edges
                 .iter()
                 .map(|r| (*r.key(), r.value().clone()))
                 .collect(),
-        }
+        };
+        
+        debug!("UNISWAP_GRAPH: Снимок создан с {} узлами и {} ребрами", nodes_count, edges_count);
+        snapshot
     }
 }
 
@@ -228,7 +299,8 @@ fn serialize_i32<S>(value: &i32, serializer: S) -> Result<S::Ok, S::Error>
 where
 S: Serializer,
 {
-    serializer.serialize_i32(*value)``
+    debug!("UNISWAP_GRAPH: Сериализация i32 значения: {}", value);
+    serializer.serialize_i32(*value)
 }
 
 // Сериализатор для u32 в десятичное число
@@ -245,8 +317,8 @@ where
 S: Serializer,
 {
     serializer.serialize_u8(*value)
-}
-*/
+} */
+
 
 // Сериализатор для OrdMap
 fn serialize_tick_map<S>(
@@ -267,3 +339,6 @@ where
     }
     map.end()
 }
+
+
+
