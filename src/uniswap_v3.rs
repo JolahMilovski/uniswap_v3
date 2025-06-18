@@ -13,6 +13,7 @@ use ethers::providers::Provider;
 use ethers::types::H160;
 use ethers::types::U256;
 use ethers::types::{Address, U512};
+use ethers_contract::Multicall;
 use ethers_providers::Ws;
 use log::{info, warn, debug};
 use std::env;
@@ -557,7 +558,7 @@ pub async fn build_uniswap_v3_pool(
         get_single_token_data(token_b, provider.clone(), token_cache)
     )
     .ok()?;
-    debug!("[ UNISWAP_V3_BUILD_DEBUG ][{:?}] Данные токенов получены: token_a: {}, token_b: {}", pool_address, token_a_info.symbol, token_b_info.symbol);
+    info!("[ UNISWAP_V3_BUILD_DEBUG ][{:?}] Данные токенов получены: token_a: {}, token_b: {}", pool_address, token_a_info.symbol, token_b_info.symbol);
 
     // Получаем данные пула
     let pool_contract = UniswapV3Pool::new(pool_address, provider.clone());
@@ -578,7 +579,7 @@ pub async fn build_uniswap_v3_pool(
     let tick_map = fetch_active_ticks(pool_address, provider.clone(), slot0_result.1, fee)
         .await
         .ok()?;
-    debug!("[ UNISWAP_V3_BUILD_DEBUG ][{:?}] tick_map получен, размер: {}", pool_address, tick_map.len());
+    info!("[ UNISWAP_V3_BUILD_DEBUG ][{:?}] tick_map получен, размер: {}", pool_address, tick_map.len());
 
     // Проверяем, что тиковая карта не пуста
     if tick_map.is_empty() {
@@ -844,6 +845,7 @@ pub async fn fetch_pool_fee(
         300,
     ).await
 }
+
 /*
 
 pub async fn fetch_pool_liquidity(
@@ -911,7 +913,7 @@ pub async fn fetch_pool_fee(
     result
 }
  */
-
+/*
 pub async fn process_pool_data(
     pool_address: H160,
     pool_contract: Arc<UniswapV3Pool<Provider<Ws>>>,
@@ -1029,3 +1031,103 @@ pub async fn process_pool_data(
     Some((liquidity, slot0, tick_spacing, max_liquidity, fee))
 
 }
+ */
+
+ 
+/// Получает данные пула Uniswap V3 с использованием мультиколла
+///
+/// # Описание
+/// Выполняет одновременный запрос к контракту пула для получения ликвидности, slot0, tick_spacing,
+/// max_liquidity_per_tick и fee, минимизируя количество сетевых вызовов.
+///
+/// # Параметры
+/// * `pool_address` - Адрес пула
+/// * `pool_contract` - Контракт пула Uniswap V3
+/// * `provider` - WebSocket-провайдер
+///
+/// # Возвращаемое значение
+/// * `Option<(U512, (U256, i32, u16, u16, u16, u8, bool), i32, u128, u32)>` - Данные пула или None при ошибке
+async fn fetch_pool_data_multicall(
+    pool_address: H160,
+    pool_contract: &UniswapV3Pool<Provider<Ws>>,
+    provider: Arc<Provider<Ws>>,
+) -> Option<(
+    U512,
+    (U256, i32, u16, u16, u16, u8, bool),
+    i32,
+    u128,
+    u32,
+)> {
+    // Логируем начало мультиколла
+    debug!("[UNISWAP_V3_MULTICALL_DEBUG] Начало мультиколла для пула {:?}", pool_address);
+
+    // Инициализируем мультиколл
+    let mut multicall = Multicall::new(provider, None).await.ok()?;
+    // Добавляем вызовы функций контракта
+    multicall
+        .add_call(pool_contract.liquidity(), true) // Ликвидность пула
+        .add_call(pool_contract.slot_0(), true) // Данные slot0 (sqrtPriceX96, tick, etc.)
+        .add_call(pool_contract.tick_spacing(), true) // Интервал тиков
+        .add_call(pool_contract.max_liquidity_per_tick(), true) // Максимальная ликвидность на тик
+        .add_call(pool_contract.fee(), true); // Комиссия пула
+
+    // Выполняем мультиколл и обрабатываем результат
+    let result = multicall
+        .call::<(u128, (U256, i32, u16, u16, u16, u8, bool), i32, u128, u32)>()
+        .await
+        .map_err(|e| {
+            warn!("[UNISWAP_V3_MULTICALL] Ошибка мультиколла для пула {:?}: {:?}", pool_address, e);
+            e
+        })
+        .ok()?;
+
+    // Логируем успешное выполнение
+    debug!("[UNISWAP_V3_MULTICALL_DEBUG] Успешный мультиколл для пула {:?}", pool_address);
+    Some((
+        U512::from(result.0), // Конвертируем ликвидность в U512
+        result.1, // Данные slot0
+        result.2, // tick_spacing
+        result.3, // max_liquidity_per_tick
+        result.4, // fee
+    ))
+}
+
+/// Обрабатывает данные пула Uniswap V3
+///
+/// # Описание
+/// Вызывает мультиколл для получения всех необходимых данных пула (ликвидность, slot0, tick_spacing,
+/// max_liquidity_per_tick, fee) и возвращает их в структурированном виде.
+///
+/// # Параметры
+/// * `pool_address` - Адрес пула
+/// * `pool_contract` - Контракт пула Uniswap V3
+///
+/// # Возвращаемое значение
+/// * `Option<(U512, (U256, i32, u16, u16, u16, u8, bool), i32, u128, u32)>` - Данные пула или None при ошибке
+pub async fn process_pool_data(
+    pool_address: H160,
+    pool_contract: Arc<UniswapV3Pool<Provider<Ws>>>,
+) -> Option<(
+    U512,
+    (ethers::types::U256, i32, u16, u16, u16, u8, bool),
+    i32,
+    u128,
+    u32,
+)> {
+    // Логируем начало обработки
+    debug!("[UNISWAP_V3_PROC_DEBUG] Начало обработки данных пула {:?}", pool_address);
+
+    // Вызываем мультиколл для получения всех данных
+    let result = fetch_pool_data_multicall(pool_address, &pool_contract, pool_contract.client()).await?;
+
+    // Логируем успешное получение данных
+    debug!("[UNISWAP_V3_PROC_DEBUG][{:?}] Данные получены: ликвидность: {}, тик: {}, комиссия: {}", 
+        pool_address, result.0, result.1.1, result.4);
+
+    // Возвращаем результат
+    debug!("[UNISWAP_V3_PROC_DEBUG] Конец обработки данных пула {:?}", pool_address);
+    Some(result)
+}
+
+
+

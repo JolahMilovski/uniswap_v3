@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap, sync::{
+    collections::HashMap, env, sync::{
         atomic::{AtomicU64, Ordering}, Arc
     }, thread::sleep, time::Duration
 };
@@ -7,29 +7,27 @@ use std::{
 use anyhow::Context;
 use colored::Colorize;
 use dashmap::DashSet;
-use ethers::contract::EthEvent;
+use ethers::{contract::EthEvent, types::H160};
 use ethers::{abi::RawLog, utils::keccak256};
 use ethers::{
     contract::EthLogDecode,
     providers::{Http, Middleware, Provider, Ws},
     types::{Address, BlockNumber, Filter, H256, I256, U256, U512},
 };
-use futures::{future::join_all, StreamExt};
+use ethers_contract::abigen;
+use futures::StreamExt;
 use im::OrdMap;
 use log::{debug, error, info, warn};
-use tokio::{
-    sync::{
-        mpsc::{self, UnboundedReceiver, UnboundedSender},
-        watch,
-    },
-};
+use tokio::sync::{
+         mpsc::{
+            self}, watch
+    };
 
 use crate::{
-    uniswap_graph::UniversalGraph,
-    uniswap_v3::{UniswapV3Pool, calculate_current_price, process_pool_data},
+    uniswap_graph::UniversalGraph, uniswap_v3::{calculate_current_price, process_pool_data, UniswapV3Pool}
 };
 
-ethers_contract::abigen!(
+abigen!(
     UniswapPool,
     r#"[{
         "inputs": [],
@@ -113,6 +111,41 @@ ethers_contract::abigen!(
         "type": "event"
     }]"#
 );
+
+abigen!(
+    Multicall3,
+    r#"[{
+        "inputs": [
+            {
+                "components": [
+                    { "internalType": "address", "name": "target", "type": "address" },
+                    { "internalType": "bool", "name": "allowFailure", "type": "bool" },
+                    { "internalType": "bytes", "name": "callData", "type": "bytes" }
+                ],
+                "internalType": "struct Multicall3.Call3[]",
+                "name": "calls",
+                "type": "tuple[]"
+            }
+        ],
+        "name": "aggregate3",
+        "outputs": [
+            {
+                "components": [
+                    { "internalType": "bool", "name": "success", "type": "bool" },
+                    { "internalType": "bytes", "name": "returnData", "type": "bytes" }
+                ],
+                "internalType": "struct Multicall3.Call3Result[]",
+                "name": "",
+                "type": "tuple[]"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    }]"#
+);
+
+
+
 
 #[derive(Debug, Clone, EthEvent)]
 #[ethevent(
@@ -199,16 +232,39 @@ pub struct UniswapEventSubscriber {
 }
 #[derive(Debug, Clone)]
 pub struct PoolEventInfo {
+    pub event_id: H256,
     pub address: Address,
     pub tick_updates: DashSet<i32>,
     pub current_tick: i32,
     pub block_number: u64,
 }
 
+impl PoolEventInfo {
+    pub fn new(address: Address, tick_updates: DashSet<i32>, current_tick: i32, block_number: u64) -> Self {
+
+            debug!("[ UNISWAP_EVENTS_DEBUG_NEW_1 ] Создание нового экземпляра UniswapEventSubscriber");
+            
+        let hasher = keccak256(&[
+            address.as_bytes(),
+            &current_tick.to_le_bytes(),
+            &block_number.to_le_bytes(),
+        ].concat());
+        Self {
+            event_id: H256(hasher),
+            address,
+            tick_updates,
+            current_tick,
+            block_number,
+        }
+    }
+}
+
 impl UniswapEventSubscriber {
 
-       pub fn new(provider: Arc<Provider<Http>>) -> Self {
+    pub fn new(provider: Arc<Provider<Http>>) -> Self {
+
         debug!("[ UNISWAP_EVENTS_DEBUG_NEW_1 ] Создание нового экземпляра UniswapEventSubscriber");
+
         let subscriber = Self {
             provider,
             subscribed_pools: DashSet::new(),
@@ -277,6 +333,14 @@ impl UniswapEventSubscriber {
 
 
 
+    /// Returns a vector of event topics for Uniswap V3 pool events
+    /// 
+    /// # Returns
+    /// * `Vec<H256>` - Vector containing the following event topics:
+    ///   * Swap event - tracks token swaps in the pool
+    ///   * Mint event - tracks liquidity additions
+    ///   * Burn event - tracks liquidity removals
+    ///   * Flash event - tracks flash loan events
     fn get_event_topics() -> Vec<H256> {
         debug!("[ UNISWAP_EVENTS_GET_TOPIC_DEBUG ] Получение топиков событий");
         let topics = vec![
@@ -295,8 +359,7 @@ impl UniswapEventSubscriber {
         ];
         debug!("[ UNISWAP_EVENTS_GET_TOPIC_DEBUG ] Возвращено {} топиков", topics.len());
         topics
-    }
-
+    } 
     /// Получает события из блокчейна для подписанных пулов Uniswap V3
     /// 
     /// # Аргументы
@@ -314,8 +377,7 @@ impl UniswapEventSubscriber {
         
         // Проверка корректности диапазона блоков
         if from_block > to_block {
-            warn!(
-                "[ UNISWAP_FETCH_EVENT_WARN! ] Ошибка: from_block ({}) больше to_block ({})",
+            warn!("[ UNISWAP_FETCH_EVENT_WARN! ] Ошибка: from_block ({}) больше to_block ({})",
                 from_block, to_block
             );
             return Ok(vec![]);
@@ -335,8 +397,9 @@ impl UniswapEventSubscriber {
             return Ok(vec![]);
         }
 
-        // Создаем фильтр для получения логов
         debug!("[ UNISWAP_FETCH_EVENTS_DEBUG ] Создание фильтра для логов");
+        
+        // Создаем фильтр для получения логов
         let filter = Filter::new()
             .from_block(BlockNumber::Number(from_block.into()))
             .to_block(BlockNumber::Number(to_block.into()))
@@ -363,8 +426,8 @@ impl UniswapEventSubscriber {
         let mut burn_count = 0;
         let mut flash_count = 0;
 
-        // Обрабатываем каждый полученный лог
         debug!("[ UNISWAP_FETCH_EVENTS_DEBUG ] Обработка полученных логов");
+        // Обрабатываем каждый полученный лог
         for log in logs {
             let address = log.address;
             let block_number = log.block_number.map_or("неизвестен".to_string(), |n| {
@@ -381,6 +444,7 @@ impl UniswapEventSubscriber {
                     tick_updates: DashSet::new(),
                     current_tick: 0,
                     block_number: block_number_u64,
+                    event_id:  H256::zero(),
                 }
             });
 
@@ -534,114 +598,199 @@ impl UniswapEventSubscriber {
 
 
 
-    /// Получает данные о тиках пула Uniswap V3
-pub async fn fetch_tick_data(
-    &self,
-    pool_event_info: &PoolEventInfo, // Информация о событиях пула
-    pool_address: Address,           // Адрес пула в сети
-    provider: Arc<Provider<Ws>>,     // Web3 провайдер для взаимодействия с сетью
-    graph: Arc<UniversalGraph>,      // Граф с информацией о пулах
-) -> anyhow::Result<EventPoolUpdate> {
-    // Создаем экземпляр контракта пула
-    let pool_contract = UniswapV3Pool::new(pool_address, provider.clone());
+ 
 
-    // Получаем основные данные пула: ликвидность, slot0 и tick_spacing
-    let (liquidity, slot0, tick_spacing, _, _) =
-        process_pool_data(pool_address, pool_contract.clone().into())
-            .await
-            .context(format!("[ UNISWAP_EVENT_FETCH_TICK ] Не удалось по данные пула для: {:?}",
-                pool_address
-            ))?;
+    /// Получает данные о тиках пула Uniswap V3 с использованием мультиколла
+    ///
+    /// # Описание
+    /// Запрашивает данные о ликвидности, текущей цене и тиках пула, используя мультиколл для оптимизации
+    /// запросов к тикам. Обновляет tick_map на основе полученных событий.
+    ///
+    /// # Параметры
+    /// * `pool_event_info` - Информация о событиях пула
+    /// * `pool_address` - Адрес пула в сети
+    /// * `provider` - WebSocket-провайдер для взаимодействия с блокчейном
+    /// * `graph` - Граф с данными о пулах
+    ///
+    /// # Возвращаемое значение
+    /// * `Result<EventPoolUpdate, anyhow::Error>` - Обновленные данные пула
+    pub async fn fetch_tick_data(
+        &self,
+        pool_event_info: &PoolEventInfo,
+        pool_address: Address,
+        provider: Arc<Provider<Ws>>,
+        graph: Arc<UniversalGraph>,
+    ) -> anyhow::Result<EventPoolUpdate> {
+        debug!("[UNISWAP_EVENT_FETCH_TICK_DEBUG][{:?}] Начало получения данных для тиков пула", pool_address);
 
-    // Извлекаем текущий тик из slot0
-    let current_tick = slot0.1;
+        let pool_contract = UniswapV3Pool::new(pool_address, provider.clone());
 
-    // Получаем информацию о пуле из графа
-    let pool_info = graph
-        .edges
-        .get(&pool_address)
-        .ok_or_else(|| anyhow::anyhow!("Пул {:?} не найден в графе", pool_address))?;
+        let (liquidity, slot0, tick_spacing, _, _) =
+            process_pool_data(pool_address, pool_contract.clone().into())
+                .await
+                .context(format!("[UNISWAP_EVENT_FETCH_TICK] Не удалось получить данные пула: {:?}", pool_address))?;
 
-    // Преобразуем обновленные тики в вектор
-    let tick_indices: Vec<i32> = pool_event_info
-        .tick_updates
-        .iter()
-        .map(|tick| *tick)
-        .collect();
+        let current_tick = slot0.1;
+        debug!("[UNISWAP_EVENT_FETCH_TICK_DEBUG][{:?}] Текущий тик: {}", pool_address, current_tick);
 
-    // Создаем футуры для параллельного запроса данных по каждому тику
-    let tick_futures: Vec<_> = tick_indices
-        .into_iter()
-        .map(|tick| {
-            let contract = pool_contract.clone();
-            let pool_address = pool_address;
-            let tick_spacing = tick_spacing;
-            async move {
-                let tick_data = contract.ticks(tick).call().await;
-                tick_data.map_or_else(
-                    |_| {
-                        info!("[ UNISWAP_EVENT_FETCH_TICK ][{:?}] Ошибка при запросе тика {}: данные недоступны",
-                            pool_address, tick
-                        );
-                        None
-                    },
-                    |data| {
-                        // Проверяем, что ликвидность ненулевая и тик кратен tick_spacing
-                        if (data.0 != 0 || data.1 != 0) && tick % tick_spacing == 0 {
-                            Some((tick, data))
-                        } else {
-                            info!("[ UNISWAP_EVENT_FETCH_TICK ][{:?}] Пропущен тик {} (нулевая ликвидность: gross: {}, net: {} или не кратен tick_spacing: {})",
-                                pool_address, tick, data.0, data.1, tick_spacing
-                            );
-                            None
-                        }
-                    },
-                )
+        let pool_info = graph
+            .edges
+            .get(&pool_address)
+            .ok_or_else(|| anyhow::anyhow!("Пул не найден в графе: {:?}", pool_address))?;
+
+        let tick_indices: Vec<i32> = pool_event_info
+            .tick_updates
+            .iter()
+            .map(|tick| *tick)
+            .collect();
+
+        debug!("[UNISWAP_EVENT_FETCH_TICK_DEBUG][{:?}] Запрашивается {} тиков", pool_address, tick_indices.len());
+
+        let tick_results = Self::fetch_ticks_multicall(
+            pool_address,
+            &pool_contract,
+            tick_indices,
+            provider.clone(),
+        ).await;
+
+        debug!("[UNISWAP_EVENT_FETCH_TICK_DEBUG][{:?}] Получено {} результатов тиков", pool_address, tick_results.len());
+
+        let mut tick_map: OrdMap<i32, (i128, U512)> = OrdMap::new();
+        for result in tick_results {
+            if let Some((tick, data)) = result {
+                if (data.0 != 0 || data.1 != 0) && tick % tick_spacing == 0 {
+                    debug!("[UNISWAP_EVENTS_FETCH_TICK_DEBUG][{:?}] Добавление тика {} в tick_map", pool_address, tick);
+                    tick_map.insert(tick, (data.1, U512::from(data.0)));
+                } else {
+                    info!(
+                        "[UNISWAP_EVENT_FETCH_TICK][{:?}] Пропущен тик {} (нулевая ликвидность: gross: {}, net: {} или не кратен tick_spacing: {})",
+                        pool_address, tick, data.0, data.1, tick_spacing
+                    );
+                }
             }
-        })
-        .collect();
-
-
-     debug!("[ UNISWAP_EVENT_FETCH_TICK_DEBUG ][{:?}] Ожидание завершения запросов тиков", pool_address);
-    // Выполняем все запросы параллельно
-    let tick_results = join_all(tick_futures).await;
-        debug!("[ UNISWAP_EVENT_FETCH_TICK_DEBUG ][{:?}] Получено {} результатов тиков", pool_address, tick_results.len());
-
-
-    // Создаем упорядоченную карту для хранения данных тиков
-    let mut tick_map: OrdMap<i32, (i128, U512)> = OrdMap::new();
-
-    // Заполняем карту данными полученных тиков
-    for result in tick_results {
-        if let Some((tick, data)) = result {
-             debug!("[ UNISWAP_EVENTS_FETCH_TICK_DEBUG ][{:?}] Добавление тика {} в tick_map", pool_address, tick);
-            tick_map.insert(tick, (data.1, U512::from(data.0)));
         }
+
+        debug!("[UNISWAP_EVENTS_FETCH_TICK_DEBUG][{:?}] tick_map заполнен: {} тиков", pool_address, tick_map.len());
+
+        let sqrt_price = U512::from(slot0.0);
+        debug!("[UNISWAP_EVENTS_FETCH_TICK_DEBUG][{:?}] sqrt_price: {}", pool_address, sqrt_price);
+
+        let current_price = calculate_current_price(
+            sqrt_price,
+            pool_info.uniswap_token_a_decimals,
+            pool_info.uniswap_token_b_decimals,
+        )
+        .map_err(anyhow::Error::msg)?;
+        debug!("[UNISWAP_EVENTS_FETCH_TICK_DEBUG][{:?}] current_price: {}", pool_address, current_price);
+
+        Ok(EventPoolUpdate {
+            liquidity,
+            sqrt_price_x96: slot0.0,
+            current_tick,
+            tick_map,
+            current_price,
+        })
     }
 
-    debug!("[ UNISWAP_EVENTS_FETCH_TICK_DEBUG ][{:?}] tick_map заполнен: {} тиков", pool_address, tick_map.len());
+    /// Выполняет мультиколл для получения данных тиков пула
+    ///
+    /// # Описание
+    /// Использует контракт Multicall3 для одновременного запроса данных о тиках пула, что сокращает количество
+    /// сетевых вызовов. Обрабатывает результаты и возвращает их в виде опциональных кортежей.
+    ///
+    /// # Параметры
+    /// * `pool_address` - Адрес пула
+    /// * `pool_contract` - Контракт пула Uniswap V3
+    /// * `tick_indices` - Список индексов тиков для запроса
+    /// * `provider` - WebSocket-провайдер
+    ///
+    /// # Возвращает
+    /// * `Vec<Option<(i32, (u128, i128, U256, U256, i64, u128, u32, bool))>>` - Результаты запросов
+    async fn fetch_ticks_multicall(
+        pool_address: Address,
+        pool_contract: &UniswapV3Pool<Provider<Ws>>,
+        tick_indices: Vec<i32>,
+        provider: Arc<Provider<Ws>>,
+    ) -> Vec<Option<(i32, (u128, i128, U256, U256, i64, u128, u32, bool))>> {
+        debug!("[UNISWAP_EVENTS_TICKS_MULTICALL_DEBUG] Начало мультиколла тиков для пула {:?}", pool_address);
 
-    // Преобразуем sqrt_price в U512
-    let sqrt_price = U512::from(slot0.0);
-debug!("[ UNISWAP_EVENTS_FETCH_TICK_DEBUG ][{:?}] sqrt_price: {}", pool_address, sqrt_price);
+        let multicall = Multicall3::new(
+            env::var("MULTICALL3_ADDRESS")
+                .unwrap_or("0xca11bde05977b3631167028862be2a173976ca11".to_string())
+               .parse::<H160>()
+                .expect("Некорректный MULTICALL3_ADDRESS"),
+            provider.clone(),
+        );
 
-    // Вычисляем текущую цену на основе sqrt_price и десятичных знаков токенов
-    let current_price = calculate_current_price(
-        sqrt_price,
-        pool_info.uniswap_token_a_decimals,
-        pool_info.uniswap_token_b_decimals,
-    )
-    .map_err(anyhow::Error::msg)?;
-debug!("[ UNISWAP_EVENTS_FETCH_TICK_DEBUG][{:?}] sqrt_price: {}", pool_address, sqrt_price);
-// Возвращаем структуру с обновленными данными пула
-Ok(EventPoolUpdate {
-    liquidity,
-    sqrt_price_x96: slot0.0,
-    current_tick,
-    tick_map,
-    current_price,
-})
-}
+        let calls = tick_indices
+            .iter()
+            .map(|tick| {
+                let call_data = pool_contract.ticks(*tick).calldata().unwrap();
+                debug!("[UNISWAP_EVENTS_TICKS_MULTICALL_DEBUG][{:?}] Добавлен запрос для тика {}", pool_address, *tick);
+                Call3 {
+                    target: pool_address,
+                    allow_failure: true,
+                    call_data,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let results = multicall
+            .aggregate_3(calls)
+            .call()
+            .await
+            .map_err(|e| {
+                warn!("[UNISWAP_EVENTS_TICKS_MULTICALL] Ошибка мультиколла тиков для пула {:?}: {:?}", pool_address, e);
+                e
+            })
+            .unwrap_or_default();
+
+        debug!("[UNISWAP_EVENTS_TICKS_MULTICALL_DEBUG][{:?}] Успешный мультиколл, получено {} результатов", pool_address, results.len());
+
+        tick_indices
+            .into_iter()
+            .zip(results)
+            .map(|(tick, result)| {
+                if result.success {
+                    match ethers::abi::decode(
+                        &[
+                            ethers::abi::ParamType::Uint(128), // liquidityGross
+                            ethers::abi::ParamType::Int(128),  // liquidityNet
+                            ethers::abi::ParamType::Uint(256), // feeGrowthOutside0X128
+                            ethers::abi::ParamType::Uint(256), // feeGrowthOutside1X128
+                            ethers::abi::ParamType::Int(56),   // tickCumulativeOutside
+                            ethers::abi::ParamType::Uint(160), // secondsPerLiquidityOutsideX128
+                            ethers::abi::ParamType::Uint(32),  // secondsOutside
+                            ethers::abi::ParamType::Bool,      // initialized
+                        ],
+                        &result.return_data,
+                    ) {
+                        Ok(decoded) => {
+                            let data = (
+                                decoded[0].clone().into_uint().unwrap().try_into().unwrap(),
+                                decoded[1].clone().into_int().unwrap().try_into().unwrap(),
+                                decoded[2].clone().into_uint().unwrap(),
+                                decoded[3].clone().into_uint().unwrap(),
+                                decoded[4].clone().into_int().unwrap().try_into().unwrap(),
+                                decoded[5].clone().into_uint().unwrap().try_into().unwrap(),
+                                decoded[6].clone().into_uint().unwrap().try_into().unwrap(),
+                                decoded[7].clone().into_bool().unwrap(),
+                            );
+                            debug!("[UNISWAP_EVENTS_TICKS_MULTICALL_DEBUG][{:?}] Тик {} успешно декодирован", pool_address, tick);
+                            Some((tick, data))
+                        }
+                        Err(e) => {
+                            warn!("[UNISWAP_EVENTS_TICKS_MULTICALL][{:?}] Ошибка декодирования тика {}: {:?}", pool_address, tick, e);
+                            None
+                        }
+                    }
+                } else {
+                    warn!("[UNISWAP_EVENTS_TICKS_MULTICALL][{:?}] Неудачный вызов для тика {}", pool_address, tick);
+                    None
+                }
+            })
+            .collect()
+    }
 
 
     /// Функция для обновления графа на основе событий
@@ -705,263 +854,231 @@ Ok(EventPoolUpdate {
     /// # Возвращаемое значение
     /// * `anyhow::Result<()>` - Результат выполнения операции
 pub async fn polling_event(
-        &self,
-        block_receiver: &watch::Receiver<u64>,
-        event_tx: mpsc::Sender<PoolEventInfo>,
-        graph: Arc<UniversalGraph>,
-        arb_event_tx: mpsc::Sender<PoolEventInfo>,
-    ) -> anyhow::Result<()> {
-        debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Начало polling_event");
-        let mut block_from = *block_receiver.borrow();
-        debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Начальный блок: {}", block_from);
-        let max_chunk_size: u64 = 200;
-        let mut block_receiver = block_receiver.clone();
+    &self,
+    block_receiver: &watch::Receiver<u64>,
+    graph: Arc<UniversalGraph>,
+    event_tx: mpsc::Sender<PoolEventInfo>, // Изменено на mpsc::Sender
+) -> anyhow::Result<()> {
+    debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Начало polling_event");
+    let mut block_from = *block_receiver.borrow();
+    debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Начальный блок: {}", block_from);
+    let max_chunk_size: u64 = 200;
+    let mut block_receiver = block_receiver.clone();
 
-        loop {
-            debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Ожидание изменения номера блока");
-            if block_receiver.changed().await.is_err() {
-                warn!("[ UNISWAP_EVENT_POLLING_WARN! ] Канал блоков закрыт");
-                debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Канал блоков закрыт");
-                break;
-            }
+    loop {
+        //debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Ожидание изменения номера блока");
+        if block_receiver.changed().await.is_err() {
+            warn!("[ UNISWAP_EVENT_POLLING_WARN! ] Канал блоков закрыт");
+            debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Канал блоков закрыт");
+            break;
+        }
 
-            let block_to = *block_receiver.borrow();
-            debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Новый блок: {}", block_to);
-            if block_to < block_from {
-                warn!(
-                    "[ UNISWAP_EVENT_POLLING_WARN! ] Некорректный диапазон: from {} > to {}",
-                    block_from, block_to
-                );
-                debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Некорректный диапазон блоков");
-                continue;
-            }
+        let block_to = *block_receiver.borrow();
+        debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Новый блок: {}", block_to);
+        if block_to < block_from {
+            warn!(
+                "[ UNISWAP_EVENT_POLLING_WARN! ] Некорректный диапазон: from {} > to {}",
+                block_from, block_to
+            );
+            continue;
+        }
 
-            let subscribed_pools = self.subscribed_pools.clone();
-            debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Количество подписанных пулов: {}", subscribed_pools.len());
-            if subscribed_pools.is_empty() {
-                block_from = block_to + 1;
-                debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Пустой список подписанных пулов, block_from обновлен: {}", block_from);
-                continue;
-            }
-
-            let mut current_from = block_from;
-            let mut all_events = Vec::new();
-
-            while current_from <= block_to {
-                let current_to = (current_from + max_chunk_size - 1).min(block_to);
-                debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Обработка диапазона блоков: {}–{}", current_from, current_to);
-                match self.fetch_events(current_from, current_to).await {
-                    Ok(events) => {
-                        debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Получено {} событий для блоков {}–{}", events.len(), current_from, current_to);
-                        all_events.extend(events);
-                    }
-                    Err(e) => {
-                        warn!(
-                            "[ UNISWAP_EVENT_POLLING_WARN ] Ошибка получения событий за блоки {}–{}: {}",
-                            current_from, current_to, e
-                        );
-                        debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Ошибка получения событий: {:?}", e);
-                    }
-                }
-                current_from = current_to + 1;
-            }
-
-            let mut sent_events = 0;
-            debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Агрегация событий, всего: {}", all_events.len());
-            let aggregated_events = self.aggregate_events(all_events, graph.clone());
-            debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Агрегировано {} событий", aggregated_events.len());
-
-            for pool_event in aggregated_events {
-                let event_for_workers = pool_event.clone();
-                let event_for_simulator = pool_event;
-                debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ][{:?}] Отправка события в каналы", event_for_workers.address);
-
-                if let Err(e) = event_tx.send(event_for_workers).await {
-                    error!("[ UNISWAP_EVENT_POLLING_ERROR ] Ошибка отправки в канал воркеров: {}", e);
-                }
-                if let Err(e) = arb_event_tx.send(event_for_simulator).await {
-                    error!("[ UNISWAP_EVENT_POLLING_ERROR ] Ошибка отправки в канал симулятора: {}", e);
-                }
-                sent_events += 1;
-            }
-
-            if sent_events > 0 {
-                info!("[ UNISWAP_EVENT_POLLING ] Отправлено событий: {}", sent_events);
-                debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Отправлено {} событий", sent_events);
-            }
-
+        let subscribed_pools = self.subscribed_pools.clone();
+        debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Количество подписанных пулов: {}", subscribed_pools.len());
+        if subscribed_pools.is_empty() {
             block_from = block_to + 1;
-            debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] block_from обновлен: {}", block_from);
-            sleep(Duration::from_secs(1));
+            debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Пустой список подписанных пулов, block_from обновлен: {}", block_from);
+            continue;
         }
-        debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Конец polling_event");
-        Ok(())
-    }
 
-    fn aggregate_events(&self, events: Vec<PoolEventInfo>, graph: Arc<UniversalGraph>) -> Vec<PoolEventInfo> {
-        let mut map: HashMap<Address, PoolEventInfo> = HashMap::new();
-        
-        for event in events {
-            let entry = map.entry(event.address).or_insert_with(|| {
-                PoolEventInfo {
-                    address: event.address,
-                    tick_updates: DashSet::new(),
-                    current_tick: event.current_tick,
-                    block_number: event.block_number,
+        let mut current_from = block_from;
+        let mut all_events = Vec::new();
+
+        while current_from <= block_to {
+            let current_to = (current_from + max_chunk_size - 1).min(block_to);
+            debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Обработка диапазона блоков: {}–{}", current_from, current_to);
+            match self.fetch_events(current_from, current_to).await {
+                Ok(events) => {
+                    debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Получено {} событий для блоков {}–{}", events.len(), current_from, current_to);
+                    all_events.extend(events);
                 }
-            });
-            
-            let tick_spacing = graph
-            .edges
-            .get(&event.address)
-            .map(|pool| match pool.uniswap_fee_tier {
-                100 => 1,
-                500 => 10,
-                3000 => 60,
-                10_000 => 200,
-                _ => 60,
-            })
-            .unwrap_or(60);
-        
-        if event.block_number >= entry.block_number {
-            entry.current_tick = event.current_tick;
-            entry.block_number = event.block_number;
+                Err(e) => {
+                    warn!(
+                        "[ UNISWAP_EVENT_POLLING_WARN ] Ошибка получения событий за блоки {}–{}: {}",
+                        current_from, current_to, e
+                    );
+                    debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Ошибка получения событий: {:?}", e);
+                }
+            }
+            current_from = current_to + 1;
         }
-        
-        for tick in event.tick_updates.iter() {
-            if *tick % tick_spacing == 0 {
-                debug!("[ UNISWAP_EVENTS_AGGREGATE_DEBUG ][{:?}] Добавление тика {} в tick_updates", event.address, *tick);
-                entry.tick_updates.insert(*tick);
-            } else {
-                info!(
-                    "[ UNISWAP_AGGREGATE_EVENT ][{:?}] Пропущен тик {} в агрегации (не кратен tick_spacing: {})",
-                    event.address, *tick, tick_spacing
-                );
+       
+        debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Агрегация событий, всего: {}", all_events.len());
+        let aggregated_events = self.aggregate_events(all_events, graph.clone());
+        debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Агрегировано {} событий", aggregated_events.len());
+
+        for pool_event in aggregated_events {
+            debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ][{:?}] Отправка события в mpsc-канал", pool_event.address);
+            if let Err(e) = event_tx.send(pool_event).await {
+                error!("[ UNISWAP_EVENT_POLLING_ERROR ] Ошибка отправки в mpsc-канал: {}", e);
             }
         }
+
+        block_from = block_to + 1;
+        debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] block_from обновлен: {}", block_from);
+        sleep(Duration::from_secs(1));
+    }
+    debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Конец polling_event");
+    Ok(())
+}
+
+
+
+fn aggregate_events(
+    &self,
+    events: Vec<PoolEventInfo>,
+    graph: Arc<UniversalGraph>)
+        -> Vec<PoolEventInfo> {
+        
+    let mut map: HashMap<Address, PoolEventInfo> = HashMap::new();
+    
+    for event in events {
+        let entry = map.entry(event.address).or_insert_with(|| {
+            PoolEventInfo {
+                event_id: event.event_id,
+                address: event.address,
+                tick_updates: DashSet::new(),
+                current_tick: event.current_tick,
+                block_number: event.block_number,
+            }
+        });
+        
+        let tick_spacing = graph
+        .edges
+        .get(&event.address)
+        .map(|pool| match pool.uniswap_fee_tier {
+            100 => 1,
+            500 => 10,
+            3000 => 60,
+            10_000 => 200,
+            _ => 60,
+        })
+        .unwrap_or(60);
+    
+    if event.block_number >= entry.block_number {
+        entry.current_tick = event.current_tick;
+        entry.block_number = event.block_number;
     }
     
-    let result = map.into_values().collect();
-    result
+    for tick in event.tick_updates.iter() {
+        if *tick % tick_spacing == 0 {
+            debug!("[ UNISWAP_EVENTS_AGGREGATE_DEBUG ][{:?}] Добавление тика {} в tick_updates", event.address, *tick);
+            entry.tick_updates.insert(*tick);
+        } else {
+            info!(
+                "[ UNISWAP_AGGREGATE_EVENT ][{:?}] Пропущен тик {} в агрегации (не кратен tick_spacing: {})",
+                event.address, *tick, tick_spacing
+            );
+        }
+    }
+}
+
+let result = map.into_values().collect();
+result
 }
 
 
 
-    /// 🧠 Метод запуска воркеров и диспетчера
-        /// Метод запуска диспетчера и пула воркеров для обработки событий Uniswap
-        /// 
-        /// # Аргументы
-        /// * `self` - Arc указатель на экземпляр структуры
-        /// * `event_rx` - Приемник событий пула (канал для получения PoolEventInfo)
-        /// * `graph` - Arc указатель на универсальный граф
-        /// * `provider` - Arc указатель на Web3 провайдер
-        /// * `num_workers` - Количество воркеров для параллельной обработки
-        ///
-        /// # Принцип работы
-        /// 1. Создает пул воркеров заданного размера
-        /// 2. Каждому воркеру выделяется свой канал для получения событий
-        /// 3. Диспетчер распределяет входящие события между воркерами по кругу
-        pub async fn start_dispatcher_and_workers(
-            self: Arc<Self>,
-            mut event_rx: mpsc::Receiver<PoolEventInfo>,
-            graph: Arc<UniversalGraph>,
-            provider: Arc<Provider<Ws>>,
-            num_workers: usize,
-        ) {
-            debug!("[ UNISWAP_EVENTS_DISPATCHER_DEBUG ] Начало start_dispatcher_and_workers, num_workers: {}", num_workers);
-            // Вектор для хранения отправителей событий каждому воркеру
-            let mut worker_senders = Vec::new();
-
-            // Создаем и запускаем заданное количество воркеров
-            for i in 0..num_workers {
-                // Создаем неограниченный канал для каждого воркера
-                let (tx, rx): (
-                    UnboundedSender<PoolEventInfo>,
-                    UnboundedReceiver<PoolEventInfo>,
-                ) = tokio::sync::mpsc::unbounded_channel();
-                worker_senders.push(tx);
-
-                // Клонируем необходимые Arc указатели для воркера
-                let graph = Arc::clone(&graph);
-                let provider = Arc::clone(&provider);
-                let subscriber = Arc::clone(&self);
-
-                debug!("[ UNISWAP_EVENTS_DISPATCHER_DEBUG ] Создание канала для воркера {}", i);
-                // Запускаем воркер в отдельной задаче
-                tokio::spawn(async move {
-                     debug!("[ UNISWAP_EVENTS_DISPATCHER_DEBUG ] Воркер {} запущен", i);
-                    subscriber.worker_loop(rx, graph, provider, i).await;
-                });
-            }
-
-            // Основной цикл диспетчера
-            let mut current_worker = 0;
-            debug!("[ UNISWAP_EVENTS_DISPATCHER_DEBUG ] Запуск основного цикла диспетчера");
-            while let Some(event) = event_rx.recv().await {
-                // Отправляем событие текущему воркеру
-                debug!("[ UNISWAP_EVENTS_DISPATCHER_DEBUG ] Отправка события текущему воркеру {}", current_worker);
-                let _ = worker_senders[current_worker].send(event);
-                // Переключаемся на следующего воркера по кругу
-                current_worker = (current_worker + 1) % num_workers;
-                debug!("[ UNISWAP_EVENTS_DISPATCHER_DEBUG ] Переключение на следующего воркера {}", current_worker);
-            }
-
-            warn!("[ DISPATCHER_UNISWAP_EVENT_WARN! ] Канал событий закрыт, dispatcher завершён");
-        }
-
-        /// Основной цикл обработки событий для воркера
-        /// 
-        /// # Аргументы
-        /// * `self` - Arc указатель на текущий объект
-        /// * `rx` - Приемник событий для данного воркера (UnboundedReceiver)
-        /// * `graph` - Arc указатель на универсальный граф
-        /// * `provider` - Arc указатель на Web3 провайдер
-        /// * `worker_id` - Уникальный идентификатор воркера
-        ///
-        /// # Принцип работы
-        /// 1. В бесконечном цикле ожидает новые события из канала
-        /// 2. При получении события:
-        ///    - Извлекает адрес пула из события
-        ///    - Пытается обновить граф на основе полученного события
-        ///    - Логирует результат обработки (успех/ошибка)
-        /// 3. При закрытии канала завершает работу
-        async fn worker_loop(
-        self: Arc<Self>,
-        mut rx: UnboundedReceiver<PoolEventInfo>,
-        graph: Arc<UniversalGraph>,
-        provider: Arc<Provider<Ws>>,
-        worker_id: usize,
-    ) {
-        debug!("[ UNISWAP_EVENTS_DEBUG ][ WORKER {}] Начало worker_loop", worker_id);
-        while let Some(event) = rx.recv().await {
-            let pool_address = event.address;
-            debug!("[ UNISWAP_EVENTS_DEBUG ][ WORKER {}][{:?}] Получено событие", worker_id, pool_address);
-            if let Err(e) = self
-                .update_graph_from_event(&event, graph.clone(), pool_address, provider.clone())
-                .await
-            {
-                error!(
-                    "[ WORKER_ERROR {}] Ошибка обновления пула {:?}: {:?}",
-                    worker_id, pool_address, e
-                );
-                debug!("[ UNISWAP_EVENTS_DEBUG ][ WORKER {}][{:?}] Ошибка обновления: {:?}", worker_id, pool_address, e);
-            } else {
-                info!(
-                    "[ {} {} ] Обновил пул {:?}",
-                    "WORKER_UNISWAP_EVENT".black().on_green(),
-                    worker_id,
-                    pool_address
-                );
-                debug!("[ UNISWAP_EVENTS_DEBUG ][ WORKER {}][{:?}] Пул успешно обновлен", worker_id, pool_address);
+async fn worker_loop(
+    self: Arc<Self>,
+    mut rx: mpsc::Receiver<PoolEventInfo>,
+    graph: Arc<UniversalGraph>,
+    provider: Arc<Provider<Ws>>,
+    worker_id: usize,
+    simulator_tx: mpsc::Sender<PoolEventInfo>,
+) {
+    debug!("[ UNISWAP_EVENTS_DEBUG ][ WORKER {}] Начало worker_loop", worker_id);
+    while let Some(event) = rx.recv().await {
+        let pool_address = event.address;
+        debug!("[ UNISWAP_EVENTS_DEBUG ][ WORKER {}][{:?}] Получено событие", worker_id, pool_address);
+        if let Err(e) = self
+            .update_graph_from_event(&event, graph.clone(), pool_address, provider.clone())
+            .await
+        {
+            error!(
+                "[ WORKER_ERROR {}] Ошибка обновления пула {:?}: {:?}",
+                worker_id, pool_address, e
+            );
+            debug!("[ UNISWAP_EVENTS_DEBUG ][ WORKER {}][{:?}] Ошибка обновления: {:?}", worker_id, pool_address, e);
+        } else {
+            info!(
+                "[ {} {} ] Обновил пул {:?}",
+                "WORKER_UNISWAP_EVENT".black().on_green(),
+                worker_id,
+                pool_address
+            );
+            debug!("[ UNISWAP_EVENTS_DEBUG ][ WORKER {}][{:?}] Пул успешно обновлен", worker_id, pool_address);
+            if let Err(e) = simulator_tx.send(event).await {
+                error!("[WORKER_ERROR {}] Ошибка отправки в симулятор: {}", worker_id, e);
             }
         }
+    }
+    warn!("[ WORKER {}] Завершён", worker_id);
+    debug!("[ UNISWAP_EVENTS_DEBUG ][ WORKER {}] Конец worker_loop", worker_id);
+}
 
-        warn!("[ WORKER {}] Завершён", worker_id);
-        debug!("[ UNISWAP_EVENTS_DEBUG ][ WORKER {}] Конец worker_loop", worker_id);
+pub async fn start_coordinator_and_workers(
+    self: Arc<Self>,
+    graph: Arc<UniversalGraph>,
+    provider: Arc<Provider<Ws>>,
+    num_workers: usize,
+    mut event_rx: mpsc::Receiver<PoolEventInfo>,
+    simulator_tx: mpsc::Sender<PoolEventInfo>,
+) {
+    debug!("[ UNISWAP_EVENTS_COORDINATOR_DEBUG ] Начало start_coordinator_and_workers, num_workers: {}", num_workers);
+
+    // Создаём каналы для каждого воркера
+    let mut worker_senders = Vec::with_capacity(num_workers);
+    for i in 0..num_workers {
+        let (worker_tx, worker_rx) = mpsc::channel::<PoolEventInfo>(2048);
+        worker_senders.push(worker_tx);
+
+        // Запускаем воркер
+        let subscriber_clone = Arc::clone(&self);
+        let graph_clone = Arc::clone(&graph);
+        let provider_clone = Arc::clone(&provider);
+        let simulator_tx_clone = simulator_tx.clone();
+
+        tokio::spawn(async move {
+            subscriber_clone
+                .worker_loop(worker_rx, graph_clone, provider_clone, i, simulator_tx_clone)
+                .await;
+        });
     }
 
+    // Запускаем координатор
+    let mut worker_index = 0;
+    while let Some(event) = event_rx.recv().await {
+        debug!("[ UNISWAP_EVENTS_COORDINATOR_DEBUG ] Получено событие для пула {:?}", event.address);
+        let sender = &worker_senders[worker_index];
+        if let Err(e) = sender.send(event).await {
+            error!("[ COORDINATOR_ERROR ] Ошибка отправки события воркеру {}: {}", worker_index, e);
+        } else {
+            debug!("[ UNISWAP_EVENTS_COORDINATOR_DEBUG ] Событие отправлено воркеру {}", worker_index);
+        }
+        worker_index = (worker_index + 1) % num_workers;
+    }
+
+    // Дропаем Sender-ы, чтобы воркеры завершились после обработки оставшихся событий
+    drop(worker_senders);
+    debug!("[ UNISWAP_EVENTS_COORDINATOR_DEBUG ] Координатор завершён");
+}
+
 
 }
+
+
+
     
 
 

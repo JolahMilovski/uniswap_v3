@@ -1,7 +1,7 @@
 use num_traits::identities::Zero;
 use ethers::{
     prelude::*,
-    types::{Address, U512},
+    types::{Address, U512, I256, Bytes},
     abi::{self},
 };
 use im::OrdMap;
@@ -10,8 +10,9 @@ use std::env;
 use log::{debug, info, warn};
 use std::result::Result;
 use anyhow::Error;
+use tokio::time::Duration;
 
-// ABI для Multicall3 с переименованным Result
+// ABI для Multicall3
 abigen!(
     Multicall3,
     r#"[{
@@ -70,24 +71,137 @@ abigen!(
     }]"#
 );
 
-/// Асинхронная функция для получения активных тиков из пула Uniswap V3
+/// Обработка мультиколлов для получения тиков из пула Uniswap V3
+/// 
+/// # Аргументы
+/// * `calls` - Вектор вызовов (адрес контракта и данные вызова)
+/// * `multicall` - Экземпляр контракта Multicall3
+/// * `pool_address` - Адрес пула Uniswap V3
+/// * `tick_spacing` - Шаг тиков в зависимости от комиссии пула
+/// * `all_ticks` - Карта для хранения тиков и их ликвидности
+/// * `non_zero_liquidity` - Счетчик тиков с ненулевой ликвидностью
+/// * `word_offset` - Смещение слова для корректного логирования
+///
+/// # Возвращает
+/// Результат выполнения, содержащий () в случае успеха или ошибку
+async fn process_calls(
+    calls: Vec<(Address, Bytes)>,
+    multicall: &Arc<Multicall3<Provider<Ws>>>,
+    pool_address: Address,
+    tick_spacing: i32,
+    all_ticks: &mut OrdMap<i32, (i128, U512)>,
+    non_zero_liquidity: &mut u64,
+    word_offset: i16, // Смещение для логирования слов
+) -> Result<(), Error> {
+    // Пропускаем обработку, если нет вызовов
+    if calls.is_empty() {
+        return Ok(());
+    }
+    debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG][{:?}] Выполнение мультиколла с {} вызовами", pool_address, calls.len());
+    
+    // Выполняем мультиколл с таймаутом 20 секунд
+    let results = tokio::time::timeout(Duration::from_secs(20), multicall.aggregate_3(
+        calls.iter().map(|(target, data)| Call3 {
+            target: *target,
+            call_data: data.clone(),
+            allow_failure: true,
+        }).collect()
+    ).call()).await??;
+
+    // Обрабатываем результаты вызовов
+    for (i, result) in results.into_iter().enumerate() {
+        let word = word_offset + i as i16; // Вычисляем номер слова
+        if !result.success {
+            warn!("[UNISWAP_V3_FETH_ACTIVE_WARN!][{:?}] Неудачный вызов для слова {}: {:?}", pool_address, word, result.return_data);
+            continue;
+        }
+        // Декодируем возвращенные данные
+        match abi::decode(&[abi::ParamType::Array(Box::new(abi::ParamType::Tuple(vec![
+            abi::ParamType::Int(24),  // tick
+            abi::ParamType::Int(128), // liquidity_net
+            abi::ParamType::Uint(128), // liquidity_gross
+        ])))], &result.return_data) {
+            Ok(decoded) => {
+                let ticks: Vec<tick_lens::PopulatedTick> = decoded[0]
+                    .clone()
+                    .into_array()
+                    .unwrap()
+                    .into_iter()
+                    .map(|token| {
+                        let tuple = token.into_tuple().unwrap();
+                        let tick_value = I256::from_raw(tuple[0].clone().into_int().unwrap());
+                        let liquidity_net_value = I256::from_raw(tuple[1].clone().into_int().unwrap());
+                        // Проверка диапазона значений
+                        if tick_value < I256::from(i32::MIN) || tick_value > I256::from(i32::MAX) {
+                            warn!("[UNISWAP_V3_FETH_ACTIVE_WARN][{:?}] Тик вне диапазона i32: {}, пропускаем", pool_address, tick_value);
+                            return None;
+                        }
+                        if liquidity_net_value < I256::from(i128::MIN) || liquidity_net_value > I256::from(i128::MAX) {
+                            warn!("[UNISWAP_V3_FETH_ACTIVE_WARN][{:?}] LiquidityNet вне диапазона i128: {}, пропускаем", pool_address, liquidity_net_value);
+                            return None;
+                        }
+                        Some(tick_lens::PopulatedTick {
+                            tick: tick_value.as_i32(),
+                            liquidity_net: liquidity_net_value.as_i128(),
+                            liquidity_gross: tuple[2].clone().into_uint().unwrap().as_u128(),
+                        })
+                    })
+                    .filter_map(|tick| tick) // Фильтруем None значения
+                    .collect();
+                // Логируем только если есть тики
+                if !ticks.is_empty() {
+                    debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG][{:?}] Слово {}: получено {} тиков", pool_address, word, ticks.len());
+                }
+                // Добавляем тики в карту
+                for tick in ticks {
+                    if tick.tick % tick_spacing == 0 {
+                        all_ticks.insert(
+                            tick.tick,
+                            (tick.liquidity_net, U512::from(tick.liquidity_gross)),
+                        );
+                        if tick.liquidity_net != 0 || !tick.liquidity_gross.is_zero() {
+                            *non_zero_liquidity += 1;
+                        }
+                    } else {
+                        info!("[UNISWAP_V3_FETH_ACTIVE][{:?}] Пропущен тик {} (не кратен tick_spacing: {})",
+                            pool_address, tick.tick, tick_spacing);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("[UNISWAP_V3_FETH_ACTIVE_WARN!][{:?}] Ошибка декодирования для слова {}: {}", pool_address, word, e);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Асинхронная функция для получения всех активных тиков из пула Uniswap V3
+///
+/// # Аргументы
+/// * `pool_address` - Адрес пула Uniswap V3
+/// * `client` - Провайдер для взаимодействия с блокчейном
+/// * `current_tick` - Текущий тик пула
+/// * `fee` - Комиссия пула
+///
+/// # Возвращает
+/// Карту тиков с их ликвидностью или ошибку
 pub async fn fetch_active_ticks(
     pool_address: Address,
     client: Arc<Provider<Ws>>,
     current_tick: i32,
     fee: u32,
 ) -> Result<OrdMap<i32, (i128, U512)>, Error> {
-    // Логируем начало выполнения функции
     debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG] Начало fetch_active_ticks, pool_address: {:?}, current_tick: {}, fee: {}", pool_address, current_tick, fee);
 
-    // Загружаем адреса контрактов Multicall3 и TickLens
-    let multicall_address: Address = env::var("MULTICALL3_ADDRESS")?.parse()?;
-    let tick_lens_address: Address = env::var("UNISWAP_TICK_LENS_ADDRESS")?.parse()?;
-    let multicall = Arc::new(Multicall3::new(multicall_address, client.clone()));
-    let tick_lens = Arc::new(TickLens::new(tick_lens_address, client.clone()));
-    debug!("[UNISWAP_V3_FETH_ACTIVE_BUILD_DEBUG] Multicall3 создан, адрес: {:?}, TickLens создан, адрес: {:?}", multicall_address, tick_lens_address);
+    // Загружаем адреса контрактов
+    let multicall_address: Address = env::var("MULTICALL3_ADDRESS")?.parse()?; // Адрес Multicall3
+    let tick_lens_address: Address = env::var("UNISWAP_TICK_LENS_ADDRESS")?.parse()?; // Адрес TickLens
+    let multicall = Arc::new(Multicall3::new(multicall_address, client.clone())); // Экземпляр Multicall3
+    let tick_lens = Arc::new(TickLens::new(tick_lens_address, client.clone())); // Экземпляр TickLens
+    debug!("[UNISWAP_V3_FETH_ACTIVE_BUILD_DEBUG] Multicall3: {:?}, TickLens: {:?}", multicall_address, tick_lens_address);
 
-    // Определяем шаг тиков в зависимости от комиссии пула
+    // Определяем шаг тиков в зависимости от комиссии
     let tick_spacing = match fee {
         100 => 1,
         500 => 10,
@@ -98,225 +212,47 @@ pub async fn fetch_active_ticks(
     debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG] tick_spacing: {}", tick_spacing);
 
     // Вычисляем диапазон слов
-    let current_word = (current_tick >> 8) as i32;
-    let total_batches = match fee {
-        100 | 500 | 3000 | 10_000 => 5,
-        _ => 10,
-    };
-    let words_per_batch = 5;
-    let min_word = current_word - (total_batches * words_per_batch) as i32;
-    let max_word = current_word + (total_batches * words_per_batch) as i32;
-    let min_tick_word = -887272 >> 8;
-    let max_tick_word = 887272 >> 8;
-    debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG] current_word: {}, min_word: {}, max_word: {}, min_tick_word: {}, max_tick_word: {}", 
-        current_word, min_word, max_word, min_tick_word, max_tick_word);
+    let min_tick_word = (-887272 >> 8) as i16; // Минимальное слово тиков
+    let max_tick_word = (887272 >> 8) as i16; // Максимальное слово тиков
+    let batch_size = 1000; // Размер батча для мультиколлов
+    debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG] min_tick_word: {}, max_tick_word: {}, batch_size: {}", 
+        min_tick_word, max_tick_word, batch_size);
 
-    let mut all_ticks: OrdMap<i32, (i128, U512)> = OrdMap::new();
-    let mut non_zero_liquidity = 0;
+    let mut all_ticks: OrdMap<i32, (i128, U512)> = OrdMap::new(); // Карта для хранения тиков
+    let mut non_zero_liquidity = 0; // Счетчик тиков с ненулевой ликвидностью
 
-    // Запрос центрального слова (одиночный вызов)
-    debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG][{:?}] Запрос центрального слова {}", pool_address, current_word);
-    match tick_lens
-        .get_populated_ticks_in_word(pool_address, current_word.try_into().unwrap())
-        .call()
-        .await
-    {
-        Ok(ticks) => {
-            debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG][{:?}] Центральное слово {}: получено {} тиков", pool_address, current_word, ticks.len());
-            for tick in ticks {
-                if tick.tick % tick_spacing == 0 {
-                    all_ticks.insert(
-                        tick.tick,
-                        (tick.liquidity_net, U512::from(tick.liquidity_gross)),
-                    );
-                    if tick.liquidity_net != 0 || !tick.liquidity_gross !=0 {
-                        non_zero_liquidity += 1;
-                    }
-                } else {
-                    info!("[UNISWAP_V3_FETH_ACTIVE][{:?}] Пропущен тик {} в центральном слове {} (не кратен tick_spacing: {})",
-                        pool_address, tick.tick, current_word, tick_spacing);
-                }
-            }
-        }
-        Err(e) => {
-            warn!("[UNISWAP_V3_FETH_ACTIVE_WARN!][{:?}] Ошибка для центрального слова {}: {}", pool_address, current_word, e);
-        }
+    // Подготавливаем вызовы для всех слов
+    let mut calls = Vec::new();
+    for word in min_tick_word..=max_tick_word {
+        calls.push((
+            tick_lens_address,
+            tick_lens.get_populated_ticks_in_word(pool_address, word).calldata().unwrap(),
+        ));
     }
 
-    // Подготавливаем вызовы для левой части (один мультиколл)
-    let mut left_calls = Vec::new();
-    for batch in 0..total_batches {
-        let base_word = current_word - ((batch * words_per_batch) as i32);
-        for i in 0..words_per_batch {
-            let word = base_word - (i as i32);
-            if word < min_word || word >= current_word || word < min_tick_word {
-                debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG][{:?}] Пропуск левого слова {}: вне диапазона", pool_address, word);
-                continue;
-            }
-            left_calls.push((
-                tick_lens_address,
-                tick_lens
-                    .get_populated_ticks_in_word(pool_address, word.try_into().unwrap())
-                    .calldata()
-                    .unwrap(),
-            ));
-        }
+    // Обрабатываем все слова батчами по 1000
+    for (batch_index, batch) in calls.chunks(batch_size).enumerate() {
+        let word_offset = min_tick_word + (batch_index * batch_size) as i16; // Смещение для текущего батча
+        process_calls(
+            batch.to_vec(),
+            &multicall,
+            pool_address,
+            tick_spacing,
+            &mut all_ticks,
+            &mut non_zero_liquidity,
+            word_offset,
+        ).await?;
     }
 
- // Выполняем мультиколл для левой части
-    if !left_calls.is_empty() {
-        debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG][{:?}] Выполнение мультиколла для левой части с {} вызовами", pool_address, left_calls.len());
-        let left_results = multicall
-            .aggregate_3(left_calls.iter().map(|(target, data)| Call3 {
-                target: *target,
-                call_data: data.clone(),
-                allow_failure: true,
-            }).collect())
-            .call()
-            .await?;
-
-        // Обрабатываем результаты левой части
-        for (i, result) in left_results.into_iter().enumerate() {
-            let word = current_word - ((i / words_per_batch * words_per_batch + i % words_per_batch + 1) as i32);
-            if !result.success {
-                warn!("[UNISWAP_V3_FETH_ACTIVE_WARN!][{:?}] Неудачный вызов для левого слова {}: {:?}", pool_address, word, result.return_data);
-                continue;
-            }
-            match abi::decode(&[abi::ParamType::Array(Box::new(abi::ParamType::Tuple(vec![
-                abi::ParamType::Int(24),  // tick
-                abi::ParamType::Int(128), // liquidity_net
-                abi::ParamType::Uint(128), // liquidity_gross
-            ])))], &result.return_data) {
-                Ok(decoded) => {
-                    let ticks: Vec<tick_lens::PopulatedTick> = decoded[0]
-                        .clone()
-                        .into_array()
-                        .unwrap()
-                        .into_iter()
-                        .map(|token| {
-                            let tuple = token.into_tuple().unwrap();
-                            tick_lens::PopulatedTick {
-                                tick: I256::from_raw(tuple[0].clone().into_int().unwrap()).as_i32(),
-                                liquidity_net: I256::from_raw(tuple[1].clone().into_int().unwrap()).as_i128(),
-                                liquidity_gross: tuple[2].clone().into_uint().unwrap().as_u128(),
-                            }
-                        })
-                        .collect();
-                    debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG][{:?}] Левое слово {}: получено {} тиков", pool_address, word, ticks.len());
-                    for tick in ticks {
-                        if tick.tick % tick_spacing == 0 {
-                            all_ticks.insert(
-                                tick.tick,
-                                (tick.liquidity_net, U512::from(tick.liquidity_gross)),
-                            );
-                            if tick.liquidity_net != 0 || !tick.liquidity_gross.is_zero() {
-                                non_zero_liquidity += 1;
-                            }
-                        } else {
-                            info!("[UNISWAP_V3_FETH_ACTIVE][{:?}] Пропущен тик {} в левом слове {} (не кратен tick_spacing: {})",
-                                pool_address, tick.tick, word, tick_spacing);
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("[UNISWAP_V3_FETH_ACTIVE_WARN!][{:?}] Ошибка декодирования для левого слова {}: {}", pool_address, word, e);
-                }
-            }
-        }
-    }
-
-    // Подготавливаем вызовы для правой части (один мультиколл)
-    let mut right_calls = Vec::new();
-    for batch in 0..total_batches {
-        let base_word = current_word + ((batch * words_per_batch) as i32);
-        for i in 0..words_per_batch {
-            let word = base_word + (i as i32);
-            if word > max_word || word <= current_word || word > max_tick_word {
-                debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG][{:?}] Пропуск правого слова {}: вне диапазона", pool_address, word);
-                continue;
-            }
-            right_calls.push((
-                tick_lens_address,
-                tick_lens
-                    .get_populated_ticks_in_word(pool_address, word.try_into().unwrap())
-                    .calldata()
-                    .unwrap(),
-            ));
-        }
-    }
-
-    // Выполняем мультиколл для правой части
-    if !right_calls.is_empty() {
-        debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG][{:?}] Выполнение мультиколла для правой части с {} вызовами", pool_address, right_calls.len());
-        let right_results = multicall
-            .aggregate_3(right_calls.iter().map(|(target, data)| Call3 {
-                target: *target,
-                call_data: data.clone(),
-                allow_failure: true,
-            }).collect())
-            .call()
-            .await?;
-
-        // Обрабатываем результаты правой части
-        for (i, result) in right_results.into_iter().enumerate() {
-            let word = current_word + ((i / words_per_batch * words_per_batch + i % words_per_batch + 1) as i32);
-            if !result.success {
-                warn!("[UNISWAP_V3_FETH_ACTIVE_WARN!][{:?}] Неудачный вызов для правого слова {}: {:?}", pool_address, word, result.return_data);
-                continue;
-            }
-            match abi::decode(&[abi::ParamType::Array(Box::new(abi::ParamType::Tuple(vec![
-                abi::ParamType::Int(24),
-                abi::ParamType::Int(128),
-                abi::ParamType::Uint(128),
-            ])))], &result.return_data) {
-                Ok(decoded) => {
-                    let ticks: Vec<tick_lens::PopulatedTick> = decoded[0]
-                        .clone()
-                        .into_array()
-                        .unwrap()
-                        .into_iter()
-                        .map(|token| {
-                            let tuple = token.into_tuple().unwrap();
-                            tick_lens::PopulatedTick {
-                                tick: I256::from_raw(tuple[0].clone().into_int().unwrap()).as_i32(),
-                                liquidity_net: I256::from_raw(tuple[1].clone().into_int().unwrap()).as_i128(),
-                                liquidity_gross: tuple[2].clone().into_uint().unwrap().as_u128(),
-                            }
-                        })
-                        .collect();
-                    debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG][{:?}] Правое слово {}: получено {} тиков", pool_address, word, ticks.len());
-                    for tick in ticks {
-                        if tick.tick % tick_spacing == 0 {
-                            all_ticks.insert(
-                                tick.tick,
-                                (tick.liquidity_net, U512::from(tick.liquidity_gross)),
-                            );
-                            if tick.liquidity_net != 0 || !tick.liquidity_gross !=0 {
-                                non_zero_liquidity += 1;
-                            }
-                        } else {
-                            info!("[UNISWAP_V3_FETH_ACTIVE][{:?}] Пропущен тик {} в правом слове {} (не кратен tick_spacing: {})",
-                                pool_address, tick.tick, word, tick_spacing);
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("[UNISWAP_V3_FETH_ACTIVE_WARN!][{:?}] Ошибка декодирования для правого слова {}: {}", pool_address, word, e);
-                }
-            }
-        }
-    }
-
-    // Проверяем, пуста ли карта тиков
+    // Логируем результат
     if all_ticks.is_empty() {
-        warn!("[UNISWAP_V3_FETH_ACTIVE][{:?}] Пустая карта тиков: fee: {}, current_tick: {}, word_range: {} to {}",
-            pool_address, fee, current_tick, min_word, max_word);
+        warn!("[UNISWAP_V3_FETH_ACTIVE][{:?}] Пустая карта тиков: fee: {}, current_tick: {}", 
+            pool_address, fee, current_tick);
     } else {
-        info!("[UNISWAP_V3_FETH_ACTIVE][{:?}] Карта тиков заполнена: fee: {}, current_tick: {}, word_range: {} to {}, total_ticks: {}, non_zero_liquidity: {}",
-            pool_address, fee, current_tick, min_word, max_word, all_ticks.len(), non_zero_liquidity);
+        info!("[UNISWAP_V3_FETH_ACTIVE][{:?}] Карта тиков заполнена: fee: {}, current_tick: {}, total_ticks: {}, non_zero_liquidity: {}", 
+            pool_address, fee, current_tick, all_ticks.len(), non_zero_liquidity);
     }
 
-    // Логируем завершение функции
     debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG] Конец fetch_active_ticks, pool_address: {:?}, all_ticks: {}", pool_address, all_ticks.len());
     Ok(all_ticks)
 }

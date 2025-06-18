@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 
 lazy_static! {
-    static ref MIN_PROFIT_THRESHOLD_BY_TOKEN: HashMap<Address, U256> = {
+    pub static ref MIN_PROFIT_THRESHOLD_BY_TOKEN: HashMap<Address, U256> = {
         let mut m = HashMap::new();
 
         // MAI: 100 MAI = 100 * 10^18

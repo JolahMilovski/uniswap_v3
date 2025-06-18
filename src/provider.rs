@@ -20,11 +20,9 @@ impl ProviderManager {
         // Загружаем URL из переменных окружения
         let ws_urls = vec![
             get_env_var("WS_PROVIDER_URL_INFURA_FIRST"),
-            //get_env_var("DRPC_ARB_WS"),
         ];
         let http_urls = vec![
-            //get_env_var("DRPC_ARB_HTTP"),
-            get_env_var("HTTP_PROVIDER_URL_INFURA_FIRST"),
+           get_env_var("HTTP_PROVIDER_URL_INFURA_FIRST"),
         ];
 
         // Настраиваем общий лимит запросов

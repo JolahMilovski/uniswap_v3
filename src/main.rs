@@ -23,6 +23,7 @@ use tokio::signal;
 use tokio::spawn;
 use tokio::sync::mpsc;
 
+
 use crate::token::TokenInfo;
 use crate::uniswap_events::PoolEventInfo;
 use dashmap::{DashMap, DashSet};
@@ -129,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
    
     let _heartbeat = tokio::spawn(async move {
         loop {
-            info!("Heartbeat 💀 💀 💀 💀 💀 💀 💀 💀 💀 💀 💀 💀 💀 💀 💀 💀 💀 💀 💀 💀 💀 💀- still running");
+            info!("Heartbeat - still running");
             tokio::time::sleep(Duration::from_secs(200)).await;
         }
     });
@@ -152,6 +153,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Клонируем WS  провайдеров
     let provider_ws_for_sync = provider_ws.clone();
+
+    //Провайдер для деспетчера
     let dispatcher_provider = provider_ws.clone();
     //let provider_gas = provider_http.clone();
 
@@ -218,7 +221,7 @@ tokio::spawn({
     let graph_for_sync = Arc::clone(&graph);
     let graph_for_paths = Arc::clone(&graph);
     let graph_for_shutdown = Arc::clone(&graph);
-    let dispatcher_graph = Arc::clone(&graph);
+    //let dispatcher_graph = Arc::clone(&graph);
     let pulling_graph = Arc::clone(&graph);
 
 //=======================================  Обработки Ctrl+C =============================================================================================
@@ -257,12 +260,8 @@ info!("[ MAIN ] Мониторинг ликвидности Aave запущен 
 
     // Создаем канал для передачи новых блоков
     let (block_sender, block_receiver) = watch::channel(0);
-    // Канал для событий воркеров
-    let (event_tx, event_rx) = mpsc::channel::<PoolEventInfo>(2048);
-    // Канал для событий симулятора
-    let (arb_event_tx, arb_event_rx) = mpsc::channel::<PoolEventInfo>(2048);
-    // Клонируем event_tx для polling_event
-    let event_tx_for_polling = event_tx.clone();
+
+   let (event_tx, event_rx) = mpsc::channel::<PoolEventInfo>(2048);
 
     // Запускаем подписку на новые блоки в отдельной задаче
     spawn(async move {
@@ -275,42 +274,49 @@ info!("[ MAIN ] Мониторинг ликвидности Aave запущен 
 
     info!("⏳[ MAIN ] Создание модуля пулинга");
 
-    let subscriber: Arc<UniswapEventSubscriber> =
-        Arc::new(UniswapEventSubscriber::new(provider_http.clone()));
+    let subscriber: Arc<UniswapEventSubscriber> = Arc::new(UniswapEventSubscriber::new(provider_http.clone()));
     let subscriber_clone = Arc::clone(&subscriber);
-
     let block_receiver_clone_to_subscriber = block_receiver.clone();
+
     // Запускаем polling_event
-    spawn(async move {
-        if let Err(e) = subscriber_clone
-            .polling_event(&block_receiver_clone_to_subscriber, event_tx_for_polling, pulling_graph, arb_event_tx,)
-            .await
-        {
-            error!(
-                "💥 [ MAIN ] Задача polling_event завершилась с ошибкой: {:?}",
-                e
-            );
-        } else {
-            warn!("⚠️ [ MAIN ] Задача polling_event завершилась. Это не штатное поведение.");
+    spawn({
+        let subscriber = Arc::clone(&subscriber_clone);
+        let graph = Arc::clone(&pulling_graph);
+        async move {
+            if let Err(e) = subscriber
+                .polling_event(
+                    &block_receiver_clone_to_subscriber,
+                     graph,
+                      event_tx)
+                .await
+            {
+                error!(
+                    "💥 [ MAIN ] Задача polling_event завершилась с ошибкой: {:?}",
+                    e
+                );
+            } else {
+                warn!("⚠️ [ MAIN ] Задача polling_event завершилась. Это не штатное поведение.");
+            }
         }
     });
 
 // =============================================================🔧  Запуск ДИСПЕТЧЕРА воркеров  ===========================================================================
+    
+    let (simulator_tx, simulator_rx) = mpsc::channel::<PoolEventInfo>(2048);
 
-    const NUM_WORKERS: usize = 1;
-    info!("⏳[ MAIN ] Запуск диспетчера воркеров, создали {} воркеров", NUM_WORKERS);
-    let subscriber_clone_for_dispatcher = Arc::clone(&subscriber);
+    const NUM_WORKERS: usize = 20;
+    info!("⏳[ MAIN ] Запуск координатора с {} воркерами", NUM_WORKERS);
 
-    spawn(async move {
-        subscriber_clone_for_dispatcher
-            .start_dispatcher_and_workers(
-                event_rx,
-                dispatcher_graph,
-                dispatcher_provider,
-                NUM_WORKERS,
-            )
-            .await;
-    }); 
+    spawn({
+        let subscriber = Arc::clone(&subscriber);
+        let graph = Arc::clone(&pulling_graph);
+        let provider = Arc::clone(&dispatcher_provider);
+        async move {
+            subscriber
+                .start_coordinator_and_workers(graph, provider, NUM_WORKERS, event_rx, simulator_tx)
+                .await;
+        }
+    });
 
 //==============================================  ЗАПУСТИЛИ СКАНИРОВАНИЕ  =====================================================================================================
 
@@ -403,7 +409,7 @@ info!("[ MAIN ] Мониторинг ликвидности Aave запущен 
         path_builder_clone,
         aave_rx.clone(),
         graph.clone(),
-        arb_event_rx,
+        simulator_rx,
     );
     tokio::spawn(async move {
         info!("[ARB_SIMULATOR] Симулятор арбитража запущен после построения путей");
