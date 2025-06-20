@@ -1,7 +1,7 @@
 use num_traits::identities::Zero;
 use ethers::{
     prelude::*,
-    types::{Address, U512, I256, Bytes},
+    types::{Address, I256, Bytes},
     abi::{self},
 };
 use im::OrdMap;
@@ -89,7 +89,7 @@ async fn process_calls(
     multicall: &Arc<Multicall3<Provider<Ws>>>,
     pool_address: Address,
     tick_spacing: i32,
-    all_ticks: &mut OrdMap<i32, (i128, U512)>,
+    all_ticks: &mut OrdMap<i32, (i128, U256)>,
     non_zero_liquidity: &mut u64,
     word_offset: i16, // Смещение для логирования слов
 ) -> Result<(), Error> {
@@ -100,7 +100,7 @@ async fn process_calls(
     debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG][{:?}] Выполнение мультиколла с {} вызовами", pool_address, calls.len());
     
     // Выполняем мультиколл с таймаутом 20 секунд
-    let results = tokio::time::timeout(Duration::from_secs(20), multicall.aggregate_3(
+    let results = tokio::time::timeout(Duration::from_secs(30), multicall.aggregate_3(
         calls.iter().map(|(target, data)| Call3 {
             target: *target,
             call_data: data.clone(),
@@ -157,7 +157,7 @@ async fn process_calls(
                     if tick.tick % tick_spacing == 0 {
                         all_ticks.insert(
                             tick.tick,
-                            (tick.liquidity_net, U512::from(tick.liquidity_gross)),
+                            (tick.liquidity_net, U256::from(tick.liquidity_gross)),
                         );
                         if tick.liquidity_net != 0 || !tick.liquidity_gross.is_zero() {
                             *non_zero_liquidity += 1;
@@ -191,7 +191,8 @@ pub async fn fetch_active_ticks(
     client: Arc<Provider<Ws>>,
     current_tick: i32,
     fee: u32,
-) -> Result<OrdMap<i32, (i128, U512)>, Error> {
+) -> Result<OrdMap<i32, (i128, U256)>, Error> {
+
     debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG] Начало fetch_active_ticks, pool_address: {:?}, current_tick: {}, fee: {}", pool_address, current_tick, fee);
 
     // Загружаем адреса контрактов
@@ -199,6 +200,7 @@ pub async fn fetch_active_ticks(
     let tick_lens_address: Address = env::var("UNISWAP_TICK_LENS_ADDRESS")?.parse()?; // Адрес TickLens
     let multicall = Arc::new(Multicall3::new(multicall_address, client.clone())); // Экземпляр Multicall3
     let tick_lens = Arc::new(TickLens::new(tick_lens_address, client.clone())); // Экземпляр TickLens
+
     debug!("[UNISWAP_V3_FETH_ACTIVE_BUILD_DEBUG] Multicall3: {:?}, TickLens: {:?}", multicall_address, tick_lens_address);
 
     // Определяем шаг тиков в зависимости от комиссии
@@ -215,10 +217,11 @@ pub async fn fetch_active_ticks(
     let min_tick_word = (-887272 >> 8) as i16; // Минимальное слово тиков
     let max_tick_word = (887272 >> 8) as i16; // Максимальное слово тиков
     let batch_size = 1000; // Размер батча для мультиколлов
+
     debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG] min_tick_word: {}, max_tick_word: {}, batch_size: {}", 
         min_tick_word, max_tick_word, batch_size);
 
-    let mut all_ticks: OrdMap<i32, (i128, U512)> = OrdMap::new(); // Карта для хранения тиков
+    let mut all_ticks: OrdMap<i32, (i128, U256)> = OrdMap::new(); // Карта для хранения тиков
     let mut non_zero_liquidity = 0; // Счетчик тиков с ненулевой ликвидностью
 
     // Подготавливаем вызовы для всех слов

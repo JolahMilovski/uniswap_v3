@@ -133,135 +133,223 @@ abigen!(
 }]"#
 );
 
+lazy_static! {
+    static ref Q96: U256 = U256::from(1) << 96;
+}
 
-/// Функция для расчета текущей цены
+/// Вспомогательная функция для умножения двух U256 с разбиением на старшую и младшую части
+fn full_multiply(a: U256, b: U256) -> (U256, U256) {
+    // Разбиваем a и b на старшие и младшие 128 бит
+    let a_high = a >> 128;
+    let a_low = a & ((U256::from(1) << 128) - U256::from(1));
+    let b_high = b >> 128;
+    let b_low = b & ((U256::from(1) << 128) - U256::from(1));
+
+    // Вычисляем части произведения: a * b = (a_high * 2^128 + a_low) * (b_high * 2^128 + b_low)
+    let low_low = a_low.checked_mul(b_low).expect("Переполнение при умножении младших частей");
+    let high_low = a_high.checked_mul(b_low).expect("Переполнение при умножении старшей и младшей частей");
+    let low_high = a_low.checked_mul(b_high).expect("Переполнение при умножении младшей и старшей частей");
+    let high_high = a_high.checked_mul(b_high).expect("Переполнение при умножении старших частей");
+
+    // Суммируем части с учетом сдвигов
+    let intermediate = low_low
+        .checked_add((high_low << 128).checked_add(low_high << 128).expect("Переполнение промежуточной суммы"))
+        .expect("Переполнение суммы младших частей");
+    let high = high_high
+        .checked_add(high_low >> 128)
+        .expect("Переполнение старшей суммы")
+        .checked_add(low_high >> 128)
+        .expect("Переполнение старшей суммы");
+    let low = intermediate;
+
+    (high, low)
+}
+
+/// Функция для расчета текущей цены, соответствующая Uniswap V3
 pub fn calculate_current_price(
-    sqrt_price: U512,
+    sqrt_price: U256,
     token0_decimals: u8,
     token1_decimals: u8,
-) -> Result<U512, String> {
-    debug!("[ UNISWAP_V3_CCP_DEBUG ] Начало calculate_current_price, sqrt_price: {}, token0_decimals: {}, token1_decimals: {}", sqrt_price, token0_decimals, token1_decimals);
+) -> Result<U256, String> {
+    debug!(
+        "[UNISWAP_V3_CCP_DEBUG] Начало расчета текущей цены, sqrt_price: {}, token0_decimals: {}, token1_decimals: {}",
+        sqrt_price, token0_decimals, token1_decimals
+    );
 
-    // 1. Проверка входных данных
+    // Проверка входных данных
     if sqrt_price.is_zero() {
-        debug!("[ UNISWAP_V3_CCP_DEBUG ] Ошибка: sqrt_price_x96 is zero");
-        return Err("sqrt_price_x96 is zero".into());
+        warn!("[UNISWAP_V3_CCP_WARN] sqrt_price_x96 равен нулю, пропуск пула");
+        return Err("sqrt_price_x96 равен нулю".into());
+    }
+    if token0_decimals > 18 || token1_decimals > 18 {
+        warn!(
+            "[UNISWAP_V3_CCP_WARN] Некорректные decimals, token0: {}, token1: {}, пропуск пула",
+            token0_decimals, token1_decimals
+        );
+        return Err("Некорректные decimals".into());
     }
 
-    // 2. Вычисление с максимальной точностью
-    let sqrt_price_squared = sqrt_price
-        .checked_pow(U512::from(2))
-        .ok_or("Overflow in squaring")?;
-    debug!("[ UNISWAP_V3_CCP_DEBUG ] sqrt_price_squared: {}", sqrt_price_squared);
-
-    // 3. Масштабирование перед делением
-    let scale_factor = U512::from(10).pow(U512::from(token1_decimals.max(token0_decimals) + 18));
-    let scaled_price = sqrt_price_squared
-        .checked_mul(scale_factor)
-        .ok_or("Overflow in scaling")?
-        / (U512::one() << 192);
-    debug!("[ UNISWAP_V3_CCP_DEBUG ] scaled_price: {}", scaled_price);
-
-    // 4. Коррекция decimals
-    let decimals_adjustment = i32::from(token1_decimals) - i32::from(token0_decimals);
-    let final_price = if decimals_adjustment > 0 {
-        scaled_price.checked_mul(U512::from(10).pow(U512::from(decimals_adjustment as u32)))
+    // Вычисление цены: price = (sqrtPriceX96 * sqrtPriceX96) >> 192
+    let (high, low) = full_multiply(sqrt_price, sqrt_price);
+    let price = if high >= (U256::from(1) << 64) {
+        warn!(
+            "[UNISWAP_V3_CCP_WARN] Переполнение при возведении sqrt_price в квадрат, high: {}, пропуск пула",
+            high
+        );
+        return Err("Переполнение при расчете цены".into());
     } else {
-        scaled_price.checked_div(U512::from(10).pow(U512::from((-decimals_adjustment) as u32)))
-    }
-    .ok_or("Overflow in decimals adjustment")?;
-    debug!("[ UNISWAP_V3_CCP_DEBUG ] Конец calculate_current_price, final_price: {}", final_price);
+        // Сдвиг: (high << 256 + low) >> 192 = (high << 64) + (low >> 192)
+        (high << 64)
+            .checked_add(low >> 192)
+            .ok_or_else(|| {
+                warn!("[UNISWAP_V3_CCP_WARN] Переполнение при сдвиге цены, пропуск пула");
+                "Переполнение при сдвиге цены".to_string()
+            })?
+    };
+    debug!("[UNISWAP_V3_CCP_DEBUG] Цена (без корректировки): {}", price);
+
+    // Коррекция decimals
+    let decimals_adjustment = i32::from(token0_decimals) - i32::from(token1_decimals);
+    let final_price = if decimals_adjustment >= 0 {
+        let adjustment = U256::from(10)
+            .checked_pow(U256::from(decimals_adjustment as u32))
+            .ok_or_else(|| {
+                warn!(
+                    "[UNISWAP_V3_CCP_WARN] Переполнение при корректировке decimals, пропуск пула"
+                );
+                "Переполнение при корректировке decimals".to_string()
+            })?;
+        price.checked_mul(adjustment).ok_or_else(|| {
+            warn!(
+                "[UNISWAP_V3_CCP_WARN] Переполнение при корректировке цены, пропуск пула"
+            );
+            "Переполнение при корректировке цены".to_string()
+        })?
+    } else {
+        let adjustment = U256::from(10)
+            .checked_pow(U256::from((-decimals_adjustment) as u32))
+            .ok_or_else(|| {
+                warn!(
+                    "[UNISWAP_V3_CCP_WARN] Переполнение при корректировке decimals, пропуск пула"
+                );
+                "Переполнение при корректировке decimals".to_string()
+            })?;
+        price.checked_div(adjustment).ok_or_else(|| {
+            warn!(
+                "[UNISWAP_V3_CCP_WARN] Недостаток при корректировке цены, пропуск пула"
+            );
+            "Недостаток при корректировке цены".to_string()
+        })?
+    };
+    debug!(
+        "[UNISWAP_V3_CCP_DEBUG] Конец расчета текущей цены, final_price: {}",
+        final_price
+    );
 
     Ok(final_price)
 }
 
-// Q96
-lazy_static! {
-    static ref Q96: U512 = U512::from(1u128) << 96;
-}
+/// Преобразует тик в sqrt_price_x96, соответствующее TickMath.sol
+pub fn tick_to_sqrt_price(tick: i32) -> Result<U256, String> {
+    debug!(
+        "[UNISWAP_V3_SQRT_PRICE_DEBUG] Начало преобразования тика в sqrt_price_x96, тик: {}",
+        tick
+    );
 
-/// Преобразует тик в sqrt_price_x96
-pub fn tick_to_sqrt_price(tick: i32) -> Result<U512, String> {
-    debug!("[ UNISWAP_V3_SQRT_PRICE_DEBUG ] Начало tick_to_sqrt_price, tick: {}", tick);
-
+    // Проверка границ тика
     if tick < -887272 || tick > 887272 {
-        debug!("[ UNISWAP_V3_SQRT_PRICE_DEBUG ] Ошибка: Tick out of bounds, tick: {}", tick);
-        return Err("Tick out of bounds".to_string());
+        warn!(
+            "[UNISWAP_V3_SQRT_PRICE_WARN] Тик вне допустимого диапазона: {}, пропуск пула",
+            tick
+        );
+        return Err("Тик вне допустимого диапазона".to_string());
     }
 
     let abs_tick = tick.unsigned_abs() as u32;
     let mut ratio = if abs_tick & 0x1 != 0 {
-        U512::from_str("0xfffcb933bd6fad37aa2d162d1a594001").unwrap()
+        U256::from_str("0xfffcb933bd6fad37aa2d162d1a594001").map_err(|e| e.to_string())?
     } else {
-        U512::from_str("0x100000000000000000000000000000000").unwrap()
+        U256::from_str("0x100000000000000000000000000000000").map_err(|e| e.to_string())?
     };
-    debug!("[ UNISWAP_V3_SQRT_PRICE_DEBUG ] Начальный ratio: {}", ratio);
 
-    if abs_tick & 0x2 != 0 {
-        ratio = (ratio * U512::from_str("0xfff97272373d413259a46990580e213a").unwrap()) >> 128;
-    }
-    if abs_tick & 0x4 != 0 {
-        ratio = (ratio * U512::from_str("0xfff2e50f5f656932ef12357cf3c7fdcc").unwrap()) >> 128;
-    }
-    if abs_tick & 0x8 != 0 {
-        ratio = (ratio * U512::from_str("0xffe5caca7e10e4e61c3624eaa0941cd0").unwrap()) >> 128;
-    }
-    if abs_tick & 0x10 != 0 {
-        ratio = (ratio * U512::from_str("0xffcb9843d60f6159c9db58835c926644").unwrap()) >> 128;
-    }
-    if abs_tick & 0x20 != 0 {
-        ratio = (ratio * U512::from_str("0xff973b41fa98c081472e6896dfb254c0").unwrap()) >> 128;
-    }
-    if abs_tick & 0x40 != 0 {
-        ratio = (ratio * U512::from_str("0xff2ea16466c96a3843ec78b326b52861").unwrap()) >> 128;
-    }
-    if abs_tick & 0x80 != 0 {
-        ratio = (ratio * U512::from_str("0xfe5dee046a99a2a811c461f1969c3053").unwrap()) >> 128;
-    }
-    if abs_tick & 0x100 != 0 {
-        ratio = (ratio * U512::from_str("0xfcbe86c7900a88aedcffc83b479aa3a4").unwrap()) >> 128;
-    }
-    if abs_tick & 0x200 != 0 {
-        ratio = (ratio * U512::from_str("0xf987a7253ac413176f2b074cf7815e54").unwrap()) >> 128;
-    }
-    if abs_tick & 0x400 != 0 {
-        ratio = (ratio * U512::from_str("0xf3392b0822b70005940c7a398e4b70f3").unwrap()) >> 128;
-    }
-    if abs_tick & 0x800 != 0 {
-        ratio = (ratio * U512::from_str("0xe7159475a2c29b7443b29c7fa6e889d9").unwrap()) >> 128;
-    }
-    if abs_tick & 0x1000 != 0 {
-        ratio = (ratio * U512::from_str("0xd097f3bdfd2022b8845ad8f792aa5825").unwrap()) >> 128;
-    }
-    if abs_tick & 0x2000 != 0 {
-        ratio = (ratio * U512::from_str("0xa9f746462d870fdf8a65dc1f90e061e5").unwrap()) >> 128;
-    }
-    if abs_tick & 0x4000 != 0 {
-        ratio = (ratio * U512::from_str("0x70d869a156d2a1b890bb3df62baf32f7").unwrap()) >> 128;
-    }
-    if abs_tick & 0x8000 != 0 {
-        ratio = (ratio * U512::from_str("0x31be135f97d08fd981231505542fcfa6").unwrap()) >> 128;
-    }
-    if abs_tick & 0x10000 != 0 {
-        ratio = (ratio * U512::from_str("0x9aa508b5b7a84e1c677de54f3e99bc9").unwrap()) >> 128;
-    }
-    if abs_tick & 0x20000 != 0 {
-        ratio = (ratio * U512::from_str("0x5d6af8dedb81196699c329225ee604").unwrap()) >> 128;
-    }
-    if abs_tick & 0x40000 != 0 {
-        ratio = (ratio * U512::from_str("0x2216e584f5fa1ea926041bedfe98").unwrap()) >> 128;
-    }
-    if abs_tick & 0x80000 != 0 {
-        ratio = (ratio * U512::from_str("0x48a170391f7dc42444e8fa2").unwrap()) >> 128;
+    // Константы из TickMath.sol
+    let constants = [
+        ("0xfff97272373d413259a46990580e213a", 0x2),
+        ("0xfff2e50f5f656 sanz932ef12357cf3c7fdcc", 0x4),
+        ("0xffe5caca7e10e4e61c3624eaa0941cd0", 0x8),
+        ("0xffcb9843d60f6159c9db58835c926644", 0x10),
+        ("0xff973b41fa98c081472e6896dfb254c0", 0x20),
+        ("0xff2ea16466c96a3843ec78b326b52861", 0x40),
+        ("0xfe5dee046a99a2a811c461f1969c3053", 0x80),
+        ("0xfcbe86c7900a88aedcffc83b479aa3a4", 0x100),
+        ("0xf987a7253ac413176f2b074cf7815e54", 0x200),
+        ("0xf3392b0822b70005940c7a398e4b70f3", 0x400),
+        ("0xe7159475a2c29b7443b29c7fa6e889d9", 0x800),
+        ("0xd097f3bdfd2022b8845ad8f792aa5825", 0x1000),
+        ("0xa9f746462d870fdf8a65dc1f90e061e5", 0x2000),
+        ("0x70d869a156d2a1b890bb3df62baf32f7", 0x4000),
+        ("0x31be135f97d08fd981231505542fcfa6", 0x8000),
+        ("0x9aa508b5b7a84e1c677de54f3e99bc9", 0x10000),
+        ("0x5d6af8dedb81196699c329225ee604", 0x20000),
+        ("0x2216e584f5fa1ea926041bedfe98", 0x40000),
+        ("0x48a170391f7dc42444e8fa2", 0x80000),
+    ];
+
+    for (constant, bit) in constants.iter() {
+        if abs_tick & bit != 0 {
+            let multiplier = U256::from_str(constant).map_err(|e| e.to_string())?;
+            let (high, low) = full_multiply(ratio, multiplier);
+            if high >= (U256::from(1) << 128) {
+                warn!(
+                    "[UNISWAP_V3_SQRT_PRICE_WARN] Переполнение при умножении ratio, бит: {}, пропуск пула",
+                    bit
+                );
+                return Err("Переполнение при умножении ratio".to_string());
+            }
+            ratio = (high << 128)
+                .checked_add(low >> 128)
+                .ok_or_else(|| {
+                    warn!(
+                        "[UNISWAP_V3_SQRT_PRICE_WARN] Переполнение при сдвиге ratio, пропуск пула"
+                    );
+                    "Переполнение при сдвиге ratio".to_string()
+                })?;
+        }
     }
 
+    // Инверсия только для положительных тиков
     if tick > 0 {
-        ratio = U512::MAX / ratio;
+        ratio = U256::MAX.checked_div(ratio).ok_or_else(|| {
+            warn!(
+                "[UNISWAP_V3_SQRT_PRICE_WARN] Переполнение при инверсии ratio, пропускk пула"
+            );
+            "Переполнение при инверсии ratio".to_string()
+        })?;
+    } else {
+        debug!(
+            "[UNISWAP_V3_SQRT_PRICE_DEBUG] Тик <= 0, инверсия ratio не требуется"
+        );
     }
 
-    let result = ratio >> 32;
-    debug!("[ UNISWAP_V3_SQRT_PRICE_DEBUG ] Конец tick_to_sqrt_price, result: {}", result);
-    Ok(result)
+    // Завершающее вычисление sqrt_price_x96
+    let sqrt_price = (ratio >> 32)
+        .checked_add(if ratio % (U256::from(1) << 32) == U256::zero() {
+            U256::zero()
+        } else {
+            U256::one()
+        })
+        .ok_or_else(|| {
+            warn!(
+                "[UNISWAP_V3_SQRT_PRICE_WARN] Переполнение при финальном расчете sqrt_price, пропуск пула"
+            );
+            "Переполнение при финальном расчете sqrt_price".to_string()
+        })?;
+    debug!(
+        "[UNISWAP_V3_SQRT_PRICE_DEBUG] Конец преобразования тика в sqrt_price_x96, результат: {}",
+        sqrt_price
+    );
+
+    Ok(sqrt_price)
 }
 
 
@@ -565,11 +653,13 @@ pub async fn build_uniswap_v3_pool(
 
     let (liquidity, slot0_result, tick_spacing, max_liquidity_per_tick, fee) =
         process_pool_data(pool_address, pool_contract.into()).await?;
+
     debug!("[ UNISWAP_V3_BUILD_DEBUG ][{:?}] Данные пула получены: liquidity: {}, tick: {}, fee: {}", pool_address, liquidity, slot0_result.1, fee);
 
     let (sqrt_price_x96, tick, _, _, _, _, _) = slot0_result;
 
-    let sqrt_price = U512::from_str(&sqrt_price_x96.to_string()).unwrap_or_default();
+    let sqrt_price: U256 = U256::from_str(&sqrt_price_x96.to_string()).unwrap_or_default();
+
     debug!("[ UNISWAP_V3_BUILD_DEBUG ][{:?}] sqrt_price: {}", pool_address, sqrt_price);
 
     let current_price =
@@ -607,7 +697,7 @@ pub async fn build_uniswap_v3_pool(
         uniswap_tick_lower: tick - tick_spacing,
         uniswap_tick_upper: tick + tick_spacing,
         uniswap_tick_spacing: tick_spacing,
-        uniswap_max_liquidity_per_tick: U512::from(max_liquidity_per_tick),
+        uniswap_max_liquidity_per_tick: U256::from(max_liquidity_per_tick),
         uniswap_fee_tier: fee,
         tick_map,
         is_active: true,
@@ -846,192 +936,7 @@ pub async fn fetch_pool_fee(
     ).await
 }
 
-/*
 
-pub async fn fetch_pool_liquidity(
-    pool_address: H160,
-    pool_contract: &UniswapV3Pool<Provider<Ws>>,
-) -> Option<U512> {
-    debug!("[ UNISWAP_V3_BUILD_DEBUG ] Начало fetch_pool_liquidity, pool_address: {:?}", pool_address);
-           sleep(Duration::from_millis(200)).await;
-
-    let result = pool_contract.liquidity().call().await.ok().map(U512::from);
-    debug!("[ UNISWAP_V3_BUILD_DEBUG ] Конец fetch_pool_liquidity, pool_address: {:?}, result: {:?}", pool_address, result);
-
-    result
-}
-
-pub async fn fetch_pool_slot0(
-    pool_address: H160,
-    pool_contract: &UniswapV3Pool<Provider<Ws>>,
-) -> Option<(ethers::types::U256, i32, u16, u16, u16, u8, bool)> {
-    debug!("[ UNISWAP_V3_BUILD_DEBUG ] Начало fetch_pool_slot0, pool_address: {:?}", pool_address);
-           sleep(Duration::from_millis(200)).await;
-
-    let result = pool_contract.slot_0().call().await.ok();
-    debug!("[ UNISWAP_V3_BUILD_DEBUG ] Конец fetch_pool_slot0, pool_address: {:?}, result: {:?}", pool_address, result);
-
-    result
-}
-
-pub async fn fetch_pool_tick_spacing(
-    pool_address: H160,
-    pool_contract: &UniswapV3Pool<Provider<Ws>>,
-) -> Option<i32> {
-    debug!("[ UNISWAP_V3_BUILD_DEBUG ] Начало fetch_pool_tick_spacing, pool_address: {:?}", pool_address);
-           sleep(Duration::from_millis(200)).await;
-
-    let result = pool_contract.tick_spacing().call().await.ok();
-    debug!("[ UNISWAP_V3_BUILD_DEBUG ] Конец fetch_pool_tick_spacing, pool_address: {:?}, result: {:?}", pool_address, result);
-
-    result
-}
-
-pub async fn fetch_pool_max_liquidity(
-    pool_address: H160,
-    pool_contract: &UniswapV3Pool<Provider<Ws>>,
-) -> Option<u128> {
-    debug!("[ UNISWAP_V3_BUILD_DEBUG ] Начало fetch_pool_max_liquidity, pool_address: {:?}", pool_address);
-           sleep(Duration::from_millis(200)).await;
-
-    let result = pool_contract.max_liquidity_per_tick().call().await.ok();
-    debug!("[ UNISWAP_V3_BUILD_DEBUG ] Конец fetch_pool_max_liquidity, pool_address: {:?}, result: {:?}", pool_address, result);
-
-    result
-}
-
-pub async fn fetch_pool_fee(
-    pool_address: H160,
-    pool_contract: &UniswapV3Pool<Provider<Ws>>,
-) -> Option<u32> {
-    debug!("[ UNISWAP_V3_BUILD_DEBUG ] Начало fetch_pool_fee, pool_address: {:?}", pool_address);
-           sleep(Duration::from_millis(200)).await;
-
-    let result = pool_contract.fee().call().await.ok();
-    debug!("[ UNISWAP_V3_BUILD_DEBUG ] Конец fetch_pool_fee, pool_address: {:?}, result: {:?}", pool_address, result);
-
-    result
-}
- */
-/*
-pub async fn process_pool_data(
-    pool_address: H160,
-    pool_contract: Arc<UniswapV3Pool<Provider<Ws>>>,
-) -> Option<(
-    U512,
-    (ethers::types::U256, i32, u16, u16, u16, u8, bool),
-    i32,
-    u128,
-    u32,
-)> {
-    debug!("[ UNISWAP_V3_PROC_DEBUG ] Начало process_pool_data, pool_address: {:?}", pool_address);
-
-    let liquidity_fut = {
-        let pool_contract = pool_contract.clone();
-        let pool_address = pool_address.clone();
-        async move {
-            debug!("[ UNISWAP_V3_PROC_DEBUG ][{:?}] Запрос liquidity", pool_address);
-            fetch_pool_liquidity(pool_address, &pool_contract).await.map_or_else(
-                || {
-                    warn!(
-                        "[ UNISWAP_V3_PROC_WARN! ] Pool {:?} failed to get liquidity",
-                        pool_address
-                    );
-                    None
-                },
-                Some,
-            )
-        }
-    };
-
-    let slot0_fut = {
-        let pool_contract = pool_contract.clone();
-        let pool_address = pool_address.clone();
-        async move {
-            debug!("[ UNISWAP_V3_PROC_DEBUG ][{:?}] Запрос slot0", pool_address);
-            fetch_pool_slot0(pool_address, &pool_contract).await.map_or_else(
-                || {
-                    warn!("[ UNISWAP_V3_PROC_WARN! ] Pool {:?} failed to get slot0", pool_address);
-                    None
-                },
-                Some,
-            )
-        }
-    };
-
-    let tick_spacing_fut = {
-        let pool_contract = pool_contract.clone();
-        let pool_address = pool_address.clone();
-        async move {
-            debug!("[ UNISWAP_V3_PROC_DEBUG ][{:?}] Запрос tick_spacing", pool_address);
-            fetch_pool_tick_spacing(pool_address, &pool_contract).await.map_or_else(
-                || {
-                    warn!(
-                        "[ UNISWAP_V3_PROC_WARN! ] Pool {:?} failed to get tick spacing",
-                        pool_address
-                    );
-                    None
-                },
-                Some,
-            )
-        }
-    };
-
-    let max_liquidity_fut = {
-        let pool_contract = pool_contract.clone();
-        let pool_address = pool_address.clone();
-        async move {
-            debug!("[ UNISWAP_V3_PROC_DEBUG ][{:?}] Запрос max_liquidity", pool_address);
-            fetch_pool_max_liquidity(pool_address, &pool_contract).await.map_or_else(
-                || {
-                    warn!(
-                        "[ UNISWAP_V3_PROC_WARN! ] Pool {:?} failed to get max liquidity",
-                        pool_address
-                    );
-                    None
-                },
-                Some,
-            )
-        }
-    };
-
-    let fee_fut = {
-        let pool_contract = pool_contract.clone();
-        let pool_address = pool_address.clone();
-        async move {
-            debug!("[ UNISWAP_V3_PROC_DEBUG ][{:?}] Запрос fee", pool_address);
-            fetch_pool_fee(pool_address, &pool_contract).await.map_or_else(
-                || {
-                    warn!("[ UNISWAP_V3_PROC_WARN! ] Pool {:?} failed to get fee", pool_address);
-                    None
-                },
-                Some,
-            )
-        }
-    };
-
-    debug!("[ UNISWAP_V3_PROC_DEBUG ][{:?}] Ожидание завершения всех запросов", pool_address);
-    let (liquidity_option, slot0_option, tick_spacing_option, max_liquidity_option, fee_option) = tokio::join!(
-        liquidity_fut,
-        slot0_fut,
-        tick_spacing_fut,
-        max_liquidity_fut,
-        fee_fut
-    );
-
-    let liquidity = liquidity_option?;
-    let slot0 = slot0_option?;
-    let tick_spacing = tick_spacing_option?;
-    let max_liquidity = max_liquidity_option?;
-    let fee = fee_option?;
-    debug!("[ UNISWAP_V3_PROC_DEBUG ][{:?}] Все данные получены: liquidity: {}, tick: {}, fee: {}", pool_address, liquidity, slot0.1, fee);
-
-    debug!("[ UNISWAP_V3_PROC_DEBUG ] Конец process_pool_data, pool_address: {:?}", pool_address);
-
-    Some((liquidity, slot0, tick_spacing, max_liquidity, fee))
-
-}
- */
 
  
 /// Получает данные пула Uniswap V3 с использованием мультиколла
@@ -1052,7 +957,7 @@ async fn fetch_pool_data_multicall(
     pool_contract: &UniswapV3Pool<Provider<Ws>>,
     provider: Arc<Provider<Ws>>,
 ) -> Option<(
-    U512,
+    U256,
     (U256, i32, u16, u16, u16, u8, bool),
     i32,
     u128,
@@ -1084,7 +989,7 @@ async fn fetch_pool_data_multicall(
     // Логируем успешное выполнение
     debug!("[UNISWAP_V3_MULTICALL_DEBUG] Успешный мультиколл для пула {:?}", pool_address);
     Some((
-        U512::from(result.0), // Конвертируем ликвидность в U512
+        U256::from(result.0), // Конвертируем ликвидность в U256
         result.1, // Данные slot0
         result.2, // tick_spacing
         result.3, // max_liquidity_per_tick
@@ -1108,7 +1013,7 @@ pub async fn process_pool_data(
     pool_address: H160,
     pool_contract: Arc<UniswapV3Pool<Provider<Ws>>>,
 ) -> Option<(
-    U512,
+    U256,
     (ethers::types::U256, i32, u16, u16, u16, u8, bool),
     i32,
     u128,

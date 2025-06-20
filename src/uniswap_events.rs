@@ -12,7 +12,7 @@ use ethers::{abi::RawLog, utils::keccak256};
 use ethers::{
     contract::EthLogDecode,
     providers::{Http, Middleware, Provider, Ws},
-    types::{Address, BlockNumber, Filter, H256, I256, U256, U512},
+    types::{Address, BlockNumber, Filter, H256, I256, U256},
 };
 use ethers_contract::abigen;
 use futures::StreamExt;
@@ -217,11 +217,11 @@ pub struct FlashEvent {
 
 #[derive(Debug, Default, Clone)]
 pub struct EventPoolUpdate {
-    pub liquidity: U512,
+    pub liquidity: U256,
     pub sqrt_price_x96: U256,
     pub current_tick: i32,
-    pub tick_map: OrdMap<i32, (i128, U512)>,
-    pub current_price: U512,
+    pub tick_map: OrdMap<i32, (i128, U256)>,
+    pub current_price: U256,
 }
 
 #[derive(Debug, Clone)]
@@ -655,12 +655,12 @@ impl UniswapEventSubscriber {
 
         debug!("[UNISWAP_EVENT_FETCH_TICK_DEBUG][{:?}] Получено {} результатов тиков", pool_address, tick_results.len());
 
-        let mut tick_map: OrdMap<i32, (i128, U512)> = OrdMap::new();
+        let mut tick_map: OrdMap<i32, (i128, U256)> = OrdMap::new();
         for result in tick_results {
             if let Some((tick, data)) = result {
                 if (data.0 != 0 || data.1 != 0) && tick % tick_spacing == 0 {
                     debug!("[UNISWAP_EVENTS_FETCH_TICK_DEBUG][{:?}] Добавление тика {} в tick_map", pool_address, tick);
-                    tick_map.insert(tick, (data.1, U512::from(data.0)));
+                    tick_map.insert(tick, (data.1, U256::from(data.0)));
                 } else {
                     info!(
                         "[UNISWAP_EVENT_FETCH_TICK][{:?}] Пропущен тик {} (нулевая ликвидность: gross: {}, net: {} или не кратен tick_spacing: {})",
@@ -672,23 +672,24 @@ impl UniswapEventSubscriber {
 
         debug!("[UNISWAP_EVENTS_FETCH_TICK_DEBUG][{:?}] tick_map заполнен: {} тиков", pool_address, tick_map.len());
 
-        let sqrt_price = U512::from(slot0.0);
-        debug!("[UNISWAP_EVENTS_FETCH_TICK_DEBUG][{:?}] sqrt_price: {}", pool_address, sqrt_price);
+
+        let sqrt_price_x96 = U256::from(slot0.1);
+
+        debug!("[UNISWAP_EVENTS_FETCH_TICK_DEBUG][{:?}] sqrt_price: {}", pool_address, sqrt_price_x96);
 
         let current_price = calculate_current_price(
-            sqrt_price,
+            sqrt_price_x96, 
             pool_info.uniswap_token_a_decimals,
             pool_info.uniswap_token_b_decimals,
         )
         .map_err(anyhow::Error::msg)?;
-        debug!("[UNISWAP_EVENTS_FETCH_TICK_DEBUG][{:?}] current_price: {}", pool_address, current_price);
 
         Ok(EventPoolUpdate {
             liquidity,
             sqrt_price_x96: slot0.0,
             current_tick,
             tick_map,
-            current_price,
+            current_price, // Конвертируем U256 в U512
         })
     }
 

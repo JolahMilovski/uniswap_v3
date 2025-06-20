@@ -3,7 +3,7 @@ use crate::uniswap_graph::UniswapPool;
 use crate::uniswap_v3::tick_to_sqrt_price;
 
 use colored::Colorize;
-use ethers::types::{Address, U256, U512};
+use ethers::types::{Address, U256};
 
 use ethers::utils::hex;
 use log::info;
@@ -242,13 +242,15 @@ pub fn simulate_swap_tick_by_tick(
 ) -> Result<(U256, U256), String> {
     let mut sqrt_price_x96 = U256::try_from(pool.uniswap_sqrt_price)
         .map_err(|_| "U512 to U256 conversion failed")?;
+
     let mut liquidity = U256::try_from(pool.uniswap_liquidity)
         .map_err(|_| "U512 to U256 conversion failed")?;
+
     let mut amount_out = U256::zero();
     let fee_pips = pool.uniswap_fee_tier;
     let mut remaining_amount_in = amount_in;
 
-    let tick_iter: Box<dyn Iterator<Item = (&i32, &(i128, U512))>> = if zero_for_one {
+    let tick_iter: Box<dyn Iterator<Item = (&i32, &(i128, U256))>> = if zero_for_one {
         Box::new(pool.tick_map.iter().rev())
     } else {
         Box::new(pool.tick_map.iter())
