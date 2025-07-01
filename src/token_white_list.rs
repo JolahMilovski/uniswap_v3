@@ -1,26 +1,27 @@
 use ethers::types::Address;
 use dashmap::DashSet;
+use tracing::error;
 use std::str::FromStr;
 
 pub const TOKEN_WHITELIST: &[(&str, &str)] = &[
         ("0xba5DdD1f9d7F570dc94a51479a000E3BCE967196", "AAVE",),
-        ("0x2416092f143378750bb29b79ed961ab195cceea5", "ezETH",), 
-        ("0x35751007a407ca6FEFfE80b3cB397736D2cf4dbe", "weETH",),
-        ("0xEC70Dcb4A1EFa46b8F2D97C310C9c4790ba5ffA8", "rETH",),
-        ("0x4186bfc76e2e237523cbc30fd220fe055156b41f", "rsETH",),
-        ("0x17fc002b466eec40dae837fc4be5c67993ddbd6f", "FRAX",),
+  //      ("0x2416092f143378750bb29b79ed961ab195cceea5", "ezETH",), 
+  //      ("0x35751007a407ca6FEFfE80b3cB397736D2cf4dbe", "weETH",),
+  //      ("0xEC70Dcb4A1EFa46b8F2D97C310C9c4790ba5ffA8", "rETH",),
+  //      ("0x4186bfc76e2e237523cbc30fd220fe055156b41f", "rsETH",),
+  //      ("0x17fc002b466eec40dae837fc4be5c67993ddbd6f", "FRAX",),
         ("0x82aF49447D8a07e3bd95BD0d56f35241523fBab1", "WETH",),
-        ("0x912CE59144191C1204E64559FE8253a0e49E6548", "ARB",),
-        ("0xd22a58f79e9481d1a88e00c343885a588b34b68b", "EURS",),
-        ("0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1", "DAI",),
-        ("0x7dff72693f6a4149b17e7c6314655f6a9f7c8b33", "GHO",),
+  //      ("0x912CE59144191C1204E64559FE8253a0e49E6548", "ARB",),
+  //      ("0xd22a58f79e9481d1a88e00c343885a588b34b68b", "EURS",),
+  //      ("0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1", "DAI",),
+  //      ("0x7dff72693f6a4149b17e7c6314655f6a9f7c8b33", "GHO",),
         ("0xf97f4df75117a78c1a5a0dbb814af92458539fb4", "LINK",),
-        ("0x93b346b6bc2548da6a1e7d98e9a421b42541425b", "LUSD",),
+  //      ("0x93b346b6bc2548da6a1e7d98e9a421b42541425b", "LUSD",),
         ("0xaf88d065e77c8cC2239327C5EDb3A432268e5831", "USDC",),
         ("0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9", "USDT",),
         ("0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f", "WBTC",),
-        ("0x5979D7b546E38E414F7E9822514be443A4800529", "WSTETH",),
-        ("0x3F56e0c36d275367b8C502090EDF38289b3dEa0d", "MAI",),
+  //      ("0x5979D7b546E38E414F7E9822514be443A4800529", "WSTETH",),
+  //("0x3F56e0c36d275367b8C502090EDF38289b3dEa0d", "MAI",),
   //("0xd58d345fd9c82262e087d2d0607624b410d88242", "TRB",),
   //("0x37a645648dF29205C6261289983FB04ECD70b4B3", "ANIME",),
   //("0xc87B37a581ec3257B734886d9d3a581F5A9d056c", "ATH",),
@@ -46,8 +47,8 @@ pub const TOKEN_WHITELIST: &[(&str, &str)] = &[
   //("0x1045971c168b5294acbc8727a4f1c9e1af99f6d0", "FTN",),
   //("0x31dba3c96481fde3cd81c2aaf51f2d8bf618c742", "SOPH",),
   //("0xb0eCc6ac0073c063DCFC026cCdC9039Cae2998E1", "AA",),
-  //("0xf0cb2dc0db5e6c66b9a70ac27b06b878da017028","OHM",),
-  //("0xcb8b5cd20bdcaea9a010ac1f8d835824f5c87a04","COW",),
+  //("0xf0cb2dc0db5e6c66b9a70ac27b06b878da017028", "OHM",),
+  //("0xcb8b5cd20bdcaea9a010ac1f8d835824f5c87a04", "COW",),
   //("0x6b2a01a5f79deb4c2f3c0eda7b01df456fbd726a", "UNIBTC",),
   //("0xca4e51f6ad4afd9d1068e5899de9dd7d73f3463d", "AARK",),
   //("0x7C8a1A80FDd00C9Cccd6EbD573E9EcB49BFa2a59", "AICODE",),
@@ -174,7 +175,7 @@ pub const TOKEN_WHITELIST: &[(&str, &str)] = &[
   //("0xe05a08226c49b636acf99c40da8dc6af83ce5bb3", "ANKRETH",),
   //("0xbc011a12da28e8f0f528d9ee5e7039e22f91cf18", "SWETH",),
   //("0x0ce45dd53affbb011884ef1866e0738f58ab7969", "CGETH.H",),
-  //("0x18c14c2d707b2212e17d1579789fc06010cfca23","ETHPlus",),
+  //("0x18c14c2d707b2212e17d1579789fc06010cfca23", "ETHPlus",),
   //("0xe231db5f348d709239ef1741ea30961b3b635a61", "YNETHX",),
   //("0x2e412435928efe43b156caa8f4b1068729fee275", "KING",),
   //("0x848e0ba28b637e8490d88bae51fa99c87116409b", "AGVE",),
@@ -191,7 +192,7 @@ pub fn load_token_whitelist() -> DashSet<Address> {
         if let Ok(address) = Address::from_str(address_str) {
             whitelist.insert(address);
         } else {
-            log::error!("[TOKEN_WHITELIST] Неверный формат адреса: {}", address_str);
+            error!("[TOKEN_WHITELIST] Неверный формат адреса: {}", address_str);
         }
     }
     

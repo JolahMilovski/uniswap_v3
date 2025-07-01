@@ -8,7 +8,7 @@ use std::{
 use colored::Colorize;
 use dashmap::DashMap;
 use ethers::types::Address;
-use log::info;
+use tracing::{debug, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
@@ -39,14 +39,14 @@ pub struct PathBuilder {
 
 impl PathBuilder {
     /// Создает новый экземпляр PathBuilder
-    ////// # Аргументы
+    /// # Аргументы
     /// * `aave_rx` - Receiver для получения обновлений о ликвидности токенов в Aave
-    ////// # Возвращает
+    /// # Возвращает
     /// Новый экземпляр PathBuilder с пустыми путями и токенами из Aave
     pub fn new(aave_rx: watch::Receiver<AaveTokenLiquidity>) -> Self {
-        info!("[{}] Начало создания нового экземпляра PathBuilder",  "UNISWAP_PATH_BUILDER".green());
+        debug!("[{}] Начало создания нового экземпляра PathBuilder",  "UNISWAP_PATH_BUILDER".green());
         let aave_tokens_borrow = aave_rx.borrow().token_address.clone();
-        info!("[{}] Загружено {} токенов из Aave для flash loan", "UNISWAP_PATH_BUILDER".green(), aave_tokens_borrow.len());
+            warn!("[{}] Загружено {} токенов из Aave для flash loan: {:?}", "UNISWAP_PATH_BUILDER".green(), aave_tokens_borrow.len(), aave_tokens_borrow);
         let result = Self {
             aave_tokens: aave_tokens_borrow,
             paths: Vec::new(),
@@ -68,31 +68,31 @@ impl PathBuilder {
     pub fn build_all_paths(&mut self, graph: Arc<UniversalGraph>) {
         info!("[{}] Начало построения всех арбитражных путей", "UNISWAP_PATH_BUILDER".green());
         // Очищаем предыдущие результаты
-        info!("[{}] Очистка предыдущих путей (было {} путей)", "UNISWAP_PATH_BUILDER".green(), self.paths.len());
+        debug!("[{}] Очистка предыдущих путей (было {} путей)", "UNISWAP_PATH_BUILDER".green(), self.paths.len());
         self.paths.clear();
-        info!("[{}] Очистка предыдущих индексов pool_to_paths (было {} записей)", "UNISWAP_PATH_BUILDER".green(), self.pool_to_paths.len());
+        debug!("[{}] Очистка предыдущих индексов pool_to_paths (было {} записей)", "UNISWAP_PATH_BUILDER".green(), self.pool_to_paths.len());
         self.pool_to_paths.clear();
 
         // Строим граф связей между токенами
-        info!("[{}] Построение списка связей между токенами", "UNISWAP_PATH_BUILDER".green(),);
+       // debug!("[{}] Построение списка связей между токенами", "UNISWAP_PATH_BUILDER".green(),);
 
         let related_list = self.build_related_list(&graph);
 
-        info!("[{}] Построено {} связей между токенами", "UNISWAP_PATH_BUILDER".green(), related_list.len());
+        warn!("[{}] Построено {} связей между токенами", "UNISWAP_PATH_BUILDER".green(), related_list.len());
 
         let aave_tokens = self.aave_tokens.clone();
 
-        info!("[{}] Начало поиска путей для {} токенов Aave","UNISWAP_PATH_BUILDER".green(), aave_tokens.len());
+        debug!("[{}] Начало поиска путей для {} токенов Aave","UNISWAP_PATH_BUILDER".green(), aave_tokens.len());
 
         // Для каждого токена из Aave ищем циклические пути арбитража
         for start_token in aave_tokens {
-            info!("[{}] Поиск путей для начального токена {:?}", "UNISWAP_PATH_BUILDER".green(), start_token);
+           // debug!("[{}] Поиск путей для начального токена {:?}", "UNISWAP_PATH_BUILDER".green(), start_token);
             let mut visited_pools = HashSet::new();
             let mut current_path = vec![start_token];
             let mut current_pools = Vec::new();
 
-            // Запускаем рекурсивный поиск путей с 2-4 хопами
-            info!("[{}] Запуск рекурсивного поиска путей для токена {:?}", "UNISWAP_PATH_BUILDER".green(), start_token);
+            // Запускаем рекурсивный поиск путей с 3-4 хопами
+           // debug!("[{}] Запуск рекурсивного поиска путей для токена {:?}", "UNISWAP_PATH_BUILDER".green(), start_token);
             self.search_paths_dual_hops(
                 start_token,
                 start_token,
@@ -102,7 +102,7 @@ impl PathBuilder {
                 &mut current_pools,
                 0,
             );
-            info!("[{}] Завершён поиск путей для токена {:?}", "UNISWAP_PATH_BUILDER".green(), start_token);
+            debug!("[{}] Завершён поиск путей для токена {:?}", "UNISWAP_PATH_BUILDER".green(), start_token);
         }
 
         info!("[{}] Найдено {} арбитражных путей","UNISWAP_PATH_BUILDER".green(), self.paths.len());
@@ -114,6 +114,8 @@ impl PathBuilder {
             info!("[{}] Пути успешно сохранены в arbitrage_paths.json","UNISWAP_PATH_BUILDER".green());
         }
     }
+
+
 
     /// Строит список связей между токенами на основе графа пулов Uniswap
     ///
@@ -130,16 +132,20 @@ impl PathBuilder {
         &self,
         graph: &UniversalGraph,
     ) -> HashMap<Address, Vec<(Address, Address)>> {
-        info!("[{}] Начало построения списка связей между токенами","UNISWAP_PATH_BUILDER".green());
+
+        debug!("[{}] Начало построения списка связей между токенами","UNISWAP_PATH_BUILDER".green());
+
         let mut related_list = HashMap::new();
+
         let pool_count = graph.nodes.len();
-        info!("[{}] Обработка {} пулов из графа", "UNISWAP_PATH_BUILDER".green(), pool_count);
+
+        debug!("[{}] Обработка {} пулов из графа", "UNISWAP_PATH_BUILDER".green(), pool_count);
 
         // Проходим по всем пулам в графе
         for (index, entry) in graph.nodes.iter().enumerate() {
             let pool_address = *entry.key();
             let (token0, token1) = *entry.value();
-            info!("[{}] Пул {}: {:?}, токены: ({:?}, {:?})","UNISWAP_PATH_BUILDER".green(),index + 1, pool_address, token0, token1);
+            trace!("[{}] Пул {}: {:?}, токены: ({:?}, {:?})","UNISWAP_PATH_BUILDER".green(),index + 1, pool_address, token0, token1);
 
             // Добавляем связь token0 -> token1 через данный пул
             related_list
@@ -156,11 +162,13 @@ impl PathBuilder {
           //  info!("[{}] Добавлена обратная связь: токен {:?} -> токен {:?}", "UNISWAP_PATH_BUILDER".green(),token1, token0);
         }
 
-        info!("[{}] Список связей построен, содержит {} токенов","UNISWAP_PATH_BUILDER".green(), related_list.len());
+        warn!("[{}] Список связей построен, содержит {} токенов","UNISWAP_PATH_BUILDER".green(), related_list.len());
 
         related_list
 
     }
+
+
 
     /// Рекурсивная функция для поиска циклических путей арбитража
     /// Ищет пути длиной 3-4 хопа, которые начинаются и заканчиваются одним токеном
@@ -189,10 +197,11 @@ impl PathBuilder {
         current_pools: &mut Vec<Address>,
         current_hops: usize,
     ) {
-        info!(
-            "[{}] Поиск путей: текущий токен {:?}, хопы: {}, путь: {:?}, пулы: {:?}","UNISWAP_PATH_BUILDER".green(),
-            current_token, current_hops, current_path, current_pools
-        );
+        //debug!("[{}] Поиск путей: текущий токен {:?}, хопы: {}, путь: {:?}, пулы: {:?}","UNISWAP_PATH_BUILDER".green(),current_token, current_hops, current_path, current_pools);
+
+         if current_hops >= 4 {
+             return;
+        }
 
         // Проверяем, нашли ли мы валидный циклический путь арбитража
         if (current_hops == 3 || current_hops == 4)
@@ -262,6 +271,8 @@ impl PathBuilder {
         }
     }
 
+
+    
     /// Сохраняет текущее состояние PathBuilder в JSON файл
     ///
     /// # Аргументы
@@ -273,6 +284,7 @@ impl PathBuilder {
     /// # Использование
     /// Позволяет сохранить найденные пути арбитража для последующего анализа
     /// или использования другими компонентами системы
+    /// 
     pub fn save_to_json(
         &self,
         file_path: impl AsRef<Path>,

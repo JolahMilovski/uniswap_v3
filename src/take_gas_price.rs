@@ -2,7 +2,7 @@ use colored::Colorize;
 use ethers::prelude::Provider;
 use ethers::types::U256;
 use ethers_providers::{Http, Middleware};
-use log::info;
+use tracing::info;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;

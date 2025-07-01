@@ -1,7 +1,7 @@
 use dashmap::DashMap;
 use ethers::types::{Address, U256};
 use im::OrdMap;
-use log::{debug, warn};
+use tracing::{debug, warn};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::{serde_as, DeserializeAs, SerializeAs, DisplayFromStr};
 use std::collections::{HashMap, HashSet};
@@ -75,7 +75,7 @@ pub struct UniswapPool {
     #[serde_as(as = "DisplayFromStr")]
     pub uniswap_sqrt_price: U256, // uint160 в Uniswap V3
     #[serde_as(as = "DisplayFromStr")]
-    pub uniswap_current_price: U256, // uint256 в Uniswap V3
+    //pub uniswap_current_price: U256, // uint256 в Uniswap V3
     pub uniswap_tick_current: i32,
     pub uniswap_tick_lower: i32,
     pub uniswap_tick_upper: i32,
@@ -98,7 +98,7 @@ impl UniversalGraph {
             edges: DashMap::new(),
         }
     }
-
+/*
     pub fn add_pool(
         &self,
         uniswap_pool_address: Address,
@@ -111,7 +111,7 @@ impl UniversalGraph {
         uniswap_token_b_symbol: String,
         uniswap_liquidity: U256,
         uniswap_sqrt_price: U256,
-        uniswap_current_price: U256,
+        //uniswap_current_price: U256,
         uniswap_tick_current: i32,
         uniswap_tick_lower: i32,
         uniswap_tick_upper: i32,
@@ -162,7 +162,7 @@ impl UniversalGraph {
                 uniswap_token_b_symbol,
                 uniswap_liquidity,
                 uniswap_sqrt_price,
-                uniswap_current_price,
+                //uniswap_current_price,
                 uniswap_tick_current,
                 uniswap_tick_lower,
                 uniswap_tick_upper,
@@ -176,7 +176,7 @@ impl UniversalGraph {
 
         debug!("UNISWAP_GRAPH: Пул {:?} успешно добавлен", uniswap_pool_address);
     }
-
+ */
     pub fn upsert_pool(&self, new_pool: UniswapPool) {
         debug!(
             "UNISWAP_GRAPH: Обновление/вставка пула {:?}",
@@ -207,7 +207,7 @@ impl UniversalGraph {
 
             existing_pool.uniswap_liquidity = new_pool.uniswap_liquidity;
             existing_pool.uniswap_sqrt_price = new_pool.uniswap_sqrt_price;
-            existing_pool.uniswap_current_price = new_pool.uniswap_current_price;
+            //existing_pool.uniswap_current_price = new_pool.uniswap_current_price;
             existing_pool.uniswap_tick_current = new_pool.uniswap_tick_current;
             existing_pool.is_active = new_pool.is_active;
             existing_pool.tick_map = existing_pool

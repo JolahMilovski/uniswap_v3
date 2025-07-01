@@ -2,7 +2,7 @@ use dashmap::DashMap;
 use ethers::contract::abigen;
 use ethers::prelude::*;
 use ethers::types::Address;
-use log::error;
+use tracing::error;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;

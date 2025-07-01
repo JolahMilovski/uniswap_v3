@@ -7,6 +7,7 @@ use crate::uniswap_graph::UniswapPool;
 use crate::uniswap_graph::UniversalGraph;
 
 use colored::Colorize;
+//use colored::Colorize;
 use dashmap::DashSet;
 use ethers::contract::abigen;
 use ethers::providers::Provider;
@@ -15,7 +16,7 @@ use ethers::types::U256;
 use ethers::types::{Address, U512};
 use ethers_contract::Multicall;
 use ethers_providers::Ws;
-use log::{info, warn, debug};
+use tracing::{info, warn, debug};
 use std::env;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -133,6 +134,40 @@ abigen!(
 }]"#
 );
 
+abigen!(
+    ERC20,
+    r#"[  
+        {
+            "constant": true,
+            "inputs": [],
+            "name": "decimals",
+            "outputs": [{"name": "", "type": "uint8"}],
+            "payable": false,
+            "stateMutability": "view",
+            "type": "function"
+        },
+        {
+            "constant": true,
+            "inputs": [],
+            "name": "symbol",
+            "outputs": [{"name": "", "type": "string"}],
+            "payable": false,
+            "stateMutability": "view",
+            "type": "function"
+        },
+        {
+            "constant": true,
+            "inputs": [{"name": "owner", "type": "address"}],
+            "name": "balanceOf",
+            "outputs": [{"name": "balance", "type": "uint256"}],
+            "payable": false,
+            "stateMutability": "view",
+            "type": "function"
+        }
+    ]"#
+);
+
+
 lazy_static! {
     static ref Q96: U256 = U256::from(1) << 96;
 }
@@ -165,90 +200,6 @@ fn full_multiply(a: U256, b: U256) -> (U256, U256) {
     (high, low)
 }
 
-/// Функция для расчета текущей цены, соответствующая Uniswap V3
-pub fn calculate_current_price(
-    sqrt_price: U256,
-    token0_decimals: u8,
-    token1_decimals: u8,
-) -> Result<U256, String> {
-    debug!(
-        "[UNISWAP_V3_CCP_DEBUG] Начало расчета текущей цены, sqrt_price: {}, token0_decimals: {}, token1_decimals: {}",
-        sqrt_price, token0_decimals, token1_decimals
-    );
-
-    // Проверка входных данных
-    if sqrt_price.is_zero() {
-        warn!("[UNISWAP_V3_CCP_WARN] sqrt_price_x96 равен нулю, пропуск пула");
-        return Err("sqrt_price_x96 равен нулю".into());
-    }
-    if token0_decimals > 18 || token1_decimals > 18 {
-        warn!(
-            "[UNISWAP_V3_CCP_WARN] Некорректные decimals, token0: {}, token1: {}, пропуск пула",
-            token0_decimals, token1_decimals
-        );
-        return Err("Некорректные decimals".into());
-    }
-
-    // Вычисление цены: price = (sqrtPriceX96 * sqrtPriceX96) >> 192
-    let (high, low) = full_multiply(sqrt_price, sqrt_price);
-    let price = if high >= (U256::from(1) << 64) {
-        warn!(
-            "[UNISWAP_V3_CCP_WARN] Переполнение при возведении sqrt_price в квадрат, high: {}, пропуск пула",
-            high
-        );
-        return Err("Переполнение при расчете цены".into());
-    } else {
-        // Сдвиг: (high << 256 + low) >> 192 = (high << 64) + (low >> 192)
-        (high << 64)
-            .checked_add(low >> 192)
-            .ok_or_else(|| {
-                warn!("[UNISWAP_V3_CCP_WARN] Переполнение при сдвиге цены, пропуск пула");
-                "Переполнение при сдвиге цены".to_string()
-            })?
-    };
-    debug!("[UNISWAP_V3_CCP_DEBUG] Цена (без корректировки): {}", price);
-
-    // Коррекция decimals
-    let decimals_adjustment = i32::from(token0_decimals) - i32::from(token1_decimals);
-    let final_price = if decimals_adjustment >= 0 {
-        let adjustment = U256::from(10)
-            .checked_pow(U256::from(decimals_adjustment as u32))
-            .ok_or_else(|| {
-                warn!(
-                    "[UNISWAP_V3_CCP_WARN] Переполнение при корректировке decimals, пропуск пула"
-                );
-                "Переполнение при корректировке decimals".to_string()
-            })?;
-        price.checked_mul(adjustment).ok_or_else(|| {
-            warn!(
-                "[UNISWAP_V3_CCP_WARN] Переполнение при корректировке цены, пропуск пула"
-            );
-            "Переполнение при корректировке цены".to_string()
-        })?
-    } else {
-        let adjustment = U256::from(10)
-            .checked_pow(U256::from((-decimals_adjustment) as u32))
-            .ok_or_else(|| {
-                warn!(
-                    "[UNISWAP_V3_CCP_WARN] Переполнение при корректировке decimals, пропуск пула"
-                );
-                "Переполнение при корректировке decimals".to_string()
-            })?;
-        price.checked_div(adjustment).ok_or_else(|| {
-            warn!(
-                "[UNISWAP_V3_CCP_WARN] Недостаток при корректировке цены, пропуск пула"
-            );
-            "Недостаток при корректировке цены".to_string()
-        })?
-    };
-    debug!(
-        "[UNISWAP_V3_CCP_DEBUG] Конец расчета текущей цены, final_price: {}",
-        final_price
-    );
-
-    Ok(final_price)
-}
-
 /// Преобразует тик в sqrt_price_x96, соответствующее TickMath.sol
 pub fn tick_to_sqrt_price(tick: i32) -> Result<U256, String> {
     debug!(
@@ -273,9 +224,9 @@ pub fn tick_to_sqrt_price(tick: i32) -> Result<U256, String> {
     };
 
     // Константы из TickMath.sol
-    let constants = [
+      let constants = [
         ("0xfff97272373d413259a46990580e213a", 0x2),
-        ("0xfff2e50f5f656 sanz932ef12357cf3c7fdcc", 0x4),
+        ("0xfff2e50f5f656932ef12357cf3c7fdcc", 0x4),
         ("0xffe5caca7e10e4e61c3624eaa0941cd0", 0x8),
         ("0xffcb9843d60f6159c9db58835c926644", 0x10),
         ("0xff973b41fa98c081472e6896dfb254c0", 0x20),
@@ -353,283 +304,6 @@ pub fn tick_to_sqrt_price(tick: i32) -> Result<U256, String> {
 }
 
 
-/*
-
-pub async fn fetch_active_ticks(
-    pool_address: Address,
-    client: Arc<Provider<Ws>>,
-    current_tick: i32,
-    fee: u32,
-) -> Result<OrdMap<i32, (i128, U512)>, anyhow::Error> {
-    debug!("[ UNISWAP_V3_FETH_ACTIVE_DEBUG ] Начало fetch_active_ticks, pool_address: {:?}, current_tick: {}, fee: {}", pool_address, current_tick, fee);
-
-    let tick_lens_address: Address = env::var("UNISWAP_TICK_LENS_ADDRESS")?.parse()?;
-    let tick_lens = Arc::new(TickLens::new(tick_lens_address, client.clone()));
-    debug!("[ UNISWAP_V3_FETH_ACTIVE_BUILD_DEBUG ] TickLens создан, адрес: {:?}", tick_lens_address);
-
-    let tick_spacing = match fee {
-        100 => 1,
-        500 => 10,
-        3000 => 60,
-        10_000 => 200,
-        _ => 0,
-    };
-    debug!("[ UNISWAP_V3_FETH_ACTIVE_DEBUG ] tick_spacing: {}", tick_spacing);
-
-    let current_word = (current_tick >> 8) as i32;
-    let mut total_batches = match fee {
-        100 => 5,
-        500 => 5,
-       3000 => 5,
-     10_000 => 5,
-        _ => 10,
-    };
-    let words_per_batch = match fee {
-        100 => 5,
-        500 => 5,
-       3000 => 5,
-     10_000 => 5,
-        _ => 5,
-    };
-    debug!("[ UNISWAP_V3_FETH_ACTIVE_DEBUG ] current_word: {}, total_batches: {}, words_per_batch: {}", current_word, total_batches, words_per_batch);
-
-    let max_attempts = 1;
-    let mut attempt = 0;
-    let mut all_ticks: OrdMap<i32, (i128, U512)> = OrdMap::new();
-    let mut min_word = current_word - (total_batches * words_per_batch) as i32;
-    let mut max_word = current_word + (total_batches * words_per_batch) as i32;
-    let min_tick_word = -887272 >> 8;
-    let max_tick_word = 887272 >> 8;
-    debug!("[ UNISWAP_V3_FETH_ACTIVE_DEBUG ] min_word: {}, max_word: {}, min_tick_word: {}, max_tick_word: {}", min_word, max_word, min_tick_word, max_tick_word);
-
-    loop {
-        attempt += 1;
-        info!("[ UNISWAP_V3_FETH_ACTIVE ][{:?}] Попытка {}, Tick spacing: {}, Current word: {}, Range: {} to {}",
-            pool_address, attempt, tick_spacing, current_word, min_word, max_word
-        );
-        debug!("[ UNISWAP_V3_FETH_ACTIVE_DEBUG ] Начало попытки {}, pool_address: {:?}", attempt, pool_address);
-
-        let left_active = Arc::new(AtomicUsize::new(0));
-        let right_active = Arc::new(AtomicUsize::new(0));
-        let center_active = Arc::new(AtomicUsize::new(0));
-        let mut set = JoinSet::new();
-        debug!("[ UNISWAP_V3_FETH_ACTIVE_DEBUG ] JoinSet создан для обработки слов");
-
-        // Запрос центрального слова
-        {
-            let tick_lens = tick_lens.clone();
-            let pool_address = pool_address;
-            let center_active = center_active.clone();
-            let tick_spacing = tick_spacing;
-            set.spawn(async move {
-                let mut ticks: OrdMap<i32, (i128, U512)> = OrdMap::new();
-                debug!("[ UNISWAP_V3_FETH_ACTIVE_DEBUG ][{:?}] Запрос центрального слова {}", pool_address, current_word);
-                match tick_lens
-                    .get_populated_ticks_in_word(pool_address, current_word.try_into().unwrap())
-                    .call()
-                    .await
-                {
-                    Ok(list) => {
-                        let count = list.len();
-                        info!("[ UNISWAP_V3_FETH_ACTIVE_DEBUG ][{:?}] Центральное слово {}: получено {} тиков", pool_address, current_word, count);
-                        for tick in &list {
-                            if tick.tick % tick_spacing == 0 {
-                                ticks.insert(
-                                    tick.tick,
-                                    (tick.liquidity_net, U512::from(tick.liquidity_gross)),
-                                );
-                            } else {
-                                info!("[ UNISWAP_V3_FETH_ACTIVE ][{:?}] Пропущен тик {} в центральном слове {} (не кратен tick_spacing: {})",
-                                    pool_address, tick.tick, current_word, tick_spacing
-                                );
-                            }
-                        }
-                        center_active.fetch_add(count, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        warn!(
-                            "[ UNISWAP_V3_FETH_ACTIVE_WARN! ][{:?}] Ошибка для центрального слова {}: {}",
-                            pool_address, current_word, e
-                        );
-                        debug!("[ UNISWAP_V3_FETH_ACTIVE_DEBUG ][{:?}] Ошибка при запросе центрального слова {}: {}", pool_address, current_word, e);
-                    }
-                }
-                debug!("[ UNISWAP_V3_FETH_ACTIVE_DEBUG ][{:?}] Завершение обработки центрального слова, ticks: {}", pool_address, ticks.len());
-                ticks
-            });
-            sleep(Duration::from_millis(100)).await;
-        }
-
-        // Запрос слов слева
-        let left_active_clone = left_active.clone();
-        for batch in 0..total_batches {
-            let base_word = current_word - ((batch * words_per_batch) as i32);
-            let tick_lens = tick_lens.clone();
-            let pool_address = pool_address;
-            let left_active = left_active.clone();
-            let tick_spacing = tick_spacing;
-            set.spawn(async move {
-                let mut ticks: OrdMap<i32, (i128, U512)> = OrdMap::new();
-                for i in 0..words_per_batch {
-                    let word = base_word - (i as i32);
-                    if word < min_word || word >= current_word || word < min_tick_word {
-                        debug!("[ UNISWAP_V3_FETH_ACTIVE_DEBUG ][{:?}] Пропуск левого слова {}: вне диапазона", pool_address, word);
-                        continue;
-                    }
-                    debug!("[ UNISWAP_V3_FETH_ACTIVE_DEBUG ][{:?}] Запрос левого слова {}", pool_address, word);
-                    match tick_lens
-                        .get_populated_ticks_in_word(pool_address, word.try_into().unwrap())
-                        .call()
-                        .await
-                    {
-                        Ok(list) => {
-                            let count = list.len();
-                            debug!("[ UNISWAP_V3_FETH_ACTIVE_DEBUG ][{:?}] Слово {}: получено {} тиков", pool_address, word, count);
-                            for tick in &list {
-                                if tick.tick % tick_spacing == 0 {
-                                    ticks.insert(
-                                        tick.tick,
-                                        (tick.liquidity_net, U512::from(tick.liquidity_gross)),
-                                    );
-                                } else {
-                                    info!(
-                                        "[ UNISWAP_V3_FETH_ACTIVE ][{:?}] Пропущен тик {} в левом слове {} (не кратен tick_spacing: {})",
-                                        pool_address, tick.tick, word, tick_spacing
-                                    );
-                                }
-                            }
-                            left_active.fetch_add(count, Ordering::Relaxed);
-                        }
-                        Err(e) => {
-                            warn!(
-                                "[ UNISWAP_V3_FETH_ACTIVE_WARN! ][{:?}] Ошибка для левого слова {}: {}",
-                                pool_address, word, e
-                            );
-                            debug!("[ UNISWAP_V3_FETH_ACTIVE_DEBUG ][{:?}] Ошибка при запросе левого слова {}: {}", pool_address, word, e);
-                        }
-                    }
-                    sleep(Duration::from_millis(300)).await;
-                }
-                debug!("[ UNISWAP_V3_FETH_ACTIVE_DEBUG ][{:?}] Завершение обработки левого батча, ticks: {}", pool_address, ticks.len());
-                ticks
-            });
-            sleep(Duration::from_millis(300)).await;
-        }
-
-        // Запрос слов справа
-        let right_active_clone = right_active.clone();
-        for batch in 0..total_batches {
-            let base_word = current_word + ((batch * words_per_batch) as i32);
-            let tick_lens = tick_lens.clone();
-            let pool_address = pool_address;
-            let right_active = right_active.clone();
-            let tick_spacing = tick_spacing;
-            set.spawn(async move {
-                let mut ticks: OrdMap<i32, (i128, U512)> = OrdMap::new();
-                for i in 0..words_per_batch {
-                    let word = base_word + (i as i32);
-                    if word > max_word || word <= current_word || word > max_tick_word {
-                        debug!("[ UNISWAP_V3_FETH_ACTIVE_DEBUG ][{:?}] Пропуск правого слова {}: вне диапазона", pool_address, word);
-                        continue;
-                    }
-                    debug!("[ UNISWAP_V3_FETH_ACTIVE_DEBUG ][{:?}] Запрос правого слова {}", pool_address, word);
-                    match tick_lens
-                        .get_populated_ticks_in_word(pool_address, word.try_into().unwrap())
-                        .call()
-                        .await
-                    {
-                        Ok(list) => {
-                            let count = list.len();
-                            debug!("[ UNISWAP_V3_FETH_ACTIVE_DEBUG ][{:?}] Слово {}: получено {} тиков", pool_address, word, count);
-                            for tick in &list {
-                                if tick.tick % tick_spacing == 0 {
-                                    ticks.insert(
-                                        tick.tick,
-                                        (tick.liquidity_net, U512::from(tick.liquidity_gross)),
-                                    );
-                                } else {
-                                    info!(
-                                        "[ UNISWAP_V3_FETH_ACTIVE ][{:?}] Пропущен тик {} в правом слове {} (не кратен tick_spacing: {})",
-                                        pool_address, tick.tick, word, tick_spacing
-                                    );
-                                }
-                            }
-                            right_active.fetch_add(count, Ordering::Relaxed);
-                        }
-                        Err(e) => {
-                            warn!(
-                                "[ UNISWAP_V3_FETH_ACTIVE_WARN! ][{:?}] Ошибка для правого слова {}: {}",
-                                pool_address, word, e
-                            );
-                            debug!("[ UNISWAP_V3_FETH_ACTIVE_DEBUG ][{:?}] Ошибка при запросе правого слова {}: {}", pool_address, word, e);
-                        }
-                    }
-                    sleep(Duration::from_millis(300)).await;
-                }
-                debug!("[ UNISWAP_V3_FETH_ACTIVE_DEBUG ][{:?}] Завершение обработки правого батча, ticks: {}", pool_address, ticks.len());
-                ticks
-            });
-            sleep(Duration::from_millis(300)).await;
-        }
-
-        // Собираем все тики
-        debug!("[ UNISWAP_V3_FETH_ACTIVE_DEBUG ][{:?}] Ожидание завершения JoinSet", pool_address);
-        while let Some(Ok(partial)) = set.join_next().await {
-            all_ticks = all_ticks.union(partial);
-            debug!("[ UNISWAP_V3_FETH_ACTIVED_DEBUG ][{:?}] Добавлено тиков из батча, текущий размер all_ticks: {}", pool_address, all_ticks.len());
-        }
-
-        // Подсчёт тиков с ненулевой ликвидностью
-        let non_zero_liquidity: usize = all_ticks
-            .iter()
-            .filter(|(_, (liquidity_net, liquidity_gross))| {
-                *liquidity_net != 0 || !liquidity_gross.is_zero()
-            })
-            .count();
-        debug!("[ UNISWAP_V3_FETH_ACTIVE_DEBUG ][{:?}] non_zero_liquidity: {}", pool_address, non_zero_liquidity);
-
-        // Проверяем, пуста ли тиковая карта
-        if all_ticks.is_empty() && attempt < max_attempts {
-            info!(
-                "[UNISWAP_V3_СИНХРОНИЗАЦИЯ][{:?}] Пустая тиковая карта, расширяем диапазон (попытка {})",
-                pool_address, attempt
-            );
-            total_batches = match fee {
-                   100 => 1 * (attempt + 1) as usize,
-                   500 => 1 * (attempt + 1) as usize,
-                  3000 => 1 * (attempt + 1) as usize,
-                10_000 => 1 * (attempt + 1) as usize,
-                _ => 10,
-            };
-            min_word = min_word - (total_batches * words_per_batch) as i32;
-            max_word = max_word + (total_batches * words_per_batch) as i32;
-            min_word = min_word.max(min_tick_word);
-            max_word = max_word.min(max_tick_word);
-            debug!("[ UNISWAP_V3_FETH_ACTIVE_DEBUG ][{:?}] Пустая тиковая карта, новый диапазон: {} to {}", pool_address, min_word, max_word);
-            continue;
-        }
-
-        if all_ticks.is_empty() {
-            warn!(
-                "[ UNISWAP_V3_FETH_ACTIVE ][{:?}] Пустая тиковая карта после {} попыток: fee: {}, current_tick: {}, word_range: {} to {}",
-                pool_address, attempt, fee, current_tick, min_word, max_word
-            );
-        } else {
-            info!(
-                "[ UNISWAP_V3_FETH_ACTIVE ][{:?}] Тиковая карта заполнена после {} попыток: fee: {}, current_tick: {}, word_range: {} to {}, total_ticks: {}, non_zero_liquidity: {}, left_ticks: {}, right_ticks: {}, center_ticks: {}",
-                pool_address, attempt, fee, current_tick, min_word, max_word, all_ticks.len(), non_zero_liquidity,
-                left_active_clone.load(Ordering::Relaxed), right_active_clone.load(Ordering::Relaxed), center_active.load(Ordering::Relaxed)
-            );
-        }
-        debug!("[ UNISWAP_V3_FETH_ACTIVE_DEBUG ][{:?}] Конец попытки {}, all_ticks: {}", pool_address, attempt, all_ticks.len());
-        break;
-    }
-
-    debug!("[ UNISWAP_V3_FETH_ACTIVE_DEBUG ] Конец fetch_active_ticks, pool_address: {:?}, all_ticks: {}", pool_address, all_ticks.len());
-    Ok(all_ticks)
-}
- */
- 
 pub async fn build_uniswap_v3_pool(
     pool_address: Address,
     tokens: (Address, Address),
@@ -646,40 +320,173 @@ pub async fn build_uniswap_v3_pool(
         get_single_token_data(token_b, provider.clone(), token_cache)
     )
     .ok()?;
-    info!("[ UNISWAP_V3_BUILD_DEBUG ][{:?}] Данные токенов получены: token_a: {}, token_b: {}", pool_address, token_a_info.symbol, token_b_info.symbol);
+    info!("[ UNISWAP_V3_BUILD_DEBUG ][{:?}] ДАННЫЕ ТОКЕНОВ ПУЛА: token_a: {}, token_b: {}", pool_address, token_a_info.symbol, token_b_info.symbol);
+
+    // Проверка decimals
+    if token_a_info.decimals == 0 || token_a_info.decimals > 18 || token_b_info.decimals == 0 || token_b_info.decimals > 18 {
+        warn!("[UNISWAP_V3_GRAPH_BUILDER][{:?}] Некорректные decimals: token_a_decimals={}, token_b_decimals={}", pool_address, token_a_info.decimals, token_b_info.decimals);
+        return None;
+    }
 
     // Получаем данные пула
     let pool_contract = UniswapV3Pool::new(pool_address, provider.clone());
 
     let (liquidity, slot0_result, tick_spacing, max_liquidity_per_tick, fee) =
-        process_pool_data(pool_address, pool_contract.into()).await?;
+        process_pool_data(pool_address, pool_contract.clone().into()).await?;
 
     debug!("[ UNISWAP_V3_BUILD_DEBUG ][{:?}] Данные пула получены: liquidity: {}, tick: {}, fee: {}", pool_address, liquidity, slot0_result.1, fee);
 
     let (sqrt_price_x96, tick, _, _, _, _, _) = slot0_result;
 
-    let sqrt_price: U256 = U256::from_str(&sqrt_price_x96.to_string()).unwrap_or_default();
+    // Проверка нулевых данных
+    if liquidity.is_zero() {
+        warn!("[UNISWAP_V3_GRAPH_BUILDER][{:?}] Пропуск пула: нулевая ликвидность", pool_address);
+        return None;
+    }
+    if sqrt_price_x96.is_zero() {
+        warn!("[UNISWAP_V3_GRAPH_BUILDER][{:?}] Пропуск пула: нулевая sqrt_price_x96", pool_address);
+        return None;
+    }
+    if tick_spacing <= 0 {
+        warn!("[UNISWAP_V3_GRAPH_BUILDER][{:?}] Некорректный tick_spacing: {}", pool_address, tick_spacing);
+        return None;
+    }
 
-    debug!("[ UNISWAP_V3_BUILD_DEBUG ][{:?}] sqrt_price: {}", pool_address, sqrt_price);
+    // Добавляем дебаг-лог до преобразования
+    debug!("[ UNISWAP_V3_BUILD_DEBUG ][{:?}] Raw sqrt_price_x96 from slot0: {:?}", pool_address, sqrt_price_x96);
+/*
 
-    let current_price =
-        calculate_current_price(sqrt_price, token_a_info.decimals, token_b_info.decimals).ok()?;
-    debug!("[ UNISWAP_V3_BUILD_DEBUG ][{:?}] current_price: {}", pool_address, current_price);
+проверка наличие 1 токена соответственно децимал из sqrt_price_x96 по пулу
 
+// Минимальные пороги для токенов в их базовых единицах
+let min_amount_a = U256::exp10(token_a_info.decimals as usize); // 1.0 токена A
+let min_amount_b = U256::exp10(token_b_info.decimals as usize); // 1.0 токена B
+
+// Проверка порядка токенов
+let zero_for_one = token_a < token_b;
+
+// Точный расчёт эквивалентных сумм токенов
+let q96 = *Q96; // Используем lazy_static константу
+let tick_lower = tick - tick_spacing;
+let tick_upper = tick + tick_spacing;
+
+// Проверка тиков
+if tick_lower < -887272 || tick_lower > 887272 || tick_upper < -887272 || tick_upper > 887272 {
+    warn!("[UNISWAP_V3_GRAPH_BUILDER][{:?}] Некорректные тики: tick_lower={}, tick_upper={}", pool_address, tick_lower, tick_upper);
+    return None;
+}
+
+// Преобразуем тики в sqrt_price
+let sqrt_price_lower = tick_to_sqrt_price(tick_lower).ok()?;
+let sqrt_price_upper = tick_to_sqrt_price(tick_upper).ok()?;
+
+// Проверяем порядок цен
+let (sqrt_price_lower, sqrt_price_upper) = if sqrt_price_lower < sqrt_price_upper {
+    (sqrt_price_lower, sqrt_price_upper)
+} else {
+    (sqrt_price_upper, sqrt_price_lower)
+};
+
+// Расчёт сумм токенов
+let (amount_a, amount_b) = if zero_for_one {
+    // Для zero_for_one = true (токен A -> токен B)
+    let amount_a = if sqrt_price_x96 >= sqrt_price_lower && sqrt_price_x96 <= sqrt_price_upper {
+        let inv_sqrt_price_x96 = U512::from(q96)
+        .checked_mul(U512::from(q96))
+        .and_then(|x| x.checked_div(U512::from(sqrt_price_x96)))
+        .map(|x| U256::try_from(x).unwrap_or(U256::zero()))
+        .unwrap_or(U256::zero());
+    let inv_sqrt_price_upper = U512::from(q96)
+    .checked_mul(U512::from(q96))
+    .and_then(|x| x.checked_div(U512::from(sqrt_price_upper)))
+    .map(|x| U256::try_from(x).unwrap_or(U256::zero()))
+    .unwrap_or(U256::zero());
+let delta_price = inv_sqrt_price_x96
+.checked_sub(inv_sqrt_price_upper)
+.unwrap_or(U256::zero());
+U512::from(liquidity)
+.checked_mul(U512::from(delta_price))
+.and_then(|x| x.checked_div(U512::from(q96)))
+.map(|x| U256::try_from(x).unwrap_or(U256::zero()))
+.unwrap_or(U256::zero())
+} else {
+    U256::zero()
+};
+let amount_b = if sqrt_price_x96 >= sqrt_price_lower && sqrt_price_x96 <= sqrt_price_upper {
+    let delta_price = sqrt_price_x96
+    .checked_sub(sqrt_price_lower)
+    .unwrap_or(U256::zero());
+U512::from(liquidity)
+.checked_mul(U512::from(delta_price))
+.and_then(|x| x.checked_div(U512::from(q96)))
+.map(|x| U256::try_from(x).unwrap_or(U256::zero()))
+.unwrap_or(U256::zero())
+} else {
+    U256::zero()
+};
+(amount_a, amount_b)
+} else {
+    // Для zero_for_one = false (токен B -> токен A)
+    let amount_b = if sqrt_price_x96 >= sqrt_price_lower && sqrt_price_x96 <= sqrt_price_upper {
+        let inv_sqrt_price_x96 = U512::from(q96)
+        .checked_mul(U512::from(q96))
+        .and_then(|x| x.checked_div(U512::from(sqrt_price_x96)))
+        .map(|x| U256::try_from(x).unwrap_or(U256::zero()))
+        .unwrap_or(U256::zero());
+    let inv_sqrt_price_lower = U512::from(q96)
+    .checked_mul(U512::from(q96))
+    .and_then(|x| x.checked_div(U512::from(sqrt_price_lower)))
+    .map(|x| U256::try_from(x).unwrap_or(U256::zero()))
+    .unwrap_or(U256::zero());
+let delta_price = inv_sqrt_price_lower
+.checked_sub(inv_sqrt_price_x96)
+.unwrap_or(U256::zero());
+U512::from(liquidity)
+.checked_mul(U512::from(delta_price))
+.and_then(|x| x.checked_div(U512::from(q96)))
+.map(|x| U256::try_from(x).unwrap_or(U256::zero()))
+.unwrap_or(U256::zero())
+} else {
+    U256::zero()
+};
+let amount_a = if sqrt_price_x96 >= sqrt_price_lower && sqrt_price_x96 <= sqrt_price_upper {
+    let delta_price = sqrt_price_upper
+    .checked_sub(sqrt_price_x96)
+    .unwrap_or(U256::zero());
+U512::from(liquidity)
+.checked_mul(U512::from(delta_price))
+.and_then(|x| x.checked_div(U512::from(q96)))
+.map(|x| U256::try_from(x).unwrap_or(U256::zero()))
+.unwrap_or(U256::zero())
+} else {
+    U256::zero()
+};
+(amount_a, amount_b)
+};
+
+// Проверка ликвидности по обоим токенам
+if amount_a < min_amount_a && amount_b < min_amount_b {
+    warn!(
+        "[UNISWAP_V3_GRAPH_BUILDER][{:?}] Пропуск пула: низкая ликвидность (amount_a={} < {}, amount_b={} < {})",
+        pool_address, amount_a, min_amount_a, amount_b, min_amount_b
+    );
+    return None;
+}
+*/
+
+    // Тиковая карта
     let tick_map = fetch_active_ticks(pool_address, provider.clone(), slot0_result.1, fee)
         .await
         .ok()?;
     info!("[ UNISWAP_V3_BUILD_DEBUG ][{:?}] tick_map получен, размер: {}", pool_address, tick_map.len());
 
-    // Проверяем, что тиковая карта не пуста
     if tick_map.is_empty() {
         warn!(
-            "[UNISWAP_V3_GRAPH_BUILDER][{:?}] Пропуск пула: пустая тиковая карта ))",
+            "[UNISWAP_V3_GRAPH_BUILDER][{:?}] Пропуск пула: пустая тиковая карта",
             pool_address
         );
         return None;
     }
-    
 
     let pool = UniswapPool {
         uniswap_pool_address: pool_address,
@@ -691,8 +498,7 @@ pub async fn build_uniswap_v3_pool(
         uniswap_token_b_decimals: token_b_info.decimals,
         uniswap_token_b_symbol: token_b_info.symbol,
         uniswap_liquidity: liquidity,
-        uniswap_sqrt_price: sqrt_price,
-        uniswap_current_price: current_price,
+        uniswap_sqrt_price: sqrt_price_x96,
         uniswap_tick_current: tick,
         uniswap_tick_lower: tick - tick_spacing,
         uniswap_tick_upper: tick + tick_spacing,
@@ -702,10 +508,11 @@ pub async fn build_uniswap_v3_pool(
         tick_map,
         is_active: true,
     };
-    debug!("[ UNISWAP_V3_BUILD_DEBUG ] Конец build_uniswap_v3_pool, pool_address: {:?}", pool_address);
 
+    debug!("[ UNISWAP_V3_BUILD_DEBUG ] Конец build_uniswap_v3_pool, pool_address: {:?}", pool_address);
     Some(pool)
 }
+
 
 
 
@@ -719,7 +526,7 @@ pub async fn sync_pools(
     token_whitelist: &DashSet<Address>,
     event_subscriber: Arc<UniswapEventSubscriber>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    debug!("[ UNISWAP_V3_SYNC_POOL_DEBUG ] Начало sync_pools");
+    info!("[ UNISWAP_V3_SYNC_POOL_DEBUG ] Начало sync_pools");
 
     let save_per_pool = env::var("SAVE_GRAPH_PER_POOL")
         .map(|v| v == "true")
@@ -729,6 +536,7 @@ pub async fn sync_pools(
         pool_cache.pool_addresses.clone(),
         pool_cache.pool_addresses.len(),
     );
+
     info!("[ UNISWAP_V3_SYNC_POOL ] Начинаем обработку {} пулов из кэша", original_count);
     debug!("[ UNISWAP_V3_SYNC_POOL_DEBUG ] original_count: {}", original_count);
 
@@ -739,10 +547,7 @@ pub async fn sync_pools(
         debug!("[ UNISWAP_V3_SYNC_POOL_DEBUG ][{:?}] >>>>> Старт обработки пула ", current_addresses);
 
         let pool_contract = UniswapV3Pool::new(current_addresses, provider.clone());
-
-                // Проверка валидности пула
-      
-
+         
         let token0 = match pool_contract.token_0().call().await {
             Ok(t) => t,
             Err(e) => {
@@ -751,7 +556,7 @@ pub async fn sync_pools(
             }
         };
 
-        sleep(Duration::from_millis(100)).await;
+        //sleep(Duration::from_millis(100)).await;
 
         let token1 = match pool_contract.token_1().call().await {
             Ok(t) => t,
@@ -772,7 +577,7 @@ pub async fn sync_pools(
             ).await {
                 Some(pool) => {
                     debug!("[ UNISWAP_V3_SYNC_POOL_DEBUG ][{:?}] Пул построен: {:?}", current_addresses, pool.uniswap_pool_address);
-                    sleep(Duration::from_millis(222)).await;
+                    //sleep(Duration::from_millis(222)).await;
 
                     if pool.is_active {
                         graph.upsert_pool(pool.clone());
@@ -821,21 +626,8 @@ pub async fn sync_pools(
     Ok(())
 }
 
-/*
 
-pub async fn fetch_tick_spacing(
-    pool_address: H160,
-    provider: Arc<Provider<Ws>>) -> Option<i32> {
-    debug!("[ UNISWAP_V3_BUILD_DEBUG ] Начало fetch_tick_spacing, pool_address: {:?}", pool_address);
 
-    let pool_contract = UniswapV3Pool::new(pool_address, provider.clone());
-
-    let result = pool_contract.tick_spacing().call().await.ok();
-    debug!("[ UNISWAP_V3_BUILD_DEBUG ] Конец fetch_tick_spacing, pool_address: {:?}, result: {:?}", pool_address, result);
-
-    result
-}
-*/
 
 // Универсальная retry-обёртка
 pub async fn retry_async<T, F, Fut>(mut f: F, retries: usize, delay_ms: u64) -> Option<T>
@@ -868,7 +660,7 @@ pub async fn fetch_pool_liquidity(
             pool_contract.liquidity().call().await.ok().map(U512::from)
         },
         5,
-        300,
+        30,
     ).await
 }
 
@@ -884,7 +676,7 @@ pub async fn fetch_pool_slot0(
             pool_contract.slot_0().call().await.ok()
         },
         5,
-        300,
+        30,
     ).await
 }
 
@@ -900,7 +692,7 @@ pub async fn fetch_pool_tick_spacing(
             pool_contract.tick_spacing().call().await.ok()
         },
         5,
-        300,
+        30,
     ).await
 }
 
@@ -916,7 +708,7 @@ pub async fn fetch_pool_max_liquidity(
             pool_contract.max_liquidity_per_tick().call().await.ok()
         },
         5,
-        300,
+        30,
     ).await
 }
 
@@ -932,7 +724,7 @@ pub async fn fetch_pool_fee(
             pool_contract.fee().call().await.ok()
         },
         5,
-        300,
+        30,
     ).await
 }
 
