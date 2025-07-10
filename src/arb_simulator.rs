@@ -1,17 +1,14 @@
 use crate::{
     aave_v3_flash_monitor::AaveTokenLiquidity,
-    arb_scanner::simulate_path_swap,
+    arb_scanner::calculate_aave_borrow_amount,
     path_builder::PathBuilder,
     uniswap_events::PoolEventInfo,
     uniswap_graph::{UniswapPool, UniversalGraph},
 };
 
-use ethers::types::U256;
 use tracing::{debug, error, info, warn};
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use tokio::sync::{mpsc, watch};
-
-
 
 /// # Симулятор арбитража
 /// 
@@ -76,24 +73,21 @@ impl ArbitrageSimulator {
     /// 2. **Инкремент счетчика** - Присваивает уникальный ID событию
     /// 3. **Получение ликвидности** - Читает актуальные данные Aave
     /// 4. **Поиск путей** - Находит все предвычисленные пути для данного пула
-    /// 5. **Симуляция каждого пути**:
+    /// 5. **Расчет суммы заимствования**:
     ///    - Построение цепочки пулов
-    ///    - Определение стартового токена и суммы
-    ///    - Выполнение симуляции свопа
-    ///    - Расчет потенциальной прибыли
-    /// 6. **Логирование результатов** - Выводит информацию о прибыльных возможностях
+    ///    - Определение стартового токена
+    ///    - Расчет необходимой суммы заимствования из Aave для достижения минимальной прибыли
+    /// 6. **Логирование результатов** - Выводит информацию о необходимой сумме заимствования
     /// 
     /// ## Обработка ошибок:
     /// - Предупреждения для отсутствующих пулов в графе
-    /// - Логирование ошибок симуляции
+    /// - Логирование ошибок расчета
     /// - Информирование об отсутствии путей для пула
     pub async fn run(&mut self) {
-
         info!("[ UNISWAP_ARB_SIMULATOR ] Запуск симулятора арбитража");
 
         // Основной цикл обработки событий от пулов
         while let Some(event) = self.event_rx.recv().await {
-            
             // Присваиваем уникальный ID каждому событию для отслеживания
             let event_id = self.event_counter.fetch_add(1, Ordering::SeqCst);
             
@@ -119,90 +113,72 @@ impl ArbitrageSimulator {
 
                 // Обрабатываем каждый найденный путь
                 for &path_index in path_indices.value() {
-                    debug!("[ UNISWAP_ARB_SIMULATOR event:{}] Обработка пути с индексом {}", event_id, path_index);
+                    debug!("[ UNISWAP_ARB_SIMULATOR event:{} path_index:{}] Обработка пути с индексом {}", event_id, path_index, path_index);
 
                     // Получаем детали пути по индексу
                     if let Some(path) = self.path_builder.paths.get(path_index) {
-                        debug!("[ UNISWAP_ARB_SIMULATOR event:{}] Путь найден: pools={:?}, tokens={:?}", event_id, path.pools, path.tokens);
+                        debug!("[ UNISWAP_ARB_SIMULATOR event:{} path_index:{}] Путь найден: pools={:?}, tokens={:?}", event_id, path_index, path.pools, path.tokens);
 
-                        // Строим вектор объектов пулов для симуляции
+                        // Строим вектор объектов пулов для расчета
                         let mut pool_path: Vec<UniswapPool> = Vec::new();
                         for pool_addr in &path.pools {
                             if let Some(pool) = self.graph.edges.get(pool_addr) {
-                                debug!("[ UNISWAP_ARB_SIMULATOR event:{}] Пул добавлен в путь: {:?}", event_id, pool_addr);
+                                debug!("[ UNISWAP_ARB_SIMULATOR event:{} path_index:{}] Пул добавлен в путь: {:?}", event_id, path_index, pool_addr);
                                 pool_path.push(pool.clone());
                             } else {
-                                warn!("[ UNISWAP_ARB_SIMULATOR event:{}] Пул {:?} не найден в графе", event_id, pool_addr);
+                                warn!("[ UNISWAP_ARB_SIMULATOR event:{} path_index:{}] Пул {:?} не найден в графе", event_id, path_index, pool_addr);
+                                continue;
                             }
-
                         }
 
-                        // Определяем стартовый токен (первый в цепочке) и тестовую сумму
+                        // Определяем стартовый токен (первый в цепочке)
                         let start_token = path.tokens.first().copied().unwrap_or_default();
 
-
-
+                        // Проверяем наличие ликвидности Aave для стартового токена
                         let aave_liquidity = self.aave_liquidity_rx.borrow().clone();
-                        let start_amount = match aave_liquidity.token_info.get(&start_token) {
-                            Some((_, liquidity)) => *liquidity,
-                            None => {
-                                error!(
-                                    "[ UNISWAP_ARB_SIMULATOR event:{}] Ликвидность для флеш-лоана недоступна для токена {:?}. Остановка бота.",
-                                    event_id, start_token
-                                );
-                                std::process::exit(1); // Завершаем программу
-                            }
-                        };
-
-                        debug!(
-                            "[ UNISWAP_ARB_SIMULATOR event:{}] Стартовая сумма для токена {:?}: {}",
-                            event_id, start_token, start_amount
-                        );
-
-                        // Выполняем симуляцию арбитражного свопа
-                        let result = simulate_path_swap(&pool_path, start_amount, start_token, &aave_liquidity);
-
-                        // Анализируем результат симуляции
-                        if let Ok(Some((profit, _route))) = result {
-                            if profit > U256::zero() {
-                                // Найдена прибыльная возможность!
-                                info!(
-                                    "[ UNISWAP_ARB_SIMULATOR event:{}] 💰 PROFIT: {} {} на пути {:?}",
-                                    event_id,
-                                    profit,
-                                    start_token,
-                                    path.tokens
-                                );
-                            } else {
-                                // Путь не прибыльный в текущих условиях
-                                debug!(
-                                    "[ UNISWAP_ARB_SIMULATOR event:{}] ➖ Без профита: {} {} на пути {:?}",
-                                    event_id,
-                                    profit,
-                                    start_token,
-                                    path.tokens
-                                );
-                            }
-                        } else if let Err(err) = result {
-                            // Ошибка при симуляции (недостаточная ликвидность, неверные параметры и т.д.)
-                            warn!(
-                                "[ UNISWAP_ARB_SIMULATOR event:{}] Ошибка симуляции: {} для пути {:?}",
-                                event_id,
-                                err,
-                                path.tokens
+                        if aave_liquidity.token_info.get(&start_token).is_none() {
+                            error!(
+                                "[ UNISWAP_ARB_SIMULATOR event:{} path_index:{}] Ликвидность для флеш-лоана недоступна для токена {:?}",
+                                event_id, path_index, start_token
                             );
+                            continue;
+                        }
+
+                        // Рассчитываем необходимую сумму заимствования из Aave
+                        let result = calculate_aave_borrow_amount
+                            (event_id,
+                            &pool_path,
+                            start_token,
+                            &aave_liquidity,
+                            path_index);
+
+                        // Анализируем результат расчета
+                        match result {
+                            Ok(start_amount) => {
+                                warn!(
+                                    "[ UNISWAP_ARB_SIMULATOR event:{} path_index:{}] 💰 Рассчитана сумма заимствования: {} {} для пути {:?}", 
+                                    event_id, path_index,
+                                    start_amount,
+                                    start_token,
+                                    path.tokens
+                                );
+                            }
+                            Err(err) => {
+                                warn!(
+                                    "[ UNISWAP_ARB_SIMULATOR event:{} path_index:{}] Ошибка расчета суммы заимствования: {} для пути {:?}", 
+                                    event_id, path_index, err, path.tokens
+                                );
+                            }
                         }
                     }
                 }
             } else {
                 // Для данного пула не найдено предвычисленных путей
-                // Возможно, токены пула не входят в whitelist
                 warn!(
-                    "[event:{}] Нет путей для пула {:?} — возможно токен не whitelisted",
+                    "[ UNISWAP_ARB_SIMULATOR event:{}] Нет путей для пула {:?} ",
                     event_id, pool_address
                 );
             }
         }
     }
-    
 }

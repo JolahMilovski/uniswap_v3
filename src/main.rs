@@ -12,6 +12,7 @@ pub mod token_white_list;
 pub mod arb_simulator; 
 pub mod tick_fetcher;
 
+
 use aave_v3_flash_monitor::AaveTokenLiquidity;
 use aave_v3_flash_monitor::get_aave_data;
 use path_builder::PathBuilder;
@@ -49,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
 
     // Настройка логирования с tracing
-    let file_appender = rolling::daily("./logs", "uniswap_arb_scanner.log");
+    let file_appender = rolling::minutely("./logs", "uniswap_arb_scanner.log");
     let file_layer = fmt::layer()
         .json()
         .with_writer(file_appender)
@@ -57,16 +58,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_target(true)
         .with_line_number(true)
         .with_thread_names(true);
-
-    let md_appender = rolling::never("./logs", "log.md");
-    let file_layer_md = fmt::layer()
-        .with_writer(md_appender)
-        .with_ansi(false)
-        .with_target(true)
-        .with_line_number(true)
-        .with_thread_names(true)
-        .with_level(true)
-        .event_format(CustomEventFormat::new(false));
 
     let stdout_layer = fmt::layer()
         .with_ansi(true)
@@ -78,12 +69,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(
-            "info,uniswap::arb_scanner=debug,uniswap::arb_simulator=debug,uniswap::aave_v3_flash_monitor=debug,uniswap=debug,uniswap::path_builder=info,uniswap::provider=warn,uniswap::take_gas_price=warn,uniswap::token=warn,uniswap::token_white_list=warn,uniswap::uniswap_cache=warn,uniswap::tick_fetcher=warn,uniswap::uniswap_events=warn,uniswap::uniswap_graph=warn,uniswap::uniswap_v3=warn,tokio=off,hyper=off,rustls=off,ethers_providers=off,reqwest=off"
+            "info,
+            uniswap::arb_scanner=debug,
+            uniswap::arb_simulator=debug,
+            uniswap::aave_v3_flash_monitor=warn,            
+            uniswap::path_builder=info,
+            uniswap::provider=warn,
+            uniswap::take_gas_price=warn,
+            uniswap::token=warn,
+            uniswap::token_white_list=warn,
+            uniswap::uniswap_cache=warn,
+            uniswap::tick_fetcher=debug,
+            uniswap::uniswap_events=debug,
+            uniswap::uniswap_graph=warn,
+            uniswap::uniswap_v3=info,
+            tokio=off,hyper=off,
+            rustls=off,
+            ethers_providers=off"
         ));
 
     tracing_subscriber::registry()
         .with(file_layer)
-        .with(file_layer_md)
         .with(stdout_layer)
         .with(filter)
         .init();
@@ -98,7 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Подключаемся к блокчейну
+    //============================================================================================== Подключаемся к блокчейну
     info!("[MAIN] Подключаемся к блокчейну");
     let provider_manager = ProviderManager::new(200).await;
     let provider_ws = provider_manager.get_ws().await;
@@ -106,8 +112,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let provider_for_aave = provider_http.clone();
     let provider_ws_for_sync = provider_ws.clone();
     let dispatcher_provider = provider_ws.clone();
+    let polling_provider = provider_ws.clone();
 
-    // Инициализация TokenCache
+    //=============================================================================================== Инициализация TokenCache
     pub type TokenCache = Arc<DashMap<Address, TokenInfo>>;
     let token_cache: TokenCache = {
         let raw_map = load_token_list_from_json();
@@ -120,7 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Загрузка белого списка токенов
+    //================================================================================================ Загрузка белого списка токенов
     let token_whitelist_set: Arc<DashSet<Address>> = Arc::new(token_white_list::load_token_whitelist());
     info!("[MAIN] Загружено {} токенов из белого списка", token_whitelist_set.len());
 
@@ -138,7 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
 
-    // Создаем UniversalGraph
+    //================================================================================================== Создаем UniversalGraph
     let graph: Arc<UniversalGraph> = Arc::new(UniversalGraph::new());
     let graph_for_sync = Arc::clone(&graph);
     let graph_for_paths = Arc::clone(&graph);
@@ -158,7 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(0);
     });
 
-    // Инициализация Aave Flash Monitor
+    //================================================================================================ Инициализация Aave Flash Monitor
     let (aave_tx, aave_rx) = watch::channel(AaveTokenLiquidity::default());
     info!("[MAIN] Мониторинг ликвидности Aave запущен в фоне");
     spawn({
@@ -169,7 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Модуль пулинга
+    //=============================================================================== Модуль пулинга =============================================================================================================
     let (block_sender, block_receiver) = watch::channel(0);
     let (event_tx, event_rx) = mpsc::channel::<PoolEventInfo>(2048);
     spawn(async move {
@@ -182,12 +189,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let subscriber: Arc<UniswapEventSubscriber> = Arc::new(UniswapEventSubscriber::new(provider_http.clone()));
     let subscriber_clone = Arc::clone(&subscriber);
     let block_receiver_clone_to_subscriber = block_receiver.clone();
+    
     spawn({
         let subscriber = Arc::clone(&subscriber_clone);
         let graph = Arc::clone(&pulling_graph);
         async move {
             if let Err(e) = subscriber
-                .polling_event(&block_receiver_clone_to_subscriber, graph, event_tx)
+                .polling_event(&block_receiver_clone_to_subscriber, graph, event_tx, polling_provider)
                 .await
             {
                 error!("[MAIN] Задача polling_event завершилась с ошибкой: {:?}", e);
@@ -197,7 +205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Запуск диспетчера воркеров
+    //==================================================================================== Запуск диспетчера воркеров =======================================================
     let (simulator_tx, simulator_rx) = mpsc::channel::<PoolEventInfo>(2048);
     const NUM_WORKERS: usize = 20;
     info!("[MAIN] Запуск координатора с {} воркерами", NUM_WORKERS);
@@ -219,7 +227,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Синхронизация пулов
+//==================================================================================== Синхронизация пулов ====================================================================================  
     info!("[MAIN] Синхронизация пулов начата...");
     match uniswap_v3::sync_pools(
         graph_for_sync.clone(),
@@ -241,7 +249,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("[MAIN] Бот завершил сканирование пулов");
 
-    // Обновление кэша адресов пулов
+    //==================================================================================== Обновление кэша адресов пулов ====================================================================================
     {
         let block_receiver_clone_to_cache = block_receiver.clone();
         let last_block = *block_receiver_clone_to_cache.borrow();
@@ -265,7 +273,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Построение арбитражных путей
+    //================================================================================================ Построение арбитражных путей
     info!("[MAIN_PATH_BUILDER] Начинаем построение арбитражных путей");
     let path_build_start = std::time::Instant::now();
     let mut path_builder = PathBuilder::new(aave_rx.clone());
@@ -279,7 +287,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         path_builder.paths.len()
     );
 
-    // Запуск симулятора арбитража
+    //==================================================================================== Запуск симулятора арбитража ====================================================================================
     let mut arb_simulator = ArbitrageSimulator::new(
         path_builder_clone,
         aave_rx.clone(),

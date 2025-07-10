@@ -649,96 +649,188 @@ pub async fn fetch_tick_data(
 
     
 
-    /// Метод для отслеживания событий в пулах Uniswap
-    /// 
-    /// # Аргументы
-    /// * `block_receiver` - Приемник для получения номеров новых блоков
-    /// * `event_tx` - Канал для отправки обнаруженных событий пула
-    /// 
-    /// # Возвращаемое значение
-    /// * `anyhow::Result<()>` - Результат выполнения операции
+/// Отслеживает события в пулах Uniswap с автоматическим перезапуском в случае ошибок.
+/// 
+/// # Описание
+/// Функция реализует защищённый цикл обработки событий, который продолжает работу с последнего обработанного блока,
+/// перезапуская MPSC-канал при каждой итерации. Логирует последний обработанный блок для возобновления после сбоев.
+/// 
+/// # Аргументы
+/// * `block_receiver` - Приемник для получения номеров новых блоков через канал watch.
+/// * `graph` - Граф пулов Uniswap, содержащий информацию о пулах.
+/// * `event_tx` - Канал для отправки обнаруженных событий пула в симулятор.
+/// * `provider_ws` - WebSocket-провайдер для взаимодействия с блокчейном.
+/// 
+/// # Возвращаемое значение
+/// * `anyhow::Result<()>` - Результат выполнения операции. Функция не завершается в нормальном режиме,
+///   так как работает в бесконечном цикле с автоматическим перезапуском.
 pub async fn polling_event(
     &self,
-    block_receiver: &watch::Receiver<u64>, // Приемник для получения номеров новых блоков
-    graph: Arc<UniversalGraph>, // Граф с информацией о пулах
-    event_tx: mpsc::Sender<PoolEventInfo>, // Канал для отправки обнаруженных событий
+    block_receiver: &watch::Receiver<u64>,
+    graph: Arc<UniversalGraph>,
+    event_tx: mpsc::Sender<PoolEventInfo>,
+    provider_ws: Arc<Provider<Ws>>,
 ) -> anyhow::Result<()> {
-    info!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Начало polling_event");
-    let mut block_from = *block_receiver.borrow(); // Получаем начальный номер блока
+    const MAX_RETRIES: u32 = 5;
+    const RETRY_DELAY_MS: u64 = 10;
+    const CHANNEL_CAPACITY: usize = 4096;
+
+    info!("[ UNISWAP_EVENTS_POLLING ] Начало polling_event");
+    let mut block_from = self.last_processed_block.load(Ordering::Acquire);
     debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Начальный блок: {}", block_from);
-    let max_chunk_size: u64 = 200; // Максимальный размер чанка блоков для обработки за раз
-    let mut block_receiver = block_receiver.clone(); // Клонируем приемник блоков
+    let max_chunk_size: u64 = 200;
 
     loop {
-        // Ждем изменения в канале блоков
-        if block_receiver.changed().await.is_err() {
-            warn!("[ UNISWAP_EVENT_POLLING_WARN! ] Канал блоков закрыт");
-            break;
-        }
+        let mut block_receiver = block_receiver.clone();
+        let (new_event_tx, mut event_rx) = mpsc::channel::<PoolEventInfo>(CHANNEL_CAPACITY);
 
-        let block_to = *block_receiver.borrow(); // Получаем текущий номер блока
-        // Проверяем корректность диапазона блоков
-        if block_to < block_from {
-            warn!(
-                "[ UNISWAP_EVENT_POLLING_WARN! ] Некорректный диапазон: from {} > to {}",
-                block_from, block_to
-            );
-            continue;
-        }
-
-        let subscribed_pools = self.subscribed_pools.clone(); // Получаем список отслеживаемых пулов
-        // Если нет отслеживаемых пулов, пропускаем итерацию
-        if subscribed_pools.is_empty() {
-            block_from = block_to + 1;
-            continue;
-        }
-
-        let mut current_from = block_from; // Текущий начальный блок для обработки
-        let mut all_events = Vec::new(); // Вектор для хранения всех событий
-
-        // Обрабатываем блоки чанками
-        while current_from <= block_to {
-            let current_to = (current_from + max_chunk_size - 1).min(block_to); // Определяем конец текущего чанка
-            debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Обработка диапазона блоков: {}–{}", current_from, current_to);
-            
-            // Получаем события для текущего чанка блоков
-            match self.fetch_events(current_from, current_to).await {
-                Ok(events) => {
-                    if !events.is_empty() {
-                        debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Получено {} событий для блоков {}–{}", events.len(), current_from, current_to);
+        // Клонируем provider_ws и event_tx перед передачей в замыкание
+        let provider_ws_clone = Arc::clone(&provider_ws);
+        let event_tx_clone = event_tx.clone();
+        let event_task = tokio::spawn({
+            let graph = Arc::clone(&graph);
+            let subscriber = self.clone();
+            async move {
+                while let Some(event) = event_rx.recv().await {
+                    if let Err(e) = subscriber
+                        .update_graph_from_event(&event, Arc::clone(&graph), event.address, Arc::clone(&provider_ws_clone))
+                        .await
+                    {
+                        error!("[ UNISWAP_EVENTS_POLLING_ERROR ] Ошибка обработки события с ID {}: {}", event.event_id, e);
                     }
-                    all_events.extend(events); // Добавляем полученные события в общий список
+                    // Клонируем event перед отправкой
+                    if let Err(e) = event_tx_clone.send(event.clone()).await {
+                        error!("[ UNISWAP_EVENTS_POLLING_ERROR ] Ошибка отправки события с ID {} в канал: {}", event.event_id, e);
+                    }
+                }
+            }
+        });
+
+        let mut attempt = 0;
+        while attempt < MAX_RETRIES {
+            match self.process_block_range(&mut block_receiver, block_from, max_chunk_size, &new_event_tx, &graph).await {
+                Ok((new_block_from, events)) => {
+                    block_from = new_block_from;
+                    self.last_processed_block.store(block_from, Ordering::Release);
+
+                    if block_from % 100 == 0 {
+                        info!("[ UNISWAP_EVENTS_POLLING ] Обработан последний блок: {}", block_from);
+                    }
+
+                    if !events.is_empty() {
+                        debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Получено {} событий", events.len());
+                    }
+                    
+                    attempt = 0;
                 }
                 Err(e) => {
-                    warn!(
-                        "[ UNISWAP_EVENT_POLLING_WARN ] Ошибка получения событий за блоки {}–{}: {}",
-                        current_from, current_to, e
-                    );
+                    error!("[ UNISWAP_EVENTS_POLLING_ERROR ] Ошибка обработки блоков: {}. Попытка {}/{}", e, attempt + 1, MAX_RETRIES);
+                    attempt += 1;
+                    if attempt < MAX_RETRIES {
+                        tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+                    } else {
+                        error!("[ UNISWAP_EVENTS_POLLING_ERROR ] Исчерпаны все попытки обработки блоков");
+                        break;
+                    }
                 }
             }
-            current_from = current_to + 1; // Переходим к следующему чанку
         }
 
-        // Агрегируем полученные события
-        let aggregated_events = self.aggregate_events(all_events, graph.clone());
-        // Отправляем агрегированные события в канал
-        for pool_event in aggregated_events {
-            debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ][{:?}] Отправка события с ID {} в mpsc-канал", pool_event.address, pool_event.event_id);
-
-            let event_id = pool_event.event_id; // Сохраняем ID события
-            let pool_event_clone = pool_event.clone(); // Создаем копию события
-            // Отправляем событие в канал
-            if let Err(e) = event_tx.send(pool_event).await {
-                error!("[ UNISWAP_EVENT_POLLING_ERROR ] Ошибка отправки события с ID {} в mpsc-канал: {}", event_id, e);
-            } else {
-                debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ][{:?}] Событие с ID {} успешно отправлено в mpsc-канал", pool_event_clone.address, event_id);
-            }
+        if attempt >= MAX_RETRIES {
+            error!("[ UNISWAP_EVENTS_POLLING_ERROR ] Максимальное количество попыток исчерпано, перезапуск цикла");
         }
 
-        block_from = block_to + 1; // Обновляем начальный блок для следующей итерации
-        sleep(Duration::from_secs(1)); // Ждем 1 секунду перед следующей итерацией
+        event_task.abort();
+        info!("[ UNISWAP_EVENTS_POLLING ] Перезапуск polling_event с последнего блока: {}", block_from);
+        tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
     }
-    Ok(())
+}
+
+/// Обрабатывает диапазон блоков, получая и агрегируя события пулов Uniswap.
+/// 
+/// # Описание
+/// Функция извлекает события из указанного диапазона блоков, агрегирует их и отправляет в канал.
+/// Используется в `polling_event` для обработки чанков блоков с учётом максимального размера.
+/// 
+/// # Аргументы
+/// * `block_receiver` - Приемник для получения номеров новых блоков.
+/// * `block_from` - Начальный блок для обработки.
+/// * `max_chunk_size` - Максимальный размер чанка блоков для обработки за раз.
+/// * `event_tx` - Канал для отправки агрегированных событий.
+/// * `graph` - Граф пулов Uniswap для фильтрации тиков по `tick_spacing`.
+/// 
+/// # Возвращаемое значение
+/// * `anyhow::Result<(u64, Vec<PoolEventInfo>)>` - Кортеж, содержащий следующий начальный блок
+///   и вектор агрегированных событий. При ошибке (например, закрытие канала) возвращает `Err`.
+/// 
+/// # Детали реализации
+/// * Проверяет изменение в канале блоков и валидирует диапазон блоков.
+/// * Пропускает итерацию, если нет подписанных пулов.
+/// * Обрабатывает блоки чанками, вызывая `fetch_events` для каждого диапазона.
+/// * Агрегирует события через `aggregate_events` и отправляет их в `event_tx`.
+/// * Возвращает обновлённый `block_from` и список событий.
+async fn process_block_range(
+    &self,
+    block_receiver: &mut watch::Receiver<u64>,
+    block_from: u64,
+    max_chunk_size: u64,
+    event_tx: &mpsc::Sender<PoolEventInfo>,
+    graph: &Arc<UniversalGraph>,
+) -> anyhow::Result<(u64, Vec<PoolEventInfo>)> {
+    // Ожидаем изменения в канале блоков
+    if block_receiver.changed().await.is_err() {
+        error!("[ UNISWAP_EVENTS_POLLING_ERROR ] Канал блоков закрыт");
+        return Err(anyhow::anyhow!("Канал блоков закрыт"));
+    }
+
+    // Получаем конечный блок из канала
+    let block_to = *block_receiver.borrow();
+    // Проверяем корректность диапазона блоков
+    if block_to < block_from {
+        info!(
+            "[ UNISWAP_EVENTS_POLLING ] Некорректный диапазон: from {} > to {}",
+            block_from, block_to
+        );
+        return Ok((block_from, vec![]));
+    }
+
+    // Проверяем наличие подписанных пулов
+    let subscribed_pools = self.subscribed_pools.clone();
+    if subscribed_pools.is_empty() {
+        debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Нет подписанных пулов");
+        return Ok((block_to + 1, vec![]));
+    }
+
+    // Инициализируем переменные для обработки чанков
+    let mut current_from = block_from;
+    let mut all_events = Vec::new();
+
+    // Обрабатываем блоки чанками
+    while current_from <= block_to {
+        let current_to = (current_from + max_chunk_size - 1).min(block_to);
+        debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Обработка диапазона блоков: {}–{}", current_from, current_to);
+        
+        // Получаем события для текущего чанка
+        let events = self.fetch_events(current_from, current_to).await?;
+        if !events.is_empty() {
+            debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ] Получено {} событий для блоков {}–{}", events.len(), current_from, current_to);
+        }
+        all_events.extend(events);
+        current_from = current_to + 1;
+    }
+
+    // Агрегируем события
+    let aggregated_events = self.aggregate_events(all_events, Arc::clone(graph));
+    // Отправляем агрегированные события в канал
+    for pool_event in &aggregated_events {
+        debug!("[ UNISWAP_EVENTS_POLLING_DEBUG ][{:?}] Отправка события с ID {} в mpsc-канал", pool_event.address, pool_event.event_id);
+        if let Err(e) = event_tx.send(pool_event.clone()).await {
+            error!("[ UNISWAP_EVENTS_POLLING_ERROR ] Ошибка отправки события с ID {} в mpsc-канал: {}", pool_event.event_id, e);
+        }
+    }
+
+    // Возвращаем следующий начальный блок и агрегированные события
+    Ok((block_to + 1, aggregated_events))
 }
 
 
