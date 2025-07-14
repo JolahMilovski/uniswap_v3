@@ -6,7 +6,6 @@ use ethers::{
 };
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
-use tracing::{error, info};
 use std::{
     collections::{HashMap, HashSet},
     env,
@@ -18,6 +17,7 @@ use tokio::{
     sync::watch,
     time::{interval, Duration},
 };
+use tracing::{error, info};
 
 abigen!(
     AavePoolDataProvider,
@@ -73,62 +73,17 @@ pub async fn get_aave_data(
     aave_sender: watch::Sender<AaveTokenLiquidity>,
 ) -> Result<()> {
     let pool_address: Address = env::var("ARBITRUM_AAVE_V3_POOL_ADDRESS")?.parse()?;
-    let data_provider_address: Address = env::var("ARBITRUM_AAVE_V3_POOL_DATA_PROVIDER_ADDRESS")?.parse()?;
+    let data_provider_address: Address =
+        env::var("ARBITRUM_AAVE_V3_POOL_DATA_PROVIDER_ADDRESS")?.parse()?;
 
-    info!("[ AAVE ] Используется пул: {:?}, провайдер данных: {:?}", pool_address, data_provider_address);
+    info!(
+        "[ AAVE ] Используется пул: {:?}, провайдер данных: {:?}",
+        pool_address, data_provider_address
+    );
 
     let pool_data_provider = AavePoolDataProvider::new(data_provider_address, provider.clone());
     let pool_v3 = AavePool::new(pool_address, provider.clone());
 
-    // Загрузка данных из файла
-    let mut fallback_data = AaveTokenLiquidity::default();
-    match File::open("aave_liquidity.json") {
-        Ok(mut file) => {
-            let mut contents = String::new();
-            if file.read_to_string(&mut contents).is_ok() {
-                match serde_json::from_str::<AaveLiquiditySnapshot>(&contents) {
-                    Ok(snapshot) => {
-                        fallback_data = snapshot.data.clone();
-                        info!(
-                            "[ AAVE ] Загружены данные из файла: {} токенов, время: {}",
-                            snapshot.data.token_info.len(),
-                            snapshot.timestamp
-                        );
-                        for (addr, (symbol, virtual_balance)) in &snapshot.data.token_info {
-                            info!(
-                                "[ AAVE ] Токен {} ({:?}): virtualBalance {}",
-                                symbol, addr, virtual_balance
-                            );
-                        }
-                        let _ = aave_sender.send(snapshot.data);
-                    }
-                    Err(e) => error!("[ AAVE ] Ошибка парсинга файла: {:?}", e),
-                }
-            } else {
-                error!("[ AAVE ] Не удалось прочитать файл");
-            }
-        }
-        Err(e) => {
-            error!("[ AAVE ] Не удалось открыть файл: {:?}", e);
-            if e.kind() == std::io::ErrorKind::NotFound {
-                match File::create("aave_liquidity.json") {
-                    Ok(mut file) => {
-                        let empty_snapshot = AaveLiquiditySnapshot {
-                            timestamp: Utc::now().to_rfc3339(),
-                            data: AaveTokenLiquidity::default(),
-                        };
-                        if let Ok(json) = serde_json::to_string_pretty(&empty_snapshot) {
-                            let _ = file.write_all(json.as_bytes());
-                            info!("[ AAVE ] Создан пустой файл aave_liquidity.json");
-                        }
-                    }
-                    Err(e) => error!("[ AAVE ] Ошибка создания файла: {:?}", e),
-                }
-            }
-        }
-    }
-
-    // Основной цикл
     let mut interval = interval(Duration::from_secs(120));
     loop {
         interval.tick().await;
@@ -137,32 +92,40 @@ pub async fn get_aave_data(
         let mut new_data = AaveTokenLiquidity::default();
         let mut all_ok = true;
 
+        // Попытка загрузки данных с блокчейна
         match pool_data_provider.get_all_reserves_tokens().call().await {
             Ok(reserves) => {
                 info!("[ AAVE ] Получено {} токенов", reserves.len());
 
-                let tasks: Vec<_> = reserves.iter().map(|token| {
-                    let pool_v3 = pool_v3.clone();
-                    let token = token.clone();
-                    async move {
-                        match pool_v3.get_virtual_underlying_balance(token.token_address).call().await {
-                            Ok(virtual_balance) => {
-                                info!(
-                                    "[ AAVE ] Токен {} ({:?}): virtualBalance {}",
-                                    token.symbol, token.token_address, virtual_balance
-                                );
-                                Some((token.token_address, (token.symbol, virtual_balance)))
-                            }
-                            Err(e) => {
-                                error!(
-                                    "[ AAVE ] Ошибка получения virtualBalance для {}: {:?}",
-                                    token.symbol, e
-                                );
-                                None
+                let tasks: Vec<_> = reserves
+                    .iter()
+                    .map(|token| {
+                        let pool_v3 = pool_v3.clone();
+                        let token = token.clone();
+                        async move {
+                            match pool_v3
+                                .get_virtual_underlying_balance(token.token_address)
+                                .call()
+                                .await
+                            {
+                                Ok(virtual_balance) => {
+                                    
+                                    info!("[ AAVE ] Токен {} ({:?}): virtualBalance {}",
+                                        token.symbol, token.token_address, virtual_balance
+                                    );
+                                    Some((token.token_address, (token.symbol, virtual_balance)))
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "[ AAVE ] Ошибка получения virtualBalance для {}: {:?}",
+                                        token.symbol, e
+                                    );
+                                    None
+                                }
                             }
                         }
-                    }
-                }).collect();
+                    })
+                    .collect();
 
                 let results = futures::future::join_all(tasks).await;
 
@@ -198,25 +161,74 @@ pub async fn get_aave_data(
                             Err(e) => error!("[ AAVE ] Ошибка создания файла: {:?}", e),
                         }
                     }
-                } else {
-                    if !fallback_data.token_info.is_empty() {
-                        info!(
-                            "[ AAVE ] Используются данные из файла ({} токенов)",
-                            fallback_data.token_info.len()
-                        );
-                        let _ = aave_sender.send(fallback_data.clone());
-                    } else {
-                        error!("[ AAVE ] Нет данных для fallback");
-                    }
+                    continue; // Данные успешно загружены с блокчейна, продолжаем цикл
                 }
             }
             Err(e) => {
-                error!("[ AAVE ] Ошибка запроса токенов: {:?}", e);
-                if !fallback_data.token_info.is_empty() {
-                    let _ = aave_sender.send(fallback_data.clone());
+                error!("[ AAVE ] Ошибка запроса токенов с блокчейна: {:?}", e);
+            }
+        }
+
+        // Если данные с блокчейна не получены, пытаемся загрузить из файла
+        info!("[ AAVE ] Попытка загрузки данных из файла aave_liquidity.json");
+        
+        let mut fallback_data = AaveTokenLiquidity::default();
+        match File::open("aave_liquidity.json") {
+            Ok(mut file) => {
+                let mut contents = String::new();
+                if file.read_to_string(&mut contents).is_ok() {
+                    match serde_json::from_str::<AaveLiquiditySnapshot>(&contents) {
+                        Ok(snapshot) => {
+                            fallback_data = snapshot.data.clone();
+                            info!(
+                                "[ AAVE ] Загружены данные из файла: {} токенов, время: {}",
+                                snapshot.data.token_info.len(),
+                                snapshot.timestamp
+                            );
+                            let _ = aave_sender.send(fallback_data.clone());
+                        }
+                        Err(e) => {
+                            error!("[ AAVE ] Ошибка парсинга файла: {:?}", e);
+                        }
+                    }
+                } else {
+                    error!("[ AAVE ] Не удалось прочитать файл");
+                }
+            }
+            Err(e) => {
+                error!("[ AAVE ] Не удалось открыть файл: {:?}", e);
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    match File::create("aave_liquidity.json") {
+                        Ok(mut file) => {
+                            let empty_snapshot = AaveLiquiditySnapshot {
+                                timestamp: Utc::now().to_rfc3339(),
+                                data: AaveTokenLiquidity::default(),
+                            };
+                            if let Ok(json) = serde_json::to_string_pretty(&empty_snapshot) {
+                                let _ = file.write_all(json.as_bytes());
+                                info!("[ AAVE ] Создан пустой файл aave_liquidity.json");
+                            }
+                        }
+                        Err(e) => error!("[ AAVE ] Ошибка создания файла: {:?}", e),
+                    }
                 }
             }
         }
+
+        // Если данные из файла пусты, отправляем пустые данные
+        if fallback_data.token_info.is_empty() {
+            error!("[ AAVE ] Нет данных для fallback, отправка пустых данных");
+            let _ = aave_sender.send(AaveTokenLiquidity::default());
+        }
+
         info!("[ AAVE ] Ожидание следующего обновления");
     }
 }
+
+
+
+
+
+
+
+

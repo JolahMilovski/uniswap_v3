@@ -16,7 +16,6 @@ ethers-providers = "2.0.14"
 ethers-contract = "2.0.14"
 ethers ="2.0.14"
 lazy_static = "1.4"
-futures = "0.3.26"
 regex = "1.11.1"
 bincode = "1.3.3"
 indicatif = "0.17.11"
@@ -29,7 +28,11 @@ nonzero_ext = "0.3.0"
 im = {version = "15.1.0", features = ["serde"] }
 serde_with = "3.12.0"
 num-traits = "0.2.19"
+futures = "0.3.31"
 
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
 tracing-appender = "0.2.3"
+
+
+arc-swap = "1.7.1"

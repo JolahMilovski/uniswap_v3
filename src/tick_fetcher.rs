@@ -1,16 +1,16 @@
-use num_traits::identities::Zero;
+use anyhow::Error;
 use ethers::{
-    prelude::*,
-    types::{Address, I256, Bytes},
     abi::{self},
+    prelude::*,
+    types::{Address, Bytes, I256},
 };
 use im::OrdMap;
-use std::sync::Arc;
+use num_traits::identities::Zero;
 use std::env;
-use tracing::{info, warn};
 use std::result::Result;
-use anyhow::Error;
+use std::sync::Arc;
 use tokio::time::Duration;
+use tracing::{info, warn};
 
 // ABI для Multicall3
 abigen!(
@@ -72,7 +72,7 @@ abigen!(
 );
 
 /// Обработка мультиколлов для получения тиков из пула Uniswap V3
-/// 
+///
 /// # Аргументы
 /// * `calls` - Вектор вызовов (адрес контракта и данные вызова)
 /// * `multicall` - Экземпляр контракта Multicall3
@@ -98,29 +98,46 @@ async fn process_calls(
         return Ok(());
     }
     //debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG][{:?}] Выполнение мультиколла с {} вызовами", pool_address, calls.len());
-    
+
     // Выполняем мультиколл с таймаутом 20 секунд
-    let results = tokio::time::timeout(Duration::from_secs(30), multicall.aggregate_3(
-        calls.iter().map(|(target, data)| Call3 {
-            target: *target,
-            call_data: data.clone(),
-            allow_failure: true,
-        }).collect()
-    ).call()).await??;
+    let results = tokio::time::timeout(
+        Duration::from_secs(30),
+        multicall
+            .aggregate_3(
+                calls
+                    .iter()
+                    .map(|(target, data)| Call3 {
+                        target: *target,
+                        call_data: data.clone(),
+                        allow_failure: true,
+                    })
+                    .collect(),
+            )
+            .call(),
+    )
+    .await??;
 
     // Обрабатываем результаты вызовов
     for (i, result) in results.into_iter().enumerate() {
         let word = word_offset + i as i16; // Вычисляем номер слова
         if !result.success {
-            warn!("[UNISWAP_V3_FETH_ACTIVE_WARN!][{:?}] Неудачный вызов для слова {}: {:?}", pool_address, word, result.return_data);
+            warn!(
+                "[UNISWAP_V3_FETH_ACTIVE_WARN!][{:?}] Неудачный вызов для слова {}: {:?}",
+                pool_address, word, result.return_data
+            );
             continue;
         }
         // Декодируем возвращенные данные
-        match abi::decode(&[abi::ParamType::Array(Box::new(abi::ParamType::Tuple(vec![
-            abi::ParamType::Int(24),  // tick
-            abi::ParamType::Int(128), // liquidity_net
-            abi::ParamType::Uint(128), // liquidity_gross
-        ])))], &result.return_data) {
+        match abi::decode(
+            &[abi::ParamType::Array(Box::new(abi::ParamType::Tuple(
+                vec![
+                    abi::ParamType::Int(24),   // tick
+                    abi::ParamType::Int(128),  // liquidity_net
+                    abi::ParamType::Uint(128), // liquidity_gross
+                ],
+            )))],
+            &result.return_data,
+        ) {
             Ok(decoded) => {
                 let ticks: Vec<tick_lens::PopulatedTick> = decoded[0]
                     .clone()
@@ -150,7 +167,7 @@ async fn process_calls(
                     .collect();
                 // Логируем только если есть тики
                 if !ticks.is_empty() {
-                   // debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG][{:?}] Слово {}: получено {} тиков", pool_address, word, ticks.len());
+                    // debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG][{:?}] Слово {}: получено {} тиков", pool_address, word, ticks.len());
                 }
                 // Добавляем тики в карту
                 for tick in ticks {
@@ -169,7 +186,10 @@ async fn process_calls(
                 }
             }
             Err(e) => {
-                warn!("[UNISWAP_V3_FETH_ACTIVE_WARN!][{:?}] Ошибка декодирования для слова {}: {}", pool_address, word, e);
+                warn!(
+                    "[UNISWAP_V3_FETH_ACTIVE_WARN!][{:?}] Ошибка декодирования для слова {}: {}",
+                    pool_address, word, e
+                );
             }
         }
     }
@@ -192,7 +212,6 @@ pub async fn fetch_active_ticks(
     current_tick: i32,
     fee: u32,
 ) -> Result<OrdMap<i32, (i128, U256)>, Error> {
-
     //debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG] Начало fetch_active_ticks, pool_address: {:?}, current_tick: {}, fee: {}", pool_address, current_tick, fee);
 
     // Загружаем адреса контрактов
@@ -228,7 +247,10 @@ pub async fn fetch_active_ticks(
     for word in min_tick_word..=max_tick_word {
         calls.push((
             tick_lens_address,
-            tick_lens.get_populated_ticks_in_word(pool_address, word).calldata().unwrap(),
+            tick_lens
+                .get_populated_ticks_in_word(pool_address, word)
+                .calldata()
+                .unwrap(),
         ));
     }
 
@@ -243,13 +265,16 @@ pub async fn fetch_active_ticks(
             &mut all_ticks,
             &mut non_zero_liquidity,
             word_offset,
-        ).await?;
+        )
+        .await?;
     }
 
     // Логируем результат
     if all_ticks.is_empty() {
-        warn!("[UNISWAP_V3_FETH_ACTIVE][{:?}] Пустая карта тиков: fee: {}, current_tick: {}", 
-            pool_address, fee, current_tick);
+        warn!(
+            "[UNISWAP_V3_FETH_ACTIVE][{:?}] Пустая карта тиков: fee: {}, current_tick: {}",
+            pool_address, fee, current_tick
+        );
     } else {
         info!("[UNISWAP_V3_FETH_ACTIVE][{:?}] Карта тиков заполнена: fee: {}, current_tick: {}, total_ticks: {}, non_zero_liquidity: {}", 
             pool_address, fee, current_tick, all_ticks.len(), non_zero_liquidity);

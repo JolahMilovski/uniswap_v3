@@ -2,16 +2,19 @@ use crate::aave_v3_flash_monitor::AaveTokenLiquidity;
 use crate::uniswap_graph::UniswapPool;
 use crate::uniswap_v3::tick_to_sqrt_price;
 
-use ethers::{types::{Address, U256}, utils::hex};
-use tracing::{debug, error, info, warn};
+use ethers::{
+    types::{Address, U256},
+    utils::hex,
+};
 use lazy_static::lazy_static;
 use std::collections::HashMap;
+use tracing::{debug, error, info, warn};
 
 // Статическая карта минимальных порогов прибыли для различных токенов
-// 
+//
 // Используется для определения минимальной прибыли, необходимой для выполнения арбитражной сделки
 // с конкретным токеном. Значения указаны в базовых единицах (wei) соответствующих токенов.
-// 
+//
 // # Структура данных
 // * Ключ - адрес токена (Address)
 // * Значение - минимальный порог прибыли (U256)
@@ -36,9 +39,9 @@ lazy_static! {
 
         // WETH - Wrapped Ether (0.038 ETH)
         min_profit_by_token.insert(Address::from_slice(&hex::decode("82af49447d8a07e3bd95bd0d56f35241523fbab1").unwrap()), U256::from(38_000_000_000_000_000u128));
-                                                                                                                                   
 
-        // USDT - 100 Tether USD 
+
+        // USDT - 100 Tether USD
         min_profit_by_token.insert(Address::from_slice(&hex::decode("fd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9").unwrap()), U256::from(100_000_000));
 
         // WBTC - Wrapped Bitcoin (0.0001 BTC)
@@ -76,15 +79,13 @@ lazy_static! {
 
         // AAVE - Aave Token (~0.353 AAVE)
         min_profit_by_token.insert(Address::from_slice(&hex::decode("ba5ddd1f9d7f570dc94a51479a000e3bce967196").unwrap()), U256::from(353_700_000_000_000_000u128));
-        
+
         min_profit_by_token
     };
 }
 
-
-
 /// Проверяет входные данные для расчета арбитражной возможности
-/// 
+///
 /// # Аргументы
 /// * `pool_path` - Массив пулов Uniswap, через которые будет проходить арбитраж
 /// * `start_token` - Адрес начального токена для арбитража
@@ -108,8 +109,14 @@ fn validate_inputs(
     info!("[ UNISWAP_ARB_SCANNER_validate_inputs event:{} path_index:{} ] Проверка входных данных для токена {} ({:?})", event_id, path_index, start_token_symbol, start_token);
 
     if pool_path.is_empty() {
-        warn!("[ UNISWAP_ARB_SCANNER_validate_inputs event:{} path_index:{} ] Пустой путь пулов", event_id, path_index);
-        return Err(format!("[ UNISWAP_ARB_SCANNER_validate_inputs event:{} path_index:{} ] Пустой путь пулов", event_id, path_index));
+        warn!(
+            "[ UNISWAP_ARB_SCANNER_validate_inputs event:{} path_index:{} ] Пустой путь пулов",
+            event_id, path_index
+        );
+        return Err(format!(
+            "[ UNISWAP_ARB_SCANNER_validate_inputs event:{} path_index:{} ] Пустой путь пулов",
+            event_id, path_index
+        ));
     }
 
     let available_liquidity = aave_liquidity
@@ -117,7 +124,7 @@ fn validate_inputs(
         .get(&start_token)
         .map(|(_, liquidity)| *liquidity)
         .unwrap_or(U256::zero());
-    
+
     debug!("[ UNISWAP_ARB_SCANNER_validate_inputs event:{} path_index:{} ] Доступная ликвидность Aave для токена {} ({:?}): {}", 
         event_id, path_index, start_token_symbol, start_token, available_liquidity);
 
@@ -139,16 +146,15 @@ fn validate_inputs(
     Ok((available_liquidity, min_profit_threshold))
 }
 
-
 /// Рассчитывает целевую сумму вывода с учетом минимального порога прибыли и комиссии
-/// 
+///
 /// # Аргументы
 /// * `min_profit_threshold` - Минимальный порог прибыли в базовых единицах токена
 ///
 /// # Возвращаемое значение
 /// * `Ok(U256)` - Рассчитанная целевая сумма вывода
 
-fn calculate_target_amount_out (
+fn calculate_target_amount_out(
     event_id: usize,
     min_profit_threshold: U256,
     path_index: usize,
@@ -204,7 +210,7 @@ fn calculate_target_amount_out (
 }
 
 /// Вспомогательная функция для обработки арифметических операций с проверкой на переполнение
-/// 
+///
 /// # Аргументы
 /// * `op` - Замыкание, выполняющее арифметическую операцию
 /// * `error_msg` - Сообщение об ошибке в случае переполнения
@@ -279,7 +285,7 @@ fn update_liquidity(
 }
 
 /// Вычисляет параметры свопа для одного тика
-/// 
+///
 /// # Аргументы
 /// * `current_liquidity` - Текущая ликвидность пула
 /// * `current_sqrt_price` - Текущая цена пула (sqrt_price_x96)
@@ -436,10 +442,8 @@ fn compute_swap_for_tick(
     Ok((amount_in, amount_out, fee_amount, total_amount_in_step))
 }
 
-
-
 /// Обрабатывает тики пула для вычисления входного объема
-/// 
+///
 /// # Аргументы
 /// * `tick_iter` - Итератор по тикам пула
 /// * `current_liquidity` - Начальная ликвидность пула
@@ -467,7 +471,7 @@ fn process_ticks<'a>(
 ) -> Result<(U256, U256, U256, U256), String> {
     info!("[ UNISWAP_ARB_SCANNER_process_ticks event:{} path_index:{} ] Пул {}: Начало обработки тиков, входные параметры: remaining_amount_out = {}, current_liquidity = {}, current_sqrt_price = {}, fee_pips = {}, zero_for_one = {}, two_pow_96 = {}", 
         event_id, path_index, pool_index, remaining_amount_out, current_liquidity, current_sqrt_price, fee_pips, zero_for_one, two_pow_96);
-    
+
     if current_liquidity.is_zero() {
         warn!("[ UNISWAP_ARB_SCANNER_process_ticks event:{} path_index:{} ] Пул {}: Нулевая ликвидность, пропуск обработки тиков", event_id, path_index, pool_index);
         return Err(format!("[ UNISWAP_ARB_SCANNER_process_ticks event:{} path_index:{} ] Нулевая ликвидность в пуле {}", event_id, path_index, pool_index));
@@ -520,7 +524,14 @@ fn process_ticks<'a>(
         )?;
         debug!("[ UNISWAP_ARB_SCANNER_process_ticks event:{} path_index:{} ] Пул {}: Оставшаяся amount_out = {}", event_id, path_index, pool_index, remaining_amount_out);
 
-        current_liquidity = update_liquidity(event_id, current_liquidity, *net_liquidity, zero_for_one, pool_index, path_index)?;
+        current_liquidity = update_liquidity(
+            event_id,
+            current_liquidity,
+            *net_liquidity,
+            zero_for_one,
+            pool_index,
+            path_index,
+        )?;
         debug!("[ UNISWAP_ARB_SCANNER_process_ticks event:{} path_index:{} ] Пул {}: Обновленная ликвидность = {}", event_id, path_index, pool_index, current_liquidity);
 
         current_sqrt_price = target_sqrt_price;
@@ -534,14 +545,16 @@ fn process_ticks<'a>(
 
     info!("[ UNISWAP_ARB_SCANNER_process_ticks event:{} path_index:{} ] Пул {}: Завершение обработки тиков, total_amount_in = {}, remaining_amount_out = {}, current_sqrt_price = {}, current_liquidity = {}", 
         event_id, path_index, pool_index, total_amount_in, remaining_amount_out, current_sqrt_price, current_liquidity);
-    Ok((total_amount_in, remaining_amount_out, current_sqrt_price, current_liquidity))
+    Ok((
+        total_amount_in,
+        remaining_amount_out,
+        current_sqrt_price,
+        current_liquidity,
+    ))
 }
 
-
-
-
 /// Обрабатывает пул Uniswap V3 для расчета входного объема, необходимого для получения заданного выходного объема
-/// 
+///
 /// # Аргументы
 /// * `pool` - Пул Uniswap V3
 /// * `pool_index` - Индекс пула в пути для логирования
@@ -561,14 +574,29 @@ fn process_pool(
     two_pow_96: U256,
     path_index: usize,
 ) -> Result<(U256, Address), String> {
-    info!("[ UNISWAP_ARB_SCANNER_process_pool event:{} path_index:{} ] Обработка пула {}: {:?}", event_id, path_index, pool_index, pool.uniswap_pool_address);
-    let zero_for_one = pool.uniswap_token_b == current_token;
-    let token_out = if zero_for_one { pool.uniswap_token_a } else { pool.uniswap_token_b };
-    let token_out_symbol = if zero_for_one { &pool.uniswap_token_a_symbol } else { &pool.uniswap_token_b_symbol };
-    let current_token_symbol = if current_token == pool.uniswap_token_a { &pool.uniswap_token_a_symbol } else { &pool.uniswap_token_b_symbol };
+    info!(
+        "[ UNISWAP_ARB_SCANNER_process_pool event:{} path_index:{} ] Обработка пула {}: {:?}",
+        event_id, path_index, pool_index, pool.uniswap_pool_address
+    );
+    let zero_for_one = *pool.uniswap_token_b == current_token;
+    let token_out = if zero_for_one {
+        *pool.uniswap_token_a
+    } else {
+        *pool.uniswap_token_b
+    };
+    let token_out_symbol = if zero_for_one {
+        &pool.uniswap_token_a_symbol
+    } else {
+        &pool.uniswap_token_b_symbol
+    };
+    let current_token_symbol = if current_token == *pool.uniswap_token_a {
+        &pool.uniswap_token_a_symbol
+    } else {
+        &pool.uniswap_token_b_symbol
+    };
     debug!("[ UNISWAP_ARB_SCANNER_process_pool event:{} path_index:{} ] Пул {}: Входные параметры: zero_for_one = {}, token_in = {} ({:?}), token_out = {} ({:?})", 
         event_id, path_index, pool_index, zero_for_one, current_token_symbol, current_token, token_out_symbol, token_out);
-    
+
     let current_sqrt_price = pool.uniswap_sqrt_price;
     let current_liquidity = pool.uniswap_liquidity;
     debug!("[ UNISWAP_ARB_SCANNER_process_pool event:{} path_index:{} ] Пул {}: Промежуточные параметры: current_sqrt_price = {}, current_liquidity = {}", event_id, path_index, pool_index, current_sqrt_price, current_liquidity);
@@ -587,34 +615,41 @@ fn process_pool(
     let fee_pips = pool.uniswap_fee_tier;
     debug!("[ UNISWAP_ARB_SCANNER_process_pool event:{} path_index:{} ] Пул {}: Промежуточные параметры: fee_pips = {}, tick_current = {}", event_id, path_index, pool_index, fee_pips, pool.uniswap_tick_current);
 
-    let (total_amount_in, remaining_amount_out, _final_sqrt_price, _final_liquidity) = process_ticks(
-        event_id,
-        tick_iter,
-        current_liquidity,
-        current_sqrt_price,
-        remaining_amount_out,
-        fee_pips,
-        zero_for_one,
-        two_pow_96,
-        pool_index,
-        path_index,
-    )?;
+    let (total_amount_in, remaining_amount_out, _final_sqrt_price, _final_liquidity) =
+        process_ticks(
+            event_id,
+            tick_iter,
+            current_liquidity,
+            current_sqrt_price,
+            remaining_amount_out,
+            fee_pips,
+            zero_for_one,
+            two_pow_96,
+            pool_index,
+            path_index,
+        )?;
 
     if remaining_amount_out > U256::zero() {
         warn!("[ UNISWAP_ARB_SCANNER_process_pool event:{} path_index:{} ] Пул {}: Недостаточная ликвидность для remaining_amount_out = {} токена {} ({:?})", event_id, path_index, pool_index, remaining_amount_out, token_out_symbol, token_out);
         return Err(format!("[ UNISWAP_ARB_SCANNER_process_pool event:{} path_index:{} ] Недостаточная ликвидность в пуле {} для remaining_amount_out = {} токена {} ({:?})", event_id, path_index, pool_index, remaining_amount_out, token_out_symbol, token_out));
     }
 
-    let next_token = if zero_for_one { pool.uniswap_token_a } else { pool.uniswap_token_b };
-    let next_token_symbol = if zero_for_one { &pool.uniswap_token_a_symbol } else { &pool.uniswap_token_b_symbol };
+    let next_token = if zero_for_one {
+        pool.uniswap_token_a.clone()
+    } else {
+        pool.uniswap_token_b.clone()
+    };
+    let next_token_symbol = if zero_for_one {
+        &pool.uniswap_token_a_symbol
+    } else {
+        &pool.uniswap_token_b_symbol
+    };
     debug!("[ UNISWAP_ARB_SCANNER_process_pool event:{} path_index:{} ] Пул {}: Результат: total_amount_in = {}, next_token = {} ({:?})", event_id, path_index, pool_index, total_amount_in, next_token_symbol, next_token);
-    Ok((total_amount_in, next_token))
+    Ok((total_amount_in, *next_token))
 }
 
-
-
 /// Проверяет конечное состояние расчета и валидирует результат
-/// 
+///
 /// # Аргументы
 /// * `current_token` - Текущий токен в конце пути
 /// * `start_token` - Начальный токен, с которого начался путь
@@ -667,11 +702,8 @@ fn validate_final_state(
     Ok(start_amount)
 }
 
-
-
-
 /// Рассчитывает оптимальную сумму заимствования в протоколе Aave для арбитража
-/// 
+///
 /// # Аргументы
 /// * `pool_path` - Массив пулов Uniswap V3, через которые будет проходить арбитраж
 /// * `start_token` - Адрес токена, который будет заимствован из Aave
@@ -697,21 +729,25 @@ pub fn calculate_aave_borrow_amount(
         return Err(format!("[ UNISWAP_ARB_SCANNER_calculate_aave_borrow_amount event:{} path_index:{} ] Токен {:?} не найден в AaveTokenLiquidity", event_id, path_index, start_token));
     }
     debug!("[ UNISWAP_ARB_SCANNER_calculate_aave_borrow_amount event:{} path_index:{} ] Начало расчета суммы заимствования для токена {} ({:?})", event_id, path_index, start_token_symbol, start_token);
-    let (available_liquidity, min_profit_threshold) = validate_inputs(event_id, pool_path, start_token, aave_liquidity, path_index)?;
+    let (available_liquidity, min_profit_threshold) =
+        validate_inputs(event_id, pool_path, start_token, aave_liquidity, path_index)?;
     debug!("[ UNISWAP_ARB_SCANNER_calculate_aave_borrow_amount event:{} path_index:{} ] Промежуточные результаты: available_liquidity = {}, min_profit_threshold = {}", event_id, path_index, available_liquidity, min_profit_threshold);
 
     debug!("[ UNISWAP_ARB_SCANNER_calculate_aave_borrow_amount event:{} path_index:{} ] Расчет целевой суммы с учетом комиссии Aave", event_id, path_index);
-    let mut remaining_amount_out = calculate_target_amount_out(event_id, min_profit_threshold, path_index)?;
+
+    let mut remaining_amount_out =
+        calculate_target_amount_out(event_id, min_profit_threshold, path_index)?;
     let mut current_token = start_token;
     let two_pow_96 = U256::from(1u128 << 96);
+
     debug!("[ UNISWAP_ARB_SCANNER_calculate_aave_borrow_amount event:{} path_index:{} ] Промежуточные параметры: remaining_amount_out = {}, current_token = {} ({:?}), two_pow_96 = {}", 
         event_id, path_index, remaining_amount_out, start_token_symbol, current_token, two_pow_96);
 
     debug!("[ UNISWAP_ARB_SCANNER_calculate_aave_borrow_amount event:{} path_index:{} ] Начало обратного прохода по пути пулов", event_id, path_index);
     for (i, pool) in pool_path.iter().enumerate().rev() {
-        let current_token_symbol = if current_token == pool.uniswap_token_a {
+        let current_token_symbol = if current_token == *pool.uniswap_token_a {
             &pool.uniswap_token_a_symbol
-        } else if current_token == pool.uniswap_token_b {
+        } else if current_token == *pool.uniswap_token_b {
             &pool.uniswap_token_b_symbol
         } else {
             aave_liquidity
@@ -721,10 +757,18 @@ pub fn calculate_aave_borrow_amount(
                 .unwrap_or("UNKNOWN")
         };
         debug!("[ UNISWAP_ARB_SCANNER_calculate_aave_borrow_amount event:{} path_index:{} ] Обработка пула #{} с текущим токеном {} ({:?})", event_id, path_index, pool_path.len() - i, current_token_symbol, current_token);
-        let (total_amount_in, next_token) = process_pool(event_id, pool, i, current_token, remaining_amount_out, two_pow_96, path_index)?;
-        let next_token_symbol = if next_token == pool.uniswap_token_a {
+        let (total_amount_in, next_token) = process_pool(
+            event_id,
+            pool,
+            i,
+            current_token,
+            remaining_amount_out,
+            two_pow_96,
+            path_index,
+        )?;
+        let next_token_symbol = if next_token == *pool.uniswap_token_a {
             &pool.uniswap_token_a_symbol
-        } else if next_token == pool.uniswap_token_b {
+        } else if next_token == *pool.uniswap_token_b {
             &pool.uniswap_token_b_symbol
         } else {
             aave_liquidity
@@ -740,7 +784,15 @@ pub fn calculate_aave_borrow_amount(
     }
 
     debug!("[ UNISWAP_ARB_SCANNER_calculate_aave_borrow_amount event:{} path_index:{} ] Проверка конечного состояния и валидация результата", event_id, path_index);
-    let start_amount = validate_final_state(event_id, current_token, start_token, remaining_amount_out, available_liquidity, aave_liquidity, path_index)?;
+    let start_amount = validate_final_state(
+        event_id,
+        current_token,
+        start_token,
+        remaining_amount_out,
+        available_liquidity,
+        aave_liquidity,
+        path_index,
+    )?;
     warn!("[ UNISWAP_ARB_SCANNER_calculate_aave_borrow_amount event:{} path_index:{} ] Расчет завершен успешно. Итоговая сумма заимствования: {} для токена {} ({:?})", 
         event_id, path_index, start_amount, start_token_symbol, start_token);
     Ok(start_amount)
@@ -778,7 +830,7 @@ pub fn get_next_sqrt_price_from_input(
     }
 }
 
- 
+
 /// Вычисляет параметры одного шага свопа в пуле Uniswap V3
 pub fn compute_swap_step(
     sqrt_price_x96: U256,
@@ -789,7 +841,7 @@ pub fn compute_swap_step(
     zero_for_one: bool,
 ) -> Result<(U256, U256, U256, U256), String> {
     info!(
-        "[UNISWAP_UNISWAP_ARB_SCANNER_DEBUG] Начало шага свопа. sqrt_price_x96: {}, target_sqrt_price_x96: {}, liquidity: {}, amount_remaining: {}, fee_pips: {}, zero_for_one: {}", 
+        "[UNISWAP_UNISWAP_ARB_SCANNER_DEBUG] Начало шага свопа. sqrt_price_x96: {}, target_sqrt_price_x96: {}, liquidity: {}, amount_remaining: {}, fee_pips: {}, zero_for_one: {}",
         sqrt_price_x96, target_sqrt_price_x96, liquidity, amount_remaining, fee_pips, zero_for_one
     );
 
@@ -823,7 +875,7 @@ pub fn compute_swap_step(
             "Недостаточная amount_remaining для fee_amount".to_string()
         })?;
     debug!(
-        "[UNISWAP_UNISWAP_ARB_SCANNER_DEBUG] fee_amount = {}, amount_remaining_less_fee = {}", 
+        "[UNISWAP_UNISWAP_ARB_SCANNER_DEBUG] fee_amount = {}, amount_remaining_less_fee = {}",
         fee_amount, amount_remaining_less_fee
     );
 
@@ -916,7 +968,7 @@ pub fn compute_swap_step(
         (amount_in, amount_out)
     };
     debug!(
-        "[UNISWAP_UNISWAP_ARB_SCANNER_DEBUG] amount_in = {}, amount_out = {}", 
+        "[UNISWAP_UNISWAP_ARB_SCANNER_DEBUG] amount_in = {}, amount_out = {}",
         amount_in, amount_out
     );
 
@@ -930,7 +982,7 @@ pub fn simulate_swap_tick_by_tick(
     zero_for_one: bool,
 ) -> Result<(U256, U256), String> {
     info!(
-        "[UNISWAP_UNISWAP_ARB_SCANNER_DEBUG] Начало симуляции свопа по тикам для пула: {:?}", 
+        "[UNISWAP_UNISWAP_ARB_SCANNER_DEBUG] Начало симуляции свопа по тикам для пула: {:?}",
         pool.uniswap_pool_address
     );
     let mut sqrt_price_x96 = pool.uniswap_sqrt_price;
@@ -949,7 +1001,7 @@ pub fn simulate_swap_tick_by_tick(
     for (next_tick_idx, (net_liquidity, _)) in tick_iter {
         let target_sqrt_price = tick_to_sqrt_price(*next_tick_idx)?;
         debug!(
-            "[UNISWAP_UNISWAP_ARB_SCANNER_DEBUG] Обработка тика {}, target_sqrt_price = {}", 
+            "[UNISWAP_UNISWAP_ARB_SCANNER_DEBUG] Обработка тика {}, target_sqrt_price = {}",
             next_tick_idx, target_sqrt_price
         );
 
@@ -1041,7 +1093,7 @@ pub fn simulate_swap_tick_by_tick(
                     "Недостаточная remaining_amount_in".to_string()
                 })?;
             debug!(
-                "[UNISWAP_UNISWAP_ARB_SCANNER_DEBUG] next_sqrt_price_x96 = {}, used_amount_in = {}, produced_amount_out = {}, fee_amount = {}, remaining_amount_in = {}", 
+                "[UNISWAP_UNISWAP_ARB_SCANNER_DEBUG] next_sqrt_price_x96 = {}, used_amount_in = {}, produced_amount_out = {}, fee_amount = {}, remaining_amount_in = {}",
                 next_sqrt_price_x96, used_amount_in, produced_amount_out, fee_amount, remaining_amount_in
             );
 
@@ -1055,7 +1107,7 @@ pub fn simulate_swap_tick_by_tick(
     if remaining_amount_in > U256::zero() {
         let target_price = if zero_for_one { U256::one() } else { U256::MAX };
         debug!(
-            "[UNISWAP_UNISWAP_ARB_SCANNER_DEBUG] Обрабатываем остаток remaining_amount_in = {}, target_price = {}", 
+            "[UNISWAP_UNISWAP_ARB_SCANNER_DEBUG] Обрабатываем остаток remaining_amount_in = {}, target_price = {}",
             remaining_amount_in, target_price
         );
         let (next_sqrt_price_x96, used_amount_in, produced_amount_out, fee_amount) =
@@ -1088,13 +1140,13 @@ pub fn simulate_swap_tick_by_tick(
                 "Недостаточная remaining_amount_in (остаток)".to_string()
             })?;
         debug!(
-            "[UNISWAP_UNISWAP_ARB_SCANNER_DEBUG] Остаток: next_sqrt_price_x96 = {}, used_amount_in = {}, produced_amount_out = {}, fee_amount = {}, remaining_amount_in = {}", 
+            "[UNISWAP_UNISWAP_ARB_SCANNER_DEBUG] Остаток: next_sqrt_price_x96 = {}, used_amount_in = {}, produced_amount_out = {}, fee_amount = {}, remaining_amount_in = {}",
             next_sqrt_price_x96, used_amount_in, produced_amount_out, fee_amount, remaining_amount_in
         );
     }
 
     info!(
-        "[UNISWAP_UNISWAP_ARB_SCANNER_DEBUG] Завершение симуляции свопа: amount_out = {}, final_sqrt_price = {}", 
+        "[UNISWAP_UNISWAP_ARB_SCANNER_DEBUG] Завершение симуляции свопа: amount_out = {}, final_sqrt_price = {}",
         amount_out, sqrt_price_x96
     );
     Ok((amount_out, sqrt_price_x96))
@@ -1108,7 +1160,7 @@ pub fn simulate_path_swap(
     aave_liquidity: &AaveTokenLiquidity,
 ) -> Result<Option<(U256, Vec<U256>)>, String> {
     info!(
-        "[UNISWAP_UNISWAP_ARB_SCANNER_DEBUG] Начало симуляции свопа по пути. start_amount: {}, start_token: {:?}", 
+        "[UNISWAP_UNISWAP_ARB_SCANNER_DEBUG] Начало симуляции свопа по пути. start_amount: {}, start_token: {:?}",
         start_amount, start_token
     );
 
@@ -1118,12 +1170,12 @@ pub fn simulate_path_swap(
         .map(|(_, liquidity)| *liquidity)
         .unwrap_or(U256::zero());
     debug!(
-        "[UNISWAP_UNISWAP_ARB_SCANNER_DEBUG] Доступная ликвидность Aave: {}", 
+        "[UNISWAP_UNISWAP_ARB_SCANNER_DEBUG] Доступная ликвидность Aave: {}",
         available_liquidity
     );
     if available_liquidity.is_zero() {
         info!(
-            "[{}] Нет ликвидности для токена {:?}", 
+            "[{}] Нет ликвидности для токена {:?}",
             "ARB SKIP".black().on_red(), start_token
         );
         return Ok(None);
@@ -1132,7 +1184,7 @@ pub fn simulate_path_swap(
     let start_amount = start_amount.min(available_liquidity);
     if start_amount.is_zero() {
         info!(
-            "[{}] Нулевая сумма для токена {:?}", 
+            "[{}] Нулевая сумма для токена {:?}",
             "ARB SKIP".black().on_red(), start_token
         );
         return Ok(None);
@@ -1142,14 +1194,14 @@ pub fn simulate_path_swap(
         Some(&threshold) => threshold,
         None => {
             info!(
-                "[{}] Токен {:?} не найден в MIN_PROFIT_THRESHOLD_BY_TOKEN", 
+                "[{}] Токен {:?} не найден в MIN_PROFIT_THRESHOLD_BY_TOKEN",
                 "ARB SKIP".black().on_red(), start_token
             );
             return Ok(None);
         }
     };
     debug!(
-        "[UNISWAP_UNISWAP_ARB_SCANNER_DEBUG] Минимальный порог прибыли: {}", 
+        "[UNISWAP_UNISWAP_ARB_SCANNER_DEBUG] Минимальный порог прибыли: {}",
         min_profit_threshold
     );
 
@@ -1165,13 +1217,13 @@ pub fn simulate_path_swap(
     for (i, pool) in pool_path.iter().enumerate() {
         let zero_for_one = current_token == pool.uniswap_token_a;
         debug!(
-            "[UNISWAP_UNISWAP_ARB_SCANNER_DEBUG] Пул {}: zero_for_one = {}, token_in = {:?}, token_out = {:?}", 
-            i, zero_for_one, current_token, 
+            "[UNISWAP_UNISWAP_ARB_SCANNER_DEBUG] Пул {}: zero_for_one = {}, token_in = {:?}, token_out = {:?}",
+            i, zero_for_one, current_token,
             if zero_for_one { pool.uniswap_token_b } else { pool.uniswap_token_a }
         );
         let (amount_out, next_sqrt_price) = simulate_swap_tick_by_tick(pool, current_amount, zero_for_one)?;
         debug!(
-            "[UNISWAP_UNISWAP_ARB_SCANNER_DEBUG] Пул {}: amount_out = {}, next_sqrt_price = {}", 
+            "[UNISWAP_UNISWAP_ARB_SCANNER_DEBUG] Пул {}: amount_out = {}, next_sqrt_price = {}",
             i, amount_out, next_sqrt_price
         );
         intermediate_outputs.push(amount_out);
@@ -1185,7 +1237,7 @@ pub fn simulate_path_swap(
 
     if current_token != start_token {
         info!(
-            "[{}] Некорректный путь (длина: {}): конечный токен {:?} != стартовый {:?}", 
+            "[{}] Некорректный путь (длина: {}): конечный токен {:?} != стартовый {:?}",
             "ARB SKIP".black().on_red(), pool_path.len(), current_token, start_token
         );
         return Ok(None);
@@ -1212,7 +1264,7 @@ pub fn simulate_path_swap(
             "Переполнение при вычислении profit_threshold".to_string()
         })?;
     debug!(
-        "[UNISWAP_UNISWAP_ARB_SCANNER_DEBUG] final_amount_out = {}, aave_fee = {}, total_threshold = {}, profit_threshold = {}", 
+        "[UNISWAP_UNISWAP_ARB_SCANNER_DEBUG] final_amount_out = {}, aave_fee = {}, total_threshold = {}, profit_threshold = {}",
         final_amount_out, aave_fee, total_threshold, profit_threshold
     );
 
@@ -1224,7 +1276,7 @@ pub fn simulate_path_swap(
                 "Переполнение при вычислении profit".to_string()
             })?;
         info!(
-            "[{}] Прибыль: {} {:?} для пути: {}", 
+            "[{}] Прибыль: {} {:?} для пути: {}",
             "ARB SUCCESS".red(),
             profit,
             start_token,
@@ -1233,13 +1285,10 @@ pub fn simulate_path_swap(
         Ok(Some((final_amount_out, intermediate_outputs)))
     } else {
         info!(
-            "[{}] Прибыль ниже порога: {} <= {} для токена {:?}", 
+            "[{}] Прибыль ниже порога: {} <= {} для токена {:?}",
             "ARB SKIP".black().on_red(), final_amount_out, profit_threshold, start_token
         );
         Ok(None)
     }
 }
 */
-
-
-

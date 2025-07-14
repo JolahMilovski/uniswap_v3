@@ -1,8 +1,8 @@
 use bincode::{deserialize, serialize};
 use ethers::types::Address;
 use serde::Serialize;
-use std::io::{self, Read, Write};
 use std::fs::File;
+use std::io::{self, Read, Write};
 
 #[derive(Debug, Serialize, Clone)]
 pub struct UniswapPoolCache {
@@ -33,7 +33,8 @@ impl UniswapPoolCache {
     // Сохранение кэша в бинарный файл
     pub fn save_to_bin(&self, path: &str) -> io::Result<()> {
         let cache_data = (&self.pool_addresses, self.last_verified_block);
-        let serialized = serialize(&cache_data).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let serialized =
+            serialize(&cache_data).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let mut file = File::create(path)?;
         file.write_all(&serialized)?;
         Ok(())

@@ -2,12 +2,12 @@ use dashmap::DashMap;
 use ethers::contract::abigen;
 use ethers::prelude::*;
 use ethers::types::Address;
-use tracing::error;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::HashMap, fs};
 use tokio::time::sleep;
+use tracing::error;
 
 // Генерация биндингов для ERC20 контракта
 // Создает структуру ERC20 с методами decimals() и symbol()
@@ -39,15 +39,15 @@ const TOKEN_CACHE_JSON_PATH: &str = "token_cache.json";
 
 /// Получает информацию о токене по его адресу
 /// Сначала проверяет кэш, если данных нет - делает запрос к блокчейну
-/// 
+///
 /// # Аргументы
 /// * `address` - Адрес токена в блокчейне
 /// * `provider` - Провайдер для подключения к блокчейну (Infura, Alchemy и т.д.)
 /// * `token_cache` - Кэш для хранения уже полученной информации о токенах
-/// 
+///
 /// # Возвращает
 /// Result с TokenInfo при успехе или ошибкой при неудаче
-/// 
+///
 /// # Логика работы
 /// 1. Проверяет наличие токена в кэше
 /// 2. Если нет - создает контракт и вызывает методы symbol() и decimals()
@@ -58,8 +58,7 @@ pub async fn get_single_token_data<M: Middleware + 'static>(
     address: Address,
     provider: Arc<M>,
     token_cache: &TokenCache,
-) -> Result<TokenInfo,anyhow::Error > {
-
+) -> Result<TokenInfo, anyhow::Error> {
     // Проверяем кэш - если токен уже есть, возвращаем сохраненные данные
     if let Some(cached) = token_cache.get(&address) {
         return Ok(cached.clone());
@@ -75,7 +74,7 @@ pub async fn get_single_token_data<M: Middleware + 'static>(
     // Получаем символ токена с валидацией
     let symbol = if let Ok(sym) = contract.symbol().call().await {
         let sym_trimmed = sym.trim();
-        
+
         // Проверяем, что символ не пустой и не содержит нежелательные слова
         if sym_trimmed.is_empty()
             || sym_trimmed.to_lowercase().contains("test")
@@ -83,7 +82,7 @@ pub async fn get_single_token_data<M: Middleware + 'static>(
         {
             return Err(anyhow::anyhow!("Невалидный символ токена"));
         }
-        
+
         // Проверяем символ регулярным выражением
         // Разрешены только буквы, цифры и подчеркивания, длина 1-20 символов
         if let Ok(re) = regex::Regex::new(r"^[a-zA-Z0-9_]{1,20}$") {
@@ -121,13 +120,13 @@ pub async fn get_single_token_data<M: Middleware + 'static>(
 
 /// Сохраняет текущий кэш токенов в JSON файл
 /// Позволяет сохранить данные между перезапусками приложения
-/// 
+///
 /// # Аргументы
 /// * `token_cache` - Кэш токенов для сохранения
-/// 
+///
 /// # Возвращает
 /// Result с ошибкой в случае проблем с записью
-/// 
+///
 /// # Логика
 /// 1. Конвертирует DashMap в обычный HashMap для сериализации
 /// 2. Сериализует в JSON с красивым форматированием
@@ -141,10 +140,10 @@ pub async fn save_token_cache_to_json(
         .iter()
         .map(|kv| (*kv.key(), kv.value().clone()))
         .collect();
-    
+
     // Сериализуем в JSON с красивым форматированием (отступы, переносы строк)
     let json = serde_json::to_string_pretty(&map)?;
-    
+
     // Записываем JSON в файл
     std::fs::write(TOKEN_CACHE_JSON_PATH, json)?;
     Ok(())
@@ -152,14 +151,14 @@ pub async fn save_token_cache_to_json(
 
 /// Загружает список токенов из JSON файла
 /// Используется при запуске приложения для восстановления кэша
-/// 
+///
 /// # Возвращает
 /// HashMap с адресами токенов как ключами и TokenInfo как значениями
-/// 
+///
 /// # Паника
 /// Функция паникует если файл не найден или содержит невалидный JSON
 /// Это сделано намеренно, так как отсутствие кэша критично для работы
-/// 
+///
 /// # Логика
 /// 1. Читает JSON файл как строку
 /// 2. Парсит JSON в HashMap<String, TokenInfo>
@@ -167,9 +166,9 @@ pub async fn save_token_cache_to_json(
 /// 4. Фильтрует невалидные адреса
 pub fn load_token_list_from_json() -> HashMap<Address, TokenInfo> {
     // Читаем содержимое JSON файла
-    let json = fs::read_to_string(TOKEN_CACHE_JSON_PATH)
-        .expect("Не удалось прочитать token_cache.json");
-    
+    let json =
+        fs::read_to_string(TOKEN_CACHE_JSON_PATH).expect("Не удалось прочитать token_cache.json");
+
     // Парсим JSON в промежуточную структуру со строковыми ключами
     let raw_map: HashMap<String, TokenInfo> =
         serde_json::from_str(&json).expect("Ошибка парсинга token_cache.json");

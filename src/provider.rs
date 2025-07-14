@@ -4,8 +4,8 @@ use governor::middleware::NoOpMiddleware;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
 use std::num::NonZeroU32;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 pub struct ProviderManager {
     ws_providers: Vec<Arc<Provider<Ws>>>, // Список WS-провайдеров
@@ -24,9 +24,9 @@ impl ProviderManager {
             get_env_var("WS_PROVIDER_URL_ALCHEMY_SECOND"),
         ];
         let http_urls = vec![
-           //get_env_var("HTTP_PROVIDER_URL_INFURA_FIRST"),
-           //get_env_var("HTTP_PROVIDER_URL_ALCHEMY_FIRST"),
-           get_env_var("HTTP_PROVIDER_URL_ALCHEMY_SECOND"),
+            //get_env_var("HTTP_PROVIDER_URL_INFURA_FIRST"),
+            //get_env_var("HTTP_PROVIDER_URL_ALCHEMY_FIRST"),
+            get_env_var("HTTP_PROVIDER_URL_ALCHEMY_SECOND"),
         ];
 
         // Настраиваем общий лимит запросов

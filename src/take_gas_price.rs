@@ -2,11 +2,11 @@ use colored::Colorize;
 use ethers::prelude::Provider;
 use ethers::types::U256;
 use ethers_providers::{Http, Middleware};
-use tracing::info;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time::sleep;
+use tracing::info;
 
 pub struct GasPriceFeed {
     pub receiver: watch::Receiver<U256>,
@@ -20,16 +20,16 @@ impl GasPriceFeed {
 }
 
 // Асинхронная функция, которая в бесконечном цикле запрашивает цену газа и отправляет в канал
-pub async fn start_gas_price_loop(
-    provider: Arc<Provider<Http>>,
-    sender: watch::Sender<U256>,
-) {
+pub async fn start_gas_price_loop(provider: Arc<Provider<Http>>, sender: watch::Sender<U256>) {
     loop {
-       
         match provider.get_gas_price().await {
             Ok(price) => {
                 // Логируем цену газа в терминал сразу при получении
-                info!(" [ {} ] ЦЕНА ГАЗА: {} wei","GET_GAS_PRICE".black().on_blue(), price);
+                info!(
+                    " [ {} ] ЦЕНА ГАЗА: {} wei",
+                    "GET_GAS_PRICE".black().on_blue(),
+                    price
+                );
 
                 // Отправляем в канал
                 let _ = sender.send(price);
