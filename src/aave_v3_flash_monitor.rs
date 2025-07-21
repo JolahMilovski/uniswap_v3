@@ -110,7 +110,7 @@ pub async fn get_aave_data(
                             {
                                 Ok(virtual_balance) => {
                                     
-                                    info!("[ AAVE ] Токен {} ({:?}): virtualBalance {}",
+                                    info!("[ AAVE ] Токен {} c блокчейна ({:?}): virtualBalance {}",
                                         token.symbol, token.token_address, virtual_balance
                                     );
                                     Some((token.token_address, (token.symbol, virtual_balance)))

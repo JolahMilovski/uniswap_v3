@@ -86,7 +86,7 @@ abigen!(
 /// Результат выполнения, содержащий () в случае успеха или ошибку
 async fn process_calls(
     calls: Vec<(Address, Bytes)>,
-    multicall: &Arc<Multicall3<Provider<Ws>>>,
+    multicall: &Arc<Multicall3<Provider<Http>>>,
     pool_address: Address,
     tick_spacing: i32,
     all_ticks: &mut OrdMap<i32, (i128, U256)>,
@@ -208,7 +208,7 @@ async fn process_calls(
 /// Карту тиков с их ликвидностью или ошибку
 pub async fn fetch_active_ticks(
     pool_address: Address,
-    client: Arc<Provider<Ws>>,
+    client: Arc<Provider<Http>>,
     current_tick: i32,
     fee: u32,
 ) -> Result<OrdMap<i32, (i128, U256)>, Error> {

@@ -16,8 +16,10 @@ use ethers::types::H160;
 use ethers::types::U256;
 use ethers::types::{Address, U512};
 use ethers_contract::Multicall;
+use ethers_providers::Http;
 use ethers_providers::Ws;
 use lazy_static::lazy_static;
+use tracing::error;
 use std::env;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -310,7 +312,7 @@ pub fn tick_to_sqrt_price(tick: i32) -> Result<U256, String> {
 pub async fn build_uniswap_v3_pool(
     pool_address: Address,
     tokens: (Address, Address),
-    provider: Arc<Provider<Ws>>,
+    provider: Arc<Provider<Http>>,
     token_cache: &TokenCache,
 ) -> Option<UniswapPool> {
     debug!(
@@ -345,7 +347,7 @@ pub async fn build_uniswap_v3_pool(
     let pool_contract = UniswapV3Pool::new(pool_address, provider.clone());
 
     let (liquidity, slot0_result, tick_spacing, max_liquidity_per_tick, fee) =
-        process_pool_data(pool_address, pool_contract.clone().into()).await?;
+        process_pool_data(pool_address, pool_contract.into()).await?;
 
     debug!(
         "[ UNISWAP_V3_BUILD_DEBUG ][{:?}] Данные пула получены: liquidity: {}, tick: {}, fee: {}",
@@ -551,7 +553,7 @@ pub async fn build_uniswap_v3_pool(
 /// Функция для синхронизации пулов Uniswap V3 с кэша и обновления графа
 pub async fn sync_pools(
     graph: Arc<ArcSwap<UniversalGraph>>,
-    provider: Arc<Provider<Ws>>,
+    provider: Arc<Provider<Http>>,
     token_cache: &TokenCache,
     pool_cache: Arc<UniswapPoolCache>,
     token_whitelist: &DashSet<Address>,
@@ -628,25 +630,39 @@ pub async fn sync_pools(
                     );
                     if pool.is_active {
                         let graph_inner = graph.load().as_ref().clone();
-                        graph_inner.upsert_pool(pool.clone());
-                        graph.store(Arc::new(graph_inner));
-                        phase1_active_count.fetch_add(1, Ordering::SeqCst);
-                        event_subscriber.subscribed_pools.insert(current_addresses);
-                        info!(
-                            "{} Пул с адресом {:?} добавлен в список подписки. Всего подписанных пулов: {}",
-                            "INFO".bright_yellow().blink(),
-                            current_addresses,
-                            event_subscriber.subscribed_pools.len()
-                        );
-
-                        if save_per_pool {
-                            if let Err(e) = graph.load().save_graph_to_json("graph_final.json") {
-                                warn!("[ UNISWAP_V3_SYNC_POOL ] Ошибка сохранения JSON графа для пула {:?}: {:?}", current_addresses, e);
-                            } else {
-                                info!(
-                                    "[ UNISWAP_V3_SYNC_POOL ] JSON граф сохранён для пула {:?}",
+                        match graph_inner.upsert_pool(pool.clone()).await {
+                            Ok(()) => {
+                                debug!(
+                                    "[ UNISWAP_V3_SYNC_POOL_DEBUG ][{:?}] Пул успешно добавлен в граф",
                                     current_addresses
                                 );
+                                graph.store(Arc::new(graph_inner));
+                                phase1_active_count.fetch_add(1, Ordering::SeqCst);
+                                event_subscriber.subscribed_pools.insert(current_addresses);
+                                info!(
+                                    "{} Пул с адресом {:?} добавлен в список подписки. Всего подписанных пулов: {}",
+                                    "INFO".bright_yellow().blink(),
+                                    current_addresses,
+                                    event_subscriber.subscribed_pools.len()
+                                );
+
+                                if save_per_pool {
+                                    if let Err(e) = graph.load().save_graph_to_json("graph_final.json") {
+                                        warn!("[ UNISWAP_V3_SYNC_POOL ] Ошибка сохранения JSON графа для пула {:?}: {:?}", current_addresses, e);
+                                    } else {
+                                        info!(
+                                            "[ UNISWAP_V3_SYNC_POOL ] JSON граф сохранён для пула {:?}",
+                                            current_addresses
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!(
+                                    "[ UNISWAP_V3_SYNC_POOL_ERROR ][{:?}] Ошибка при добавлении пула в граф: {}",
+                                    current_addresses, e
+                                );
+                                continue;
                             }
                         }
                     }
@@ -814,8 +830,8 @@ pub async fn fetch_pool_fee(
 /// * `Option<(U512, (U256, i32, u16, u16, u16, u8, bool), i32, u128, u32)>` - Данные пула или None при ошибке
 async fn fetch_pool_data_multicall(
     pool_address: H160,
-    pool_contract: &UniswapV3Pool<Provider<Ws>>,
-    provider: Arc<Provider<Ws>>,
+    pool_contract: &UniswapV3Pool<Provider<Http>>,
+    provider: Arc<Provider<Http>>,
 ) -> Option<(U256, (U256, i32, u16, u16, u16, u8, bool), i32, u128, u32)> {
     // Логируем начало мультиколла
     debug!(
@@ -827,8 +843,8 @@ async fn fetch_pool_data_multicall(
     let mut multicall = Multicall::new(provider, None).await.ok()?;
     // Добавляем вызовы функций контракта
     multicall
-        .add_call(pool_contract.liquidity(), true) // Ликвидность пула
-        .add_call(pool_contract.slot_0(), true) // Данные slot0 (sqrtPriceX96, tick, etc.)
+        .add_call(pool_contract.liquidity(), true)              // Ликвидность пула
+        .add_call(pool_contract.slot_0(), true)                 // Данные slot0 (sqrtPriceX96, tick, etc.)
         .add_call(pool_contract.tick_spacing(), true) // Интервал тиков
         .add_call(pool_contract.max_liquidity_per_tick(), true) // Максимальная ликвидность на тик
         .add_call(pool_contract.fee(), true); // Комиссия пула
@@ -874,7 +890,7 @@ async fn fetch_pool_data_multicall(
 /// * `Option<(U512, (U256, i32, u16, u16, u16, u8, bool), i32, u128, u32)>` - Данные пула или None при ошибке
 pub async fn process_pool_data(
     pool_address: H160,
-    pool_contract: Arc<UniswapV3Pool<Provider<Ws>>>,
+    pool_contract: Arc<UniswapV3Pool<Provider<Http>>>,
 ) -> Option<(
     U256,
     (ethers::types::U256, i32, u16, u16, u16, u8, bool),
