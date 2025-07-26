@@ -109,8 +109,8 @@ pub async fn get_aave_data(
                                 .await
                             {
                                 Ok(virtual_balance) => {
-                                    
-                                    info!("[ AAVE ] Токен {} c блокчейна ({:?}): virtualBalance {}",
+                                    info!(
+                                        "[ AAVE ] Токен {} c блокчейна ({:?}): virtualBalance {}",
                                         token.symbol, token.token_address, virtual_balance
                                     );
                                     Some((token.token_address, (token.symbol, virtual_balance)))
@@ -171,7 +171,7 @@ pub async fn get_aave_data(
 
         // Если данные с блокчейна не получены, пытаемся загрузить из файла
         info!("[ AAVE ] Попытка загрузки данных из файла aave_liquidity.json");
-        
+
         let mut fallback_data = AaveTokenLiquidity::default();
         match File::open("aave_liquidity.json") {
             Ok(mut file) => {
@@ -224,11 +224,3 @@ pub async fn get_aave_data(
         info!("[ AAVE ] Ожидание следующего обновления");
     }
 }
-
-
-
-
-
-
-
-

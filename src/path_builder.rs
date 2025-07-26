@@ -2,175 +2,309 @@ use crate::{aave_v3_flash_monitor::AaveTokenLiquidity, uniswap_graph::UniversalG
 use arc_swap::ArcSwap;
 use colored::Colorize;
 use dashmap::DashMap;
-use ethers::types::Address;
+use ethers::types::{Address, U256};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
-    path::Path,
-    sync::{atomic::{AtomicBool, Ordering}, Arc},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 use tokio::sync::watch;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 
 /// Структура представляющая путь арбитража
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArbitragePath {
+    /// Последовательность токенов в пути арбитража
     pub tokens: Vec<Address>,
+    /// Последовательность пулов для обмена между токенами
     pub pools: Vec<Address>,
+}
+
+/// Информация о пуле для заимствования с оптимизацией возврата
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BorrowPoolInfo {
+    /// Адрес пула
+    pub pool_address: Address,
+    /// Уровень комиссии пула (например, 3000 для 0.3%)
+    pub fee_tier: u32,
+    /// Предпочтительность займа того же токена
+    pub prefer_same_token: bool,
+    /// Токен, который нужно вернуть в этот пул
+    pub repay_token: Address,
 }
 
 /// Основная структура для построения и управления путями арбитража
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PathBuilder {
+    /// Найденные арбитражные пути
     pub paths: Vec<ArbitragePath>,
+    /// Отображение пулов на индексы путей, в которых они участвуют
     pub pool_to_paths: DashMap<Address, Vec<usize>>,
+    /// Пуллы для заимствования, сгруппированные по токенам
+    pub borrow_pools: DashMap<Address, Vec<BorrowPoolInfo>>,
+    /// Токены, доступные для флеш-займов в Aave
     aave_tokens: HashSet<Address>,
-     #[serde(skip)] // Исключаем из сериализации/десериализации
+    /// Флаг завершения построения путей
+    #[serde(skip)]
     pub is_paths_built: Arc<AtomicBool>,
 }
 
 impl PathBuilder {
     /// Создает новый экземпляр PathBuilder
-       pub fn new(aave_rx: watch::Receiver<AaveTokenLiquidity>, is_paths_built: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        aave_rx: watch::Receiver<AaveTokenLiquidity>,
+        is_paths_built: Arc<AtomicBool>,
+    ) -> Self {
         debug!(
-            "[{}] Начало создания нового экземпляра PathBuilder",
-            "UNISWAP_PATH_BUILDER".green()
+            "[{}] Создание нового экземпляра PathBuilder",
+            "UNISWAP_PATH_BUILDER 🧬".green()
         );
         let aave_tokens_borrow = aave_rx.borrow().token_address.clone();
+        
         warn!(
-            "[{}] Загружено {} токенов из Aave для flash loan: {:?}",
-            "UNISWAP_PATH_BUILDER".green(),
+            "[{}] Загружено {} токенов из Aave для флеш-займов: {:?}",
+            "UNISWAP_PATH_BUILDER 🧬".green(),
             aave_tokens_borrow.len(),
             aave_tokens_borrow
         );
-        let result = Self {
+
+        Self {
             aave_tokens: aave_tokens_borrow,
             paths: Vec::new(),
             pool_to_paths: DashMap::new(),
+            borrow_pools: DashMap::new(),
             is_paths_built,
-        };
-        info!(
-            "[{}] Экземпляр PathBuilder успешно создан",
-            "UNISWAP_PATH_BUILDER".green()
-        );
-        result
+        }
     }
 
-    /// Основная функция для построения всех возможных путей арбитража
-     pub fn build_all_paths(&mut self, graph: Arc<ArcSwap<UniversalGraph>>) {
-        info!("[{}] Начало построения всех арбитражных путей", "UNISWAP_PATH_BUILDER".green());
-        debug!("[{}] Очистка предыдущих путей (было {} путей)", 
-            "UNISWAP_PATH_BUILDER".green(), self.paths.len());
-        self.paths.clear();
-        debug!("[{}] Очистка предыдущих индексов pool_to_paths (было {} записей)", 
-            "UNISWAP_PATH_BUILDER".green(), self.pool_to_paths.len());
-        self.pool_to_paths.clear();
+    /// Основная функция построения всех возможных арбитражных путей
+    pub fn build_all_paths(&mut self, graph: Arc<ArcSwap<UniversalGraph>>) {
+        warn!(
+            "[{}] Начало построения арбитражных путей",
+            "UNISWAP_PATH_BUILDER 🧬".green()
+        );
+        
+        // Очистка предыдущих данных
+        self.clear_previous_data();
 
         if graph.load().nodes.is_empty() || graph.load().edges.is_empty() {
-            error!("[{}] Граф пуст: nodes.len() = {}, edges.len() = {}. Пути не будут построены", 
-                "UNISWAP_PATH_BUILDER".green(), graph.load().nodes.len(), graph.load().edges.len());
-            return;
-        }
-
-        let related_list = self.build_related_list(&graph);
-        warn!("[{}] Построено {} связей между токенами", 
-            "UNISWAP_PATH_BUILDER".green(), related_list.len());
-
-        if related_list.is_empty() {
-            warn!("[{}] Список связей пуст, пути не будут построены", 
-                "UNISWAP_PATH_BUILDER".green());
-            return;
-        }
-
-        let aave_tokens = self.aave_tokens.clone();
-        debug!("[{}] Начало поиска путей для {} токенов Aave", 
-            "UNISWAP_PATH_BUILDER".green(), aave_tokens.len());
-
-        for start_token in aave_tokens {
-            debug!("[{}] Поиск путей для начального токена {:?}", 
-                "UNISWAP_PATH_BUILDER".green(), start_token);
-            let mut visited_pools = HashSet::new();
-            let mut current_path = vec![start_token];
-            let mut current_pools = Vec::new();
-            self.search_paths_dual_hops(
-                start_token,
-                start_token,
-                &related_list,
-                &mut visited_pools,
-                &mut current_path,
-                &mut current_pools,
-                0,
+            error!(
+                "[{}] Обнаружен пустой граф: nodes.len() = {}, edges.len() = {}",
+                "UNISWAP_PATH_BUILDER 🧬".green(),
+                graph.load().nodes.len(),
+                graph.load().edges.len()
             );
-            debug!("[{}] Завершён поиск путей для токена {:?}", 
-                "UNISWAP_PATH_BUILDER".green(), start_token);
+            return;
         }
 
-        info!("[{}] Найдено {} арбитражных путей", 
-            "UNISWAP_PATH_BUILDER".green(), self.paths.len());
+        // Построение связей между токенами
+        let related_list = self.build_related_list(&graph);
         
-        if !self.paths.is_empty() {
-            info!("[{}] Сохранение путей в файл arbitrage_paths.json", 
-                "UNISWAP_PATH_BUILDER".green());
-            if let Err(e) = self.save_to_json("arbitrage_paths.json") {
-                warn!("[{}] Ошибка сохранения путей в JSON: {:?}", 
-                    "UNISWAP_PATH_BUILDER".green(), e);
-            } else {
-                info!("[{}] Пути успешно сохранены в arbitrage_paths.json", 
-                    "UNISWAP_PATH_BUILDER".green());
-                self.is_paths_built.store(true, Ordering::SeqCst);
-                info!("[{}] Флаг is_paths_built установлен в true", 
-                    "UNISWAP_PATH_BUILDER".green());
-            }
-        } else {
-            warn!("[{}] Не найдено путей, пропуск сохранения в JSON", 
-                "UNISWAP_PATH_BUILDER".green());
+        // Поиск путей для каждого токена Aave
+        for start_token in self.aave_tokens.clone() {
+            self.find_paths_for_token(start_token, &related_list);
         }
+
+        self.finalize_path_construction();
     }
 
-    /// Строит список связей между токенами на основе графа пулов Uniswap
-fn build_related_list(&self, graph: &Arc<ArcSwap<UniversalGraph>>) -> HashMap<Address, Vec<(Address, Address)>> {
-        debug!("[{}] Начало построения списка связей между токенами", 
-            "UNISWAP_PATH_BUILDER".green());
-        debug!("[{}] Граф содержит {} узлов и {} рёбер", 
-            "UNISWAP_PATH_BUILDER".green(), graph.load().nodes.len(), graph.load().edges.len());
+    /// Очищает предыдущие данные перед построением новых путей
+    fn clear_previous_data(&mut self) {
+        debug!(
+            "[{}] Очистка предыдущих данных (было {} путей)",
+            "UNISWAP_PATH_BUILDER 🧬".green(),
+            self.paths.len()
+        );
+        self.paths.clear();
+        self.pool_to_paths.clear();
+        self.borrow_pools.clear();
+    }
+
+    /// Строит граф связей между токенами и индексирует пулы для заимствования
+    fn build_related_list(
+        &mut self,
+        graph: &Arc<ArcSwap<UniversalGraph>>,
+    ) -> HashMap<Address, Vec<(Address, Address)>> {
+        debug!(
+            "[{}] Построение графа связей между токенами",
+            "UNISWAP_PATH_BUILDER 🧬".green()
+        );
         let mut related_list = HashMap::new();
-        let pool_count = graph.load().nodes.len();
-        debug!("[{}] Обработка {} пулов из графа", 
-            "UNISWAP_PATH_BUILDER".green(), pool_count);
 
         for entry in graph.load().nodes.iter() {
             let pool_address = *entry.key();
             if let Some(pool) = graph.load().edges.get(&pool_address) {
-                let token0 = *pool.uniswap_token_a;
-                let token1 = *pool.uniswap_token_b;
-                trace!("[{}] Пул {}: {:?}, токены: ({:?}, {:?})", 
-                    "UNISWAP_PATH_BUILDER".green(), pool_count, pool_address, token0, token1);
-
-                related_list
-                    .entry(token0)
-                    .or_insert_with(Vec::new)
-                    .push((token1, pool_address));
-                debug!("[{}] Добавлена связь: токен {:?} -> токен {:?}", 
-                    "UNISWAP_PATH_BUILDER".green(), token0, token1);
-
-                related_list
-                    .entry(token1)
-                    .or_insert_with(Vec::new)
-                    .push((token0, pool_address));
-                debug!("[{}] Добавлена обратная связь: токен {:?} -> токен {:?}", 
-                    "UNISWAP_PATH_BUILDER".green(), token1, token0);
-            } else {
-                warn!("[{}] Пул {:?} отсутствует в edges, пропуск", 
-                    "UNISWAP_PATH_BUILDER".green(), pool_address);
+                self.process_pool(pool_address, &pool, &mut related_list);
             }
         }
 
-        warn!("[{}] Список связей построен, содержит {} токенов", 
-            "UNISWAP_PATH_BUILDER".green(), related_list.len());
+        // Сортировка пулов по комиссии для каждого токена
+        self.sort_borrow_pools_by_fee();
+        
+        warn!(
+            "[{}] Построено {} связей между токенами",
+            "UNISWAP_PATH_BUILDER 🧬".green(),
+            related_list.len()
+        );
+        
         related_list
     }
 
+    /// Обрабатывает отдельный пул, добавляя связи и информацию для займа
+    fn process_pool(
+        &mut self,
+        pool_address: Address,
+        pool: &crate::uniswap_graph::UniswapPool,
+        related_list: &mut HashMap<Address, Vec<(Address, Address)>>,
+    ) {
+        let token0 = *pool.uniswap_token_a;
+        let token1 = *pool.uniswap_token_b;
+        let fee_tier = pool.uniswap_fee_tier;
+        let sqrt_price_x96 = pool.uniswap_sqrt_price;
+
+        debug!(
+            "[{}] Обработка пула {:?}: токены ({:?}, {:?}), комиссия {}",
+            "UNISWAP_PATH_BUILDER 🧬".green(),
+            pool_address,
+            token0,
+            token1,
+            fee_tier
+        );
+
+        // Добавление связей между токенами
+        self.add_token_relation(related_list, token0, token1, pool_address);
+        self.add_token_relation(related_list, token1, token0, pool_address);
+
+        // Расчет параметров для займа
+        let (prefer_same_token, repay_token) = self.calculate_borrow_preferences(
+            fee_tier,
+            sqrt_price_x96,
+            token0,
+            token1,
+        );
+
+        // Добавление информации о пуле для займа
+        self.add_borrow_pool(token0, pool_address, fee_tier, prefer_same_token, repay_token);
+        self.add_borrow_pool(token1, pool_address, fee_tier, prefer_same_token, repay_token);
+    }
+
+    /// Добавляет связь между токенами в граф
+    fn add_token_relation(
+        &self,
+        related_list: &mut HashMap<Address, Vec<(Address, Address)>>,
+        from_token: Address,
+        to_token: Address,
+        pool_address: Address,
+    ) {
+        related_list
+            .entry(from_token)
+            .or_default()
+            .push((to_token, pool_address));
+    }
+
+    /// Вычисляет предпочтения для займа из пула
+    fn calculate_borrow_preferences(
+        &self,
+        fee_tier: u32,
+        sqrt_price_x96: U256,
+        token0: Address,
+        token1: Address,
+    ) -> (bool, Address) {
+        let borrow_amount = U256::from(1_000_000_000_000_000_000u64); // 1 ETH в wei
+        
+        // Комиссия при займе того же токена
+        let fee_same = borrow_amount * U256::from(fee_tier) / U256::from(1_000_000);
+        
+        // Комиссия при займе парного токена (с учетом конвертации туда-обратно)
+        let fee_paired = borrow_amount * U256::from(fee_tier) * 2 / U256::from(1_000_000);
+        
+        // Цена парного токена в терминах основного
+        let price_paired = (sqrt_price_x96 * sqrt_price_x96) / U256::from(2).pow(U256::from(192));
+        
+        // Конвертация комиссии в парном токене обратно в основной
+        let fee_paired_converted = if price_paired.is_zero() {
+            U256::max_value() // Избегаем деления на ноль
+        } else {
+            fee_paired / price_paired
+        };
+
+        // Определение предпочтений
+        let prefer_same_token = fee_same <= fee_paired_converted;
+        let repay_token = if prefer_same_token { token0 } else { token1 };
+
+        (prefer_same_token, repay_token)
+    }
+
+    /// Добавляет пул в список доступных для займа
+    fn add_borrow_pool(
+        &mut self,
+        token: Address,
+        pool_address: Address,
+        fee_tier: u32,
+        prefer_same_token: bool,
+        repay_token: Address,
+    ) {
+        self.borrow_pools
+            .entry(token)
+            .or_default()
+            .push(BorrowPoolInfo {
+                pool_address,
+                fee_tier,
+                prefer_same_token,
+                repay_token,
+            });
+    }
+
+    /// Сортирует пулы для займа по комиссии
+    fn sort_borrow_pools_by_fee(&mut self) {
+        for mut entry in self.borrow_pools.iter_mut() {
+            entry.value_mut().sort_by(|a, b| a.fee_tier.cmp(&b.fee_tier));
+            debug!(
+                "[{}] Отсортированы пулы для токена {:?} по комиссии",
+                "UNISWAP_PATH_BUILDER 🧬".green(),
+                entry.key()
+            );
+        }
+    }
+
+    /// Находит все пути для конкретного начального токена
+    fn find_paths_for_token(
+        &mut self,
+        start_token: Address,
+        related_list: &HashMap<Address, Vec<(Address, Address)>>,
+    ) {
+        debug!(
+            "[{}] Поиск путей для начального токена {:?}",
+            "UNISWAP_PATH_BUILDER 🧬".green(),
+            start_token
+        );
+
+        let mut visited_pools = HashSet::new();
+        let mut current_path = vec![start_token];
+        let mut current_pools = Vec::new();
+
+        self.search_paths_dual_hops(
+            start_token,
+            start_token,
+            related_list,
+            &mut visited_pools,
+            &mut current_path,
+            &mut current_pools,
+            0,
+        );
+
+        debug!(
+            "[{}] Завершен поиск путей для токена {:?}",
+            "UNISWAP_PATH_BUILDER 🧬".green(),
+            start_token
+        );
+    }
+
+    /// Рекурсивный поиск путей с ограничением в 4 хопа
     fn search_paths_dual_hops(
         &mut self,
         start_token: Address,
@@ -181,58 +315,40 @@ fn build_related_list(&self, graph: &Arc<ArcSwap<UniversalGraph>>) -> HashMap<Ad
         current_pools: &mut Vec<Address>,
         current_hops: usize,
     ) {
-        debug!(
-            "[{}] Поиск путей: текущий токен {:?}, хопы: {}, путь: {:?}, пулы: {:?}",
-            "UNISWAP_PATH_BUILDER".green(),
-            current_token,
-            current_hops,
-            current_path,
-            current_pools
-        );
-
+        // Ограничение глубины поиска
         if current_hops >= 4 {
             return;
         }
 
+        // Проверка завершения цикла
         if (current_hops == 3 || current_hops == 4)
             && current_token == start_token
             && !current_pools.is_empty()
         {
-            let path = ArbitragePath {
-                tokens: current_path.clone(),
-                pools: current_pools.clone(),
-            };
-            let path_index = self.paths.len();
-            self.paths.push(path);
-            for pool in current_pools.iter() {
-                self.pool_to_paths
-                    .entry(*pool)
-                    .or_insert_with(Vec::new)
-                    .push(path_index);
-            }
-            debug!(
-                "[{}] Найден путь #{}: токены={:?}, пулы={:?}",
-                "UNISWAP_PATH_BUILDER".green(),
-                path_index,
-                current_path,
-                current_pools
-            );
-            if current_hops == 4 {
-                return;
-            }
+            self.register_arbitrage_path(current_path, current_pools);
+            return;
         }
 
+        // Обработка связей текущего токена
         if let Some(connections) = related_list.get(&current_token) {
             for (next_token, pool_address) in connections {
-                if visited_pools.contains(pool_address) {
+                if !self.should_visit_pool(current_hops, *next_token, start_token, *pool_address, visited_pools) {
                     continue;
                 }
-                if current_hops == 3 && *next_token != start_token {
-                    continue;
-                }
+
+                debug!(
+                    "[{}] Переход от {:?} к {:?} через пул {:?}",
+                    "UNISWAP_PATH_BUILDER 🧬".green(),
+                    current_token,
+                    next_token,
+                    pool_address
+                );
+
+                // Рекурсивный поиск
                 visited_pools.insert(*pool_address);
                 current_path.push(*next_token);
                 current_pools.push(*pool_address);
+
                 self.search_paths_dual_hops(
                     start_token,
                     *next_token,
@@ -242,37 +358,142 @@ fn build_related_list(&self, graph: &Arc<ArcSwap<UniversalGraph>>) -> HashMap<Ad
                     current_pools,
                     current_hops + 1,
                 );
+
                 visited_pools.remove(pool_address);
                 current_path.pop();
                 current_pools.pop();
             }
-        } else {
+        }
+    }
+
+    /// Регистрирует найденный арбитражный путь
+    fn register_arbitrage_path(&mut self, tokens: &[Address], pools: &[Address]) {
+        let path = ArbitragePath {
+            tokens: tokens.to_vec(),
+            pools: pools.to_vec(),
+        };
+
+        let path_index = self.paths.len();
+        self.paths.push(path);
+
+        // Индексация пулов
+        for pool in pools {
+            self.pool_to_paths
+                .entry(*pool)
+                .or_default()
+                .push(path_index);
+        }
+
+        // Валидация доступности займа для промежуточных токенов
+        for &token in &tokens[1..tokens.len() - 1] {
+            if !self.borrow_pools.contains_key(&token) {
+                warn!(
+                    "[{}] Нет доступных пулов для займа промежуточного токена {:?}",
+                    "UNISWAP_PATH_BUILDER 🧬".green(),
+                    token
+                );
+            }
+        }
+
+        debug!(
+            "[{}] Зарегистрирован новый путь #{}: токены {:?}, пулы {:?}",
+            "UNISWAP_PATH_BUILDER 🧬".green(),
+            path_index,
+            tokens,
+            pools
+        );
+    }
+
+    /// Определяет, следует ли посещать указанный пул
+    fn should_visit_pool(
+        &self,
+        current_hops: usize,
+        next_token: Address,
+        start_token: Address,
+        pool_address: Address,
+        visited_pools: &HashSet<Address>,
+    ) -> bool {
+        !visited_pools.contains(&pool_address)
+            && !(current_hops == 3 && next_token != start_token)
+    }
+
+    /// Находит оптимальный пул для займа указанного токена
+    pub fn find_optimal_borrow_pool(
+        &self,
+        token: Address,
+        path: &[Address],
+    ) -> Option<BorrowPoolInfo> {
+        let mut pools: Vec<_> = self.borrow_pools
+            .get(&token)?
+            .iter()
+            .map(|info| info.clone())
+            .collect();
+
+        // Сортировка по приоритетам:
+        // 1. Минимальная комиссия
+        pools.sort_by(|a, b| a.fee_tier.cmp(&b.fee_tier));
+        
+        // 2. Наличие repay_token в пути
+        pools.sort_by(|a, b| {
+            path.contains(&b.repay_token).cmp(&path.contains(&a.repay_token))
+        });
+        
+        // 3. Предпочтение direct borrow
+        pools.sort_by(|a, b| b.prefer_same_token.cmp(&a.prefer_same_token));
+
+        debug!(
+            "[{}] Выбор оптимального пула для токена {:?} - найдено {} вариантов",
+            "UNISWAP_PATH_BUILDER 🧬".green(),
+            token,
+            pools.len()
+        );
+        
+        pools.into_iter().next()
+    }
+
+    /// Завершает процесс построения путей
+    fn finalize_path_construction(&mut self) {
+        warn!(
+            "[{}] Построение путей завершено. Найдено {} арбитражных путей",
+            "UNISWAP_PATH_BUILDER 🧬".green(),
+            self.paths.len()
+        );
+
+        if !self.paths.is_empty() {
+            info!(
+                "[{}] Сохранение путей в файл arbitrage_paths.json",
+                "UNISWAP_PATH_BUILDER 🧬".green()
+            );
+            if let Err(e) = self.save_paths_to_json() {
+                warn!(
+                    "[{}] Ошибка сохранения путей: {:?}",
+                    "UNISWAP_PATH_BUILDER 🧬".green(),
+                    e
+                );
+            } else {
+                info!(
+                    "[{}] Пути успешно сохранены",
+                    "UNISWAP_PATH_BUILDER 🧬".green()
+                );
+            }
+            self.is_paths_built.store(true, Ordering::SeqCst);
             debug!(
-                "[{}] Нет связанных токенов для {:?}",
-                "UNISWAP_PATH_BUILDER".green(),
-                current_token
+                "[{}] Флаг is_paths_built установлен в true",
+                "UNISWAP_PATH_BUILDER 🧬".green()
+            );
+        } else {
+            warn!(
+                "[{}] Арбитражные пути не найдены",
+                "UNISWAP_PATH_BUILDER 🧬".green()
             );
         }
     }
 
-    pub fn save_to_json(
-        &self,
-        file_path: impl AsRef<Path>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        info!(
-            "[{}] Начало сохранения PathBuilder в JSON файл {:?}",
-            "UNISWAP_PATH_BUILDER".green(),
-            file_path.as_ref()
-        );
-        let file = File::create(file_path.as_ref())?;
+    /// Сохраняет пути в JSON файл
+    fn save_paths_to_json(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let file_path = "arbitrage_paths.json";
+        let file = File::create(file_path)?;
         serde_json::to_writer_pretty(&file, self)?;
-        info!(
-            "[{}] Сохранение в JSON завершено успешно",
-            "UNISWAP_PATH_BUILDER".green()
-        );
         Ok(())
     }
-
-
-    
 }

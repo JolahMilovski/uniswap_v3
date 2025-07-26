@@ -1,12 +1,12 @@
 pub mod aave_v3_flash_monitor;
-pub mod arb_scanner;
-pub mod arb_simulator;
+
 pub mod path_builder;
 pub mod provider;
 pub mod take_gas_price;
 pub mod tick_fetcher;
 pub mod token;
 pub mod token_white_list;
+pub mod trade_simulator;
 pub mod uniswap_cache;
 pub mod uniswap_events;
 pub mod uniswap_graph;
@@ -18,27 +18,32 @@ use provider::ProviderManager;
 use token::load_token_list_from_json;
 use tokio::{
     signal, spawn,
-    sync::{broadcast, mpsc, watch, Notify}, time::interval,
+    sync::{broadcast, mpsc, watch, Notify},
+    time::interval,
 };
+
 use tracing::{error, info, warn, Level};
-use tracing_appender::rolling;
+use tracing_appender::{non_blocking::{NonBlocking, NonBlockingBuilder, WorkerGuard}, rolling};
 use tracing_subscriber::fmt;
 use tracing_subscriber::fmt::FormatFields;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
-use crate::arb_simulator::SimulationRunner;
+use crate::trade_simulator::TradeSimulator;
+
 use crate::token::TokenInfo;
 use crate::uniswap_events::{PoolEventInfo, UniswapEventSubscriber};
+
 use arc_swap::ArcSwap;
 use chrono;
 use dashmap::{DashMap, DashSet};
 use dotenv::dotenv;
-use ethers::types::{Address, H160};
-use std::{io::IsTerminal, sync::atomic::AtomicBool};
+use ethers::types::Address;
+
 use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::HashMap, env};
+use std::{io::IsTerminal, sync::atomic::AtomicBool};
 
 use uniswap_cache::UniswapPoolCache;
 use uniswap_graph::UniversalGraph;
@@ -51,9 +56,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Настройка ротации логов (ежеминутно) и запись в файл
     let file_appender = rolling::minutely("./logs", "uniswap_bot_log.txt");
-    
+
+    let (non_blocking, _guard): (NonBlocking, WorkerGuard) = NonBlockingBuilder::default()
+        .buffered_lines_limit(128_000) // Буфер на 128_000 событий
+        .lossy(false) // Не терять логи, применять обратное давление
+        .thread_name("uniswap-logger")
+        .finish(file_appender);
+
+    // Мониторинг потери логов
+    let error_counter = non_blocking.error_counter();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let dropped = error_counter.dropped_lines();
+            if dropped > 0 {
+                warn!("[LOGGING] Потеряно {} логов из-за переполнения буфера", dropped);
+            }
+        }
+    });
+
+
     let file_layer = fmt::layer()
-        .with_writer(file_appender)
+        .with_writer(non_blocking)
         .with_ansi(true)
         .with_target(true)
         .with_line_number(true)
@@ -73,31 +98,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_default_directive(Level::DEBUG.into())
         .parse(
             "debug,\
-            uniswap::arb_scanner=debug,\
-            uniswap::arb_simulator=debug,\
             uniswap::aave_v3_flash_monitor=warn,\
             uniswap::path_builder=warn,\
             uniswap::provider=warn,\
             uniswap::take_gas_price=warn,\
             uniswap::token=warn,\
             uniswap::token_white_list=warn,\
+            uniswap::trade_simulator=info,\
             uniswap::uniswap_cache=warn,\
             uniswap::tick_fetcher=warn,\
-            uniswap::uniswap_events=debug,\
-            uniswap::uniswap_graph=warn,\
+            uniswap::uniswap_events=info,\
+            uniswap::uniswap_graph=info,\
             uniswap::uniswap_v3=warn,\
             h2=off,\
             hyper=off,\
-            "
+            ",
         )
         .expect("Неверная конфигурация EnvFilter");
 
-    // Инициализация логгера с ротацией и выводом в консоль
-    tracing_subscriber::registry()
-        .with(file_layer)
-        .with(stdout_layer)
-        .with(filter)
-        .init();
+    // Инициализация логгера
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::registry()
+            .with(file_layer)
+            .with(stdout_layer)
+            .with(filter)
+    ).expect("Ошибка настройки логгера");
 
     // Логирование инициализации логгера
     info!("[MAIN] Логгер инициализирован в {:?}", chrono::Utc::now());
@@ -107,11 +132,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut ticker = interval(Duration::from_secs(200));
         loop {
             ticker.tick().await;
-            info!("❤️❤️ ❤️[    MAIN    ] Heartbeat - still running ❤️❤️❤️");
+            info!("❤️  ❤️  ❤️  [ MAIN ] Heartbeat - still running   ❤️  ❤️  ❤️");
         }
     });
 
-//===============================================================================================           Подключение к блокчейну через ProviderManager
+    //===============================================================================================           Подключение к блокчейну через ProviderManager
+
     info!("[MAIN] Подключаемся к блокчейну");
 
     let provider_manager = ProviderManager::new(500).await;
@@ -122,6 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let provider_http_for_polling = provider_http.clone();
 
     //===========================================================================================        Инициализация кэша токенов
+
     pub type TokenCache = Arc<DashMap<Address, TokenInfo>>;
     let token_cache: TokenCache = {
         let raw_map = load_token_list_from_json();
@@ -135,6 +162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     //==============================================================================================         Загрузка белого списка токенов
+
     let token_whitelist_set: Arc<DashSet<Address>> =
         Arc::new(token_white_list::load_token_whitelist());
     info!(
@@ -143,8 +171,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     //=============================================================================================          Инициализация кэша пулов Uniswap
-
-
 
     let pool_cache: Arc<UniswapPoolCache> = Arc::new(
         match UniswapPoolCache::load_from_bin("uniswap_pool_addresses_cache.bin") {
@@ -159,12 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
 
-
-
     //==========================================================================================     Инициализация графа Uniswap
-
-
-
 
     let graph: Arc<ArcSwap<UniversalGraph>> =
         Arc::new(ArcSwap::from_pointee(UniversalGraph::new()));
@@ -173,11 +194,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let graph_for_shutdown = Arc::clone(&graph);
     let pulling_graph = Arc::clone(&graph);
 
-
-
     //=======================================================================================        Обработка сигнала завершения (Ctrl+C) и сохранение графа
-
-
 
     let shutdown_notify = Arc::new(Notify::new());
     let shutdown_notify_clone = Arc::clone(&shutdown_notify);
@@ -200,9 +217,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     //============================================================================ Запуск мониторинга ликвидности Aave
 
-
-
-
     let (aave_tx, aave_rx) = watch::channel(AaveTokenLiquidity::default());
     info!("[MAIN] Мониторинг ликвидности Aave запущен в фоне");
     let aave_handle = spawn({
@@ -215,19 +229,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-
-
-
     //============================================================================ Подписка на новые блоки
-
-
-
 
     let (block_sender, block_receiver) = watch::channel(0);
     let block_handle = spawn({
         let provider_ws = Arc::clone(&provider_for_sub_block);
         async move {
-            match UniswapEventSubscriber::subscribe_to_new_blocks(&provider_ws, block_sender.clone()).await {
+            match UniswapEventSubscriber::subscribe_to_new_blocks(
+                &provider_ws,
+                block_sender.clone(),
+            )
+            .await
+            {
                 Ok(_) => {
                     info!("[MAIN_SUBSCRIBE_BLOCKS] Подписка на новые блоки успешно запущена");
                 }
@@ -238,66 +251,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    //========================================================================================================           Создание модуля пулинга событий
 
+    info!("[MAIN] Инициализация модуля пулинга событий");
 
+    let (event_tx, _event_rx) = broadcast::channel::<HashMap<Address, PoolEventInfo>>(2048);
 
-//========================================================================================================           Создание модуля пулинга событий
+    let subscriber: Arc<UniswapEventSubscriber> =
+        Arc::new(UniswapEventSubscriber::new(provider_http.clone()));
+    let subscriber_clone = Arc::clone(&subscriber);
+    let block_receiver_clone_to_subscriber = block_receiver.clone();
+    let is_paths_built = Arc::new(AtomicBool::new(false));
 
-
-
-info!("[MAIN] Инициализация модуля пулинга событий");
-
-let (event_tx, _event_rx) = broadcast::channel::<HashMap<Address, PoolEventInfo>>(2048);
-let (_signal_tx, signal_rx) = mpsc::channel::<H160>(1000);
-
-let subscriber: Arc<UniswapEventSubscriber> = Arc::new(UniswapEventSubscriber::new(
-    provider_http.clone()));
-let subscriber_clone = Arc::clone(&subscriber);
-let block_receiver_clone_to_subscriber = block_receiver.clone();
-let is_paths_built = Arc::new(AtomicBool::new(false));
-
-// Создание задачи для обработки сигналов
-let signal_handle = spawn({
-    let mut signal_rx = signal_rx;
-    async move {
-        while let Some(address) = signal_rx.recv().await {
-            info!("[MAIN_SIGNAL] Получен сигнал для адреса: {:?}", address);
+    // Создание задачи для обработки событий
+    let is_paths_built_for_polling = Arc::clone(&is_paths_built);
+    let event_tx_for_polling = event_tx.clone();
+    let (simulator_tx, simulator_rx) = mpsc::channel::<PoolEventInfo>(2000);
+    //let token_cache_clone = Arc::clone(&token_cache);
+    let polling_handle = spawn({
+        let graph = Arc::clone(&pulling_graph);
+        let provider_http = Arc::clone(&provider_http_for_polling);
+        async move {
+            if let Err(e) = &subscriber_clone
+                .polling_event(
+                    &block_receiver_clone_to_subscriber,
+                    graph,
+                    event_tx_for_polling,
+                    is_paths_built_for_polling,
+                    provider_http,
+                    simulator_tx,
+                )
+                .await
+            {
+                error!(
+                    "[MAIN_POLLING] Ошибка выполнения задачи пулинга событий: {:?}",
+                    e
+                );
+            } else {
+                warn!("[MAIN_POLLING] Задача пулинга событий завершена штатно");
+            }
         }
-        warn!("[MAIN_SIGNAL] Канал получения сигналов закрыт");
-    }
-});
-
-// Создание задачи для обработки событий
-let is_paths_built_for_polling = Arc::clone(&is_paths_built);
-let event_tx_for_polling = event_tx.clone();
-let (simulator_tx, simulator_rx) = mpsc::channel::<PoolEventInfo>(1000);
-let polling_handle = spawn({
-    let subscriber = Arc::clone(&subscriber_clone);
-    let graph = Arc::clone(&pulling_graph);
-    let provider_http = Arc::clone(&provider_http_for_polling);
-    async move {
-        if let Err(e) = subscriber
-            .polling_event(
-                &block_receiver_clone_to_subscriber,
-                graph,
-                event_tx_for_polling,
-                is_paths_built_for_polling,
-                provider_http,
-                simulator_tx,
-            )
-            .await
-        {
-            error!("[MAIN_POLLING] Ошибка выполнения задачи пулинга событий: {:?}", e);
-        } else {
-            warn!("[MAIN_POLLING] Задача пулинга событий завершена штатно");
-        }
-    }
-});
-
+    });
 
     //============================================================================ Синхронизация пулов Uniswap
+
     info!("[MAIN] Синхронизация пулов начата...");
-    
+
     match uniswap_v3::sync_pools(
         graph_for_sync.clone(),
         provider_http_for_sync.clone(),
@@ -315,10 +314,11 @@ let polling_handle = spawn({
             error!("[MAIN] Ошибка синхронизации пулов");
         }
     }
-    
+
     info!("[MAIN] Бот завершил сканирование пулов");
 
     //============================================================================ Обновление и сохранение кэша пулов
+
     let block_receiver_clone_to_cache = block_receiver.clone();
     let last_block = *block_receiver_clone_to_cache.borrow();
     let pool_addresses_from_graph: Vec<Address> = {
@@ -345,41 +345,42 @@ let polling_handle = spawn({
     }
 
     //============================================================================ Построение арбитражных путей
+
     let paths_built_notify = Arc::new(Notify::new());
     info!(
         "[MAIN_PATH_BUILDER] Начинаем построение арбитражных путей. Состояние графа перед PathBuilder: nodes={}, edges={}", 
-        graph_for_paths.load().nodes.len(), 
+        graph_for_paths.load().nodes.len(),
         graph_for_paths.load().edges.len()
     );
 
     let path_build_start = std::time::Instant::now();
     let mut path_builder = PathBuilder::new(aave_rx.clone(), Arc::clone(&is_paths_built));
+
     path_builder.build_all_paths(graph_for_paths.clone());
+
     let path_builder = Arc::new(path_builder);
     let path_build_duration = path_build_start.elapsed();
     is_paths_built.store(true, std::sync::atomic::Ordering::Release);
     paths_built_notify.notify_one();
     info!(
-        "[MAIN_PATH_BUILDER] Построение путей завершено за {} мс. Количество путей: {}", 
+        "[MAIN_PATH_BUILDER] Построение путей завершено за {} мс. Количество путей: {}",
         path_build_duration.as_millis(),
         path_builder.paths.len()
     );
 
     //============================================================================ Запуск симулятора арбитража
-    let mut simulation_runner = SimulationRunner::new(
-        simulator_rx,
-        Arc::clone(&path_builder),
-        aave_rx,
-        Arc::clone(&graph),
-    );
 
-    info!("[MAIN] Запуск SimulationRunner");
+    let mut trade_simulator =
+        TradeSimulator::new(Arc::clone(&path_builder), aave_rx, Arc::clone(&graph));
+
+    info!("[MAIN] Запуск TradeSimulator");
     let simulation_handle = spawn(async move {
-        simulation_runner.run().await;
-        info!("[MAIN_SIMULATION_RUNNER] SimulationRunner завершил работу");
+        trade_simulator.run(simulator_rx).await;
+        info!("[MAIN_TRADE_SIMULATOR] TradeSimulator завершил работу");
     });
 
     // ============================================================================ Ожидание завершения задач или сигнала завершения
+
     info!("[MAIN] Ожидание завершения задач или сигнала завершения");
     tokio::select! {
         _ = shutdown_notify.notified() => {
@@ -397,9 +398,7 @@ let polling_handle = spawn({
         _ = simulation_handle => {
             warn!("[MAIN] Задача SimulationRunner завершилась неожиданно");
         }
-        _ = signal_handle => {
-            warn!("[MAIN] Задача signaler_simulator завершилась неожиданно");
-        }
+
     }
 
     // Завершение программы

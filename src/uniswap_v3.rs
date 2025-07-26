@@ -8,24 +8,23 @@ use crate::uniswap_graph::UniversalGraph;
 
 use arc_swap::ArcSwap;
 use colored::Colorize;
-//use colored::Colorize;
 use dashmap::DashSet;
 use ethers::contract::abigen;
 use ethers::providers::Provider;
+use ethers::types::Address;
 use ethers::types::H160;
 use ethers::types::U256;
-use ethers::types::{Address, U512};
 use ethers_contract::Multicall;
 use ethers_providers::Http;
-use ethers_providers::Ws;
+use im::OrdMap;
 use lazy_static::lazy_static;
-use tracing::error;
 use std::env;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::time::sleep;
 use tokio::time::Duration;
+use tracing::error;
 use tracing::{debug, info, warn};
 
 abigen!(
@@ -309,6 +308,138 @@ pub fn tick_to_sqrt_price(tick: i32) -> Result<U256, String> {
     Ok(sqrt_price)
 }
 
+const Q96_U256: U256 = U256([0, 1 << (96 - 64), 0, 0]); // 2^96
+
+/// Делит Q96^2 на sqrtPriceX96
+fn q96_squared_div(sqrt_price_x96: U256) -> U256 {
+    let numerator = Q96_U256.checked_mul(Q96_U256).unwrap_or(U256::MAX);
+    numerator
+        .checked_div(sqrt_price_x96)
+        .unwrap_or(U256::zero())
+}
+
+/// Рассчитывает ликвидность токенов в пуле
+pub fn calculate_token_liquidity(
+    pool: &UniswapPool,
+    tick_map: &OrdMap<i32, (i128, U256)>,
+    current_tick: i32,
+    sqrt_price_x96: U256,
+) -> (U256, U256) {
+    debug!(
+        "[LIQUIDITY_CALC] 💧 Начало расчёта ликвидности для пула {:?} (токены: {}/{}), текущий тик: {}",
+        pool.uniswap_pool_address,
+        pool.uniswap_token_a_symbol,
+        pool.uniswap_token_b_symbol,
+        current_tick
+    );
+
+    // Проверка, что текущий тик находится в пределах диапазона пула
+    if current_tick < pool.uniswap_tick_lower || current_tick >= pool.uniswap_tick_upper {
+        debug!(
+            "[LIQUIDITY_CALC] 💧 Текущий тик {} вне диапазона пула [{}, {}), возвращаем нули",
+            current_tick, pool.uniswap_tick_lower, pool.uniswap_tick_upper
+        );
+        return (U256::zero(), U256::zero());
+    }
+
+    if tick_map.is_empty() {
+        debug!(
+            "[LIQUIDITY_CALC] 💧 tick_map пустой, возвращаем нули для пула {:?}",
+            pool.uniswap_pool_address
+        );
+        return (U256::zero(), U256::zero());
+    }
+
+    let total_liquidity = U256::from(pool.uniswap_liquidity);
+    info!(
+        "[LIQUIDITY_CALC] 💧 Общая ликвидность пула: {}",
+        total_liquidity
+    );
+
+    let next_active_tick = tick_map
+        .iter()
+        .filter(|(tick, _)| **tick > current_tick)
+        .min_by_key(|(tick, _)| *tick)
+        .map(|(tick, _)| *tick)
+        .unwrap_or(pool.uniswap_tick_upper);
+
+    let prev_active_tick = tick_map
+        .iter()
+        .filter(|(tick, _)| **tick <= current_tick)
+        .max_by_key(|(tick, _)| *tick)
+        .map(|(tick, _)| *tick)
+        .unwrap_or(pool.uniswap_tick_lower);
+
+    info!(
+        "[LIQUIDITY_CALC] 💧💧 Активные тики: предыдущий={}, следующий={}",
+        prev_active_tick, next_active_tick
+    );
+
+    let sqrt_price_upper = match tick_to_sqrt_price(next_active_tick) {
+        Ok(price) => price,
+        Err(e) => {
+            warn!(
+                "[LIQUIDITY_CALC] 💧💧 Ошибка конвертации верхнего тика {}: {}, используем текущую цену",
+                next_active_tick, e
+            );
+            sqrt_price_x96
+        }
+    };
+
+    let sqrt_price_lower = match tick_to_sqrt_price(prev_active_tick) {
+        Ok(price) => price,
+        Err(e) => {
+            warn!(
+                "[LIQUIDITY_CALC] 💧💧 Ошибка конвертации нижнего тика {}: {}, используем текущую цену",
+                prev_active_tick, e
+            );
+            sqrt_price_x96
+        }
+    };
+
+    info!(
+        "[LIQUIDITY_CALC] 💧💧 Цены: текущая={}, верхняя={}, нижняя={}",
+        sqrt_price_x96, sqrt_price_upper, sqrt_price_lower
+    );
+
+    let inv_sqrt_lower = q96_squared_div(sqrt_price_lower);
+    let inv_sqrt_upper = q96_squared_div(sqrt_price_upper);
+
+    info!(
+        "[LIQUIDITY_CALC] 💧💧 Обратные цены: нижняя={}, верхняя={}",
+        inv_sqrt_lower, inv_sqrt_upper
+    );
+
+    // Учет порядка токенов для корректного расчета
+    let delta_inv_sqrt = if pool.uniswap_token_a < pool.uniswap_token_b {
+        inv_sqrt_lower.saturating_sub(inv_sqrt_upper)
+    } else {
+        inv_sqrt_upper.saturating_sub(inv_sqrt_lower)
+    };
+    let amount_token0 = total_liquidity
+        .saturating_mul(delta_inv_sqrt)
+        .checked_div(Q96_U256)
+        .unwrap_or(U256::zero());
+
+    let delta_sqrt = if pool.uniswap_token_a < pool.uniswap_token_b {
+        sqrt_price_upper.saturating_sub(sqrt_price_lower)
+    } else {
+        sqrt_price_lower.saturating_sub(sqrt_price_upper)
+    };
+    let amount_token1 = total_liquidity
+        .saturating_mul(delta_sqrt)
+        .checked_div(Q96_U256)
+        .unwrap_or(U256::zero());
+
+    info!(
+        "[LIQUIDITY_CALC] 💧💧💧 Результаты: token0={}, token1={}",
+        amount_token0, amount_token1
+    );
+
+    (amount_token0, amount_token1)
+}
+
+/// Создает пул Uniswap V3
 pub async fn build_uniswap_v3_pool(
     pool_address: Address,
     tokens: (Address, Address),
@@ -316,47 +447,46 @@ pub async fn build_uniswap_v3_pool(
     token_cache: &TokenCache,
 ) -> Option<UniswapPool> {
     debug!(
-        "[ UNISWAP_V3_BUILD_DEBUG ] Начало build_uniswap_v3_pool, pool_address: {:?}",
+        "[UNISWAP_V3_BUILD_DEBUG] Начало build_uniswap_v3_pool, pool_address: {:?}",
         pool_address
     );
 
     let (token_a, token_b) = tokens;
 
-    // Получаем данные токенов
     let (token_a_info, token_b_info) = tokio::try_join!(
         get_single_token_data(token_a, provider.clone(), token_cache),
         get_single_token_data(token_b, provider.clone(), token_cache)
     )
     .ok()?;
     info!(
-        "[ UNISWAP_V3_BUILD_DEBUG ][{:?}] ДАННЫЕ ТОКЕНОВ ПУЛА: token_a: {}, token_b: {}",
+        "[UNISWAP_V3_BUILD_DEBUG][{:?}] ДАННЫЕ ТОКЕНОВ ПУЛА: token_a: {}, token_b: {}",
         pool_address, token_a_info.symbol, token_b_info.symbol
     );
 
-    // Проверка decimals
     if token_a_info.decimals == 0
         || token_a_info.decimals > 18
         || token_b_info.decimals == 0
         || token_b_info.decimals > 18
     {
-        warn!("[UNISWAP_V3_GRAPH_BUILDER][{:?}] Некорректные decimals: token_a_decimals={}, token_b_decimals={}", pool_address, token_a_info.decimals, token_b_info.decimals);
+        warn!(
+            "[UNISWAP_V3_GRAPH_BUILDER][{:?}] Некорректные decimals: token_a_decimals={}, token_b_decimals={}",
+            pool_address, token_a_info.decimals, token_b_info.decimals
+        );
         return None;
     }
 
-    // Получаем данные пула
     let pool_contract = UniswapV3Pool::new(pool_address, provider.clone());
 
     let (liquidity, slot0_result, tick_spacing, max_liquidity_per_tick, fee) =
-        process_pool_data(pool_address, pool_contract.into()).await?;
+        process_pool_data(pool_address, pool_contract.clone().into()).await?;
 
     debug!(
-        "[ UNISWAP_V3_BUILD_DEBUG ][{:?}] Данные пула получены: liquidity: {}, tick: {}, fee: {}",
+        "[UNISWAP_V3_BUILD_DEBUG][{:?}] Данные пула получены: liquidity: {}, tick: {}, fee: {}",
         pool_address, liquidity, slot0_result.1, fee
     );
 
     let (sqrt_price_x96, tick, _, _, _, _, _) = slot0_result;
 
-    // Проверка нулевых данных
     if liquidity.is_zero() {
         warn!(
             "[UNISWAP_V3_GRAPH_BUILDER][{:?}] Пропуск пула: нулевая ликвидность",
@@ -379,137 +509,11 @@ pub async fn build_uniswap_v3_pool(
         return None;
     }
 
-    // Добавляем дебаг-лог до преобразования
-    debug!(
-        "[ UNISWAP_V3_BUILD_DEBUG ][{:?}] Raw sqrt_price_x96 from slot0: {:?}",
-        pool_address, sqrt_price_x96
-    );
-    /*
-
-    проверка наличие 1 токена соответственно децимал из sqrt_price_x96 по пулу
-
-    // Минимальные пороги для токенов в их базовых единицах
-    let min_amount_a = U256::exp10(token_a_info.decimals as usize); // 1.0 токена A
-    let min_amount_b = U256::exp10(token_b_info.decimals as usize); // 1.0 токена B
-
-    // Проверка порядка токенов
-    let zero_for_one = token_a < token_b;
-
-    // Точный расчёт эквивалентных сумм токенов
-    let q96 = *Q96; // Используем lazy_static константу
-    let tick_lower = tick - tick_spacing;
-    let tick_upper = tick + tick_spacing;
-
-    // Проверка тиков
-    if tick_lower < -887272 || tick_lower > 887272 || tick_upper < -887272 || tick_upper > 887272 {
-        warn!("[UNISWAP_V3_GRAPH_BUILDER][{:?}] Некорректные тики: tick_lower={}, tick_upper={}", pool_address, tick_lower, tick_upper);
-        return None;
-    }
-
-    // Преобразуем тики в sqrt_price
-    let sqrt_price_lower = tick_to_sqrt_price(tick_lower).ok()?;
-    let sqrt_price_upper = tick_to_sqrt_price(tick_upper).ok()?;
-
-    // Проверяем порядок цен
-    let (sqrt_price_lower, sqrt_price_upper) = if sqrt_price_lower < sqrt_price_upper {
-        (sqrt_price_lower, sqrt_price_upper)
-    } else {
-        (sqrt_price_upper, sqrt_price_lower)
-    };
-
-    // Расчёт сумм токенов
-    let (amount_a, amount_b) = if zero_for_one {
-        // Для zero_for_one = true (токен A -> токен B)
-        let amount_a = if sqrt_price_x96 >= sqrt_price_lower && sqrt_price_x96 <= sqrt_price_upper {
-            let inv_sqrt_price_x96 = U512::from(q96)
-            .checked_mul(U512::from(q96))
-            .and_then(|x| x.checked_div(U512::from(sqrt_price_x96)))
-            .map(|x| U256::try_from(x).unwrap_or(U256::zero()))
-            .unwrap_or(U256::zero());
-        let inv_sqrt_price_upper = U512::from(q96)
-        .checked_mul(U512::from(q96))
-        .and_then(|x| x.checked_div(U512::from(sqrt_price_upper)))
-        .map(|x| U256::try_from(x).unwrap_or(U256::zero()))
-        .unwrap_or(U256::zero());
-    let delta_price = inv_sqrt_price_x96
-    .checked_sub(inv_sqrt_price_upper)
-    .unwrap_or(U256::zero());
-    U512::from(liquidity)
-    .checked_mul(U512::from(delta_price))
-    .and_then(|x| x.checked_div(U512::from(q96)))
-    .map(|x| U256::try_from(x).unwrap_or(U256::zero()))
-    .unwrap_or(U256::zero())
-    } else {
-        U256::zero()
-    };
-    let amount_b = if sqrt_price_x96 >= sqrt_price_lower && sqrt_price_x96 <= sqrt_price_upper {
-        let delta_price = sqrt_price_x96
-        .checked_sub(sqrt_price_lower)
-        .unwrap_or(U256::zero());
-    U512::from(liquidity)
-    .checked_mul(U512::from(delta_price))
-    .and_then(|x| x.checked_div(U512::from(q96)))
-    .map(|x| U256::try_from(x).unwrap_or(U256::zero()))
-    .unwrap_or(U256::zero())
-    } else {
-        U256::zero()
-    };
-    (amount_a, amount_b)
-    } else {
-        // Для zero_for_one = false (токен B -> токен A)
-        let amount_b = if sqrt_price_x96 >= sqrt_price_lower && sqrt_price_x96 <= sqrt_price_upper {
-            let inv_sqrt_price_x96 = U512::from(q96)
-            .checked_mul(U512::from(q96))
-            .and_then(|x| x.checked_div(U512::from(sqrt_price_x96)))
-            .map(|x| U256::try_from(x).unwrap_or(U256::zero()))
-            .unwrap_or(U256::zero());
-        let inv_sqrt_price_lower = U512::from(q96)
-        .checked_mul(U512::from(q96))
-        .and_then(|x| x.checked_div(U512::from(sqrt_price_lower)))
-        .map(|x| U256::try_from(x).unwrap_or(U256::zero()))
-        .unwrap_or(U256::zero());
-    let delta_price = inv_sqrt_price_lower
-    .checked_sub(inv_sqrt_price_x96)
-    .unwrap_or(U256::zero());
-    U512::from(liquidity)
-    .checked_mul(U512::from(delta_price))
-    .and_then(|x| x.checked_div(U512::from(q96)))
-    .map(|x| U256::try_from(x).unwrap_or(U256::zero()))
-    .unwrap_or(U256::zero())
-    } else {
-        U256::zero()
-    };
-    let amount_a = if sqrt_price_x96 >= sqrt_price_lower && sqrt_price_x96 <= sqrt_price_upper {
-        let delta_price = sqrt_price_upper
-        .checked_sub(sqrt_price_x96)
-        .unwrap_or(U256::zero());
-    U512::from(liquidity)
-    .checked_mul(U512::from(delta_price))
-    .and_then(|x| x.checked_div(U512::from(q96)))
-    .map(|x| U256::try_from(x).unwrap_or(U256::zero()))
-    .unwrap_or(U256::zero())
-    } else {
-        U256::zero()
-    };
-    (amount_a, amount_b)
-    };
-
-    // Проверка ликвидности по обоим токенам
-    if amount_a < min_amount_a && amount_b < min_amount_b {
-        warn!(
-            "[UNISWAP_V3_GRAPH_BUILDER][{:?}] Пропуск пула: низкая ликвидность (amount_a={} < {}, amount_b={} < {})",
-            pool_address, amount_a, min_amount_a, amount_b, min_amount_b
-        );
-        return None;
-    }
-    */
-
-    // Тиковая карта
     let tick_map = fetch_active_ticks(pool_address, provider.clone(), slot0_result.1, fee)
         .await
         .ok()?;
     info!(
-        "[ UNISWAP_V3_BUILD_DEBUG ][{:?}] tick_map получен, размер: {}",
+        "[UNISWAP_V3_BUILD_DEBUG][{:?}] tick_map получен, размер: {}",
         pool_address,
         tick_map.len()
     );
@@ -539,18 +543,37 @@ pub async fn build_uniswap_v3_pool(
         uniswap_tick_spacing: tick_spacing,
         uniswap_max_liquidity_per_tick: U256::from(max_liquidity_per_tick),
         uniswap_fee_tier: fee,
-        tick_map,
+        tick_map: tick_map.clone(),
         is_active: true,
+        liquidity_token0: U256::zero(),
+        liquidity_token1: U256::zero(),
+    };
+
+    let (liquidity_token0, liquidity_token1) =
+        calculate_token_liquidity(&pool, &tick_map, tick, sqrt_price_x96);
+
+    if liquidity_token0 > U256::from(u128::MAX) || liquidity_token1 > U256::from(u128::MAX) {
+        warn!(
+            "[UNISWAP_V3_BUILD_DEBUG][{:?}] Пропуск пула: ликвидность токенов превышает uint128: token0: {}, token1: {}",
+            pool_address, liquidity_token0, liquidity_token1
+        );
+        return None;
+    }
+
+    let pool = UniswapPool {
+        liquidity_token0,
+        liquidity_token1,
+        ..pool
     };
 
     debug!(
-        "[ UNISWAP_V3_BUILD_DEBUG ] Конец build_uniswap_v3_pool, pool_address: {:?}",
+        "[UNISWAP_V3_BUILD_DEBUG] Конец build_uniswap_v3_pool, pool_address: {:?}",
         pool_address
     );
     Some(pool)
 }
 
-/// Функция для синхронизации пулов Uniswap V3 с кэша и обновления графа
+/// Синхронизирует пулы Uniswap V3 с кэша и обновляет граф
 pub async fn sync_pools(
     graph: Arc<ArcSwap<UniversalGraph>>,
     provider: Arc<Provider<Http>>,
@@ -559,7 +582,7 @@ pub async fn sync_pools(
     token_whitelist: &DashSet<Address>,
     event_subscriber: Arc<UniswapEventSubscriber>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    info!("[ UNISWAP_V3_SYNC_POOL_DEBUG ] Начало sync_pools");
+    info!("[UNISWAP_V3_SYNC_POOL_DEBUG] Начало sync_pools");
 
     let save_per_pool = env::var("SAVE_GRAPH_PER_POOL")
         .map(|v| v == "true")
@@ -571,11 +594,11 @@ pub async fn sync_pools(
     );
 
     info!(
-        "[ UNISWAP_V3_SYNC_POOL ] Начинаем обработку {} пулов из кэша",
+        "[UNISWAP_V3_SYNC_POOL] Начинаем обработку {} пулов из кэша",
         original_count
     );
     debug!(
-        "[ UNISWAP_V3_SYNC_POOL_DEBUG ] original_count: {}",
+        "[UNISWAP_V3_SYNC_POOL_DEBUG] original_count: {}",
         original_count
     );
 
@@ -584,7 +607,7 @@ pub async fn sync_pools(
 
     for current_addresses in original_addresses {
         debug!(
-            "[ UNISWAP_V3_SYNC_POOL_DEBUG ][{:?}] >>>>> Старт обработки пула ",
+            "[UNISWAP_V3_SYNC_POOL_DEBUG][{:?}] >>>>> Старт обработки пула",
             current_addresses
         );
 
@@ -594,7 +617,7 @@ pub async fn sync_pools(
             Ok(t) => t,
             Err(e) => {
                 warn!(
-                    "[ UNISWAP_V3_SYNC_POOL ][{:?}] Ошибка получения token0: {:?}",
+                    "[UNISWAP_V3_SYNC_POOL][{:?}] Ошибка получения token0: {:?}",
                     current_addresses, e
                 );
                 continue;
@@ -605,7 +628,7 @@ pub async fn sync_pools(
             Ok(t) => t,
             Err(e) => {
                 warn!(
-                    "[ UNISWAP_V3_SYNC_POOL ][{:?}] Ошибка получения token1: {:?}",
+                    "[UNISWAP_V3_SYNC_POOL][{:?}] Ошибка получения token1: {:?}",
                     current_addresses, e
                 );
                 continue;
@@ -613,29 +636,29 @@ pub async fn sync_pools(
         };
 
         if token_whitelist.contains(&token0) && token_whitelist.contains(&token1) {
-            debug!("[ UNISWAP_V3_SYNC_POOL_DEBUG ][{:?}] Токены в whitelist: token0: {:?}, token1: {:?}", current_addresses, token0, token1);
+            debug!(
+                "[UNISWAP_V3_SYNC_POOL_DEBUG][{:?}] Токены в whitelist: token0: {:?}, token1: {:?}",
+                current_addresses, token0, token1
+            );
 
             match build_uniswap_v3_pool(
                 current_addresses,
                 (token0, token1),
                 provider.clone(),
-                &token_cache,
+                token_cache,
             )
             .await
             {
                 Some(pool) => {
                     debug!(
-                        "[ UNISWAP_V3_SYNC_POOL_DEBUG ][{:?}] Пул построен: {:?}",
+                        "[UNISWAP_V3_SYNC_POOL_DEBUG][{:?}] Пул построен: {:?}",
                         current_addresses, pool.uniswap_pool_address
                     );
                     if pool.is_active {
                         let graph_inner = graph.load().as_ref().clone();
                         match graph_inner.upsert_pool(pool.clone()).await {
                             Ok(()) => {
-                                debug!(
-                                    "[ UNISWAP_V3_SYNC_POOL_DEBUG ][{:?}] Пул успешно добавлен в граф",
-                                    current_addresses
-                                );
+                                debug!("[UNISWAP_V3_SYNC_POOL_DEBUG][{:?}] Пул успешно добавлен в граф", current_addresses);
                                 graph.store(Arc::new(graph_inner));
                                 phase1_active_count.fetch_add(1, Ordering::SeqCst);
                                 event_subscriber.subscribed_pools.insert(current_addresses);
@@ -647,19 +670,21 @@ pub async fn sync_pools(
                                 );
 
                                 if save_per_pool {
-                                    if let Err(e) = graph.load().save_graph_to_json("graph_final.json") {
-                                        warn!("[ UNISWAP_V3_SYNC_POOL ] Ошибка сохранения JSON графа для пула {:?}: {:?}", current_addresses, e);
-                                    } else {
-                                        info!(
-                                            "[ UNISWAP_V3_SYNC_POOL ] JSON граф сохранён для пула {:?}",
-                                            current_addresses
+                                    if let Err(e) =
+                                        graph.load().save_graph_to_json("graph_final.json")
+                                    {
+                                        warn!(
+                                            "[UNISWAP_V3_SYNC_POOL] Ошибка сохранения JSON графа для пула {:?}: {:?}",
+                                            current_addresses, e
                                         );
+                                    } else {
+                                        info!("[UNISWAP_V3_SYNC_POOL] JSON граф сохранён для пула {:?}", current_addresses);
                                     }
                                 }
                             }
                             Err(e) => {
                                 error!(
-                                    "[ UNISWAP_V3_SYNC_POOL_ERROR ][{:?}] Ошибка при добавлении пула в граф: {}",
+                                    "[UNISWAP_V3_SYNC_POOL_ERROR][{:?}] Ошибка при добавлении пула в граф: {}",
                                     current_addresses, e
                                 );
                                 continue;
@@ -669,187 +694,68 @@ pub async fn sync_pools(
                 }
                 None => {
                     warn!(
-                        "[ UNISWAP_V3_SYNC_POOL ][{:?}] Пул не построен",
+                        "[UNISWAP_V3_SYNC_POOL][{:?}] Пул не построен",
                         current_addresses
                     );
                 }
             }
         } else {
             info!(
-                "[ UNISWAP_V3_SYNC_POOL_whitelist ][{:?}] Пул отфильтрован по whitelist",
+                "[UNISWAP_V3_SYNC_POOL_whitelist][{:?}] Пул отфильтрован по whitelist",
                 current_addresses
             );
         }
 
         let processed = phase1_processed.fetch_add(1, Ordering::SeqCst) + 1;
         info!(
-            "[ UNISWAP_V3_SYNC_POOL ] Прогресс: {}/{} пулов из кэша обработано",
+            "[UNISWAP_V3_SYNC_POOL] Прогресс: {}/{} пулов из кэша обработано",
             processed, original_count
         );
         sleep(Duration::from_millis(30)).await;
 
         debug!(
-            "[ UNISWAP_V3_SYNC_POOL_DEBUG ][{:?}] Конец обработки пула <<<<< ",
+            "[UNISWAP_V3_SYNC_POOL_DEBUG][{:?}] Конец обработки пула <<<<< ",
             current_addresses
         );
     }
 
-    info!("[ UNISWAP_V3_SYNC_POOL ] ✅ Пулы из кэша обработаны");
+    info!("[UNISWAP_V3_SYNC_POOL] ✅ Пулы из кэша обработаны");
 
     if let Err(e) = graph.load().save_graph_to_json("graph_final.json") {
         warn!(
-            "[ UNISWAP_V3_SYNC_POOL ] Ошибка сохранения итогового JSON графа: {:?}",
+            "[UNISWAP_V3_SYNC_POOL] Ошибка сохранения итогового JSON графа: {:?}",
             e
         );
     } else {
-        info!("[ UNISWAP_V3_SYNC_POOL ] Граф успешно сохранён в файл graph_final.json");
+        info!("[UNISWAP_V3_SYNC_POOL] Граф успешно сохранён в файл graph_final.json");
     }
 
     info!(
-        "[ UNISWAP_V3_SYNC_POOL ] Обработано: {} пулов из кэша",
+        "[UNISWAP_V3_SYNC_POOL] Обработано: {} пулов из кэша",
         phase1_active_count.load(Ordering::SeqCst)
     );
     Ok(())
 }
 
-// Универсальная retry-обёртка
-pub async fn retry_async<T, F, Fut>(mut f: F, retries: usize, delay_ms: u64) -> Option<T>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Option<T>>,
-{
-    for attempt in 0..retries {
-        match f().await {
-            Some(result) => return Some(result),
-            None => {
-                debug!(
-                    "[ RETRY ] Попытка {} не удалась, повтор через {} мс",
-                    attempt + 1,
-                    delay_ms
-                );
-                sleep(Duration::from_millis(delay_ms)).await;
-            }
-        }
-    }
-    warn!("[ RETRY ] Все {} попыток не увенчались успехом", retries);
-    None
-}
-
-// Обёртка для liquidity
-pub async fn fetch_pool_liquidity(
-    pool_address: H160,
-    pool_contract: &UniswapV3Pool<Provider<Ws>>,
-) -> Option<U512> {
-    debug!(
-        "[ UNISWAP_V3_BUILD_DEBUG ] fetch_pool_liquidity: {:?}",
-        pool_address
-    );
-
-    retry_async(
-        || async { pool_contract.liquidity().call().await.ok().map(U512::from) },
-        5,
-        30,
-    )
-    .await
-}
-
-// Обёртка для slot0
-pub async fn fetch_pool_slot0(
-    pool_address: H160,
-    pool_contract: &UniswapV3Pool<Provider<Ws>>,
-) -> Option<(U256, i32, u16, u16, u16, u8, bool)> {
-    debug!(
-        "[ UNISWAP_V3_BUILD_DEBUG ] fetch_pool_slot0: {:?}",
-        pool_address
-    );
-
-    retry_async(|| async { pool_contract.slot_0().call().await.ok() }, 5, 30).await
-}
-
-// Обёртка для tick_spacing
-pub async fn fetch_pool_tick_spacing(
-    pool_address: H160,
-    pool_contract: &UniswapV3Pool<Provider<Ws>>,
-) -> Option<i32> {
-    debug!(
-        "[ UNISWAP_V3_BUILD_DEBUG ] fetch_pool_tick_spacing: {:?}",
-        pool_address
-    );
-
-    retry_async(
-        || async { pool_contract.tick_spacing().call().await.ok() },
-        5,
-        30,
-    )
-    .await
-}
-
-// Обёртка для max_liquidity_per_tick
-pub async fn fetch_pool_max_liquidity(
-    pool_address: H160,
-    pool_contract: &UniswapV3Pool<Provider<Ws>>,
-) -> Option<u128> {
-    debug!(
-        "[ UNISWAP_V3_BUILD_DEBUG ] fetch_pool_max_liquidity: {:?}",
-        pool_address
-    );
-
-    retry_async(
-        || async { pool_contract.max_liquidity_per_tick().call().await.ok() },
-        5,
-        30,
-    )
-    .await
-}
-
-// Обёртка для fee()
-pub async fn fetch_pool_fee(
-    pool_address: H160,
-    pool_contract: &UniswapV3Pool<Provider<Ws>>,
-) -> Option<u32> {
-    debug!(
-        "[ UNISWAP_V3_BUILD_DEBUG ] fetch_pool_fee: {:?}",
-        pool_address
-    );
-
-    retry_async(|| async { pool_contract.fee().call().await.ok() }, 5, 30).await
-}
-
 /// Получает данные пула Uniswap V3 с использованием мультиколла
-///
-/// # Описание
-/// Выполняет одновременный запрос к контракту пула для получения ликвидности, slot0, tick_spacing,
-/// max_liquidity_per_tick и fee, минимизируя количество сетевых вызовов.
-///
-/// # Параметры
-/// * `pool_address` - Адрес пула
-/// * `pool_contract` - Контракт пула Uniswap V3
-/// * `provider` - WebSocket-провайдер
-///
-/// # Возвращаемое значение
-/// * `Option<(U512, (U256, i32, u16, u16, u16, u8, bool), i32, u128, u32)>` - Данные пула или None при ошибке
 async fn fetch_pool_data_multicall(
     pool_address: H160,
     pool_contract: &UniswapV3Pool<Provider<Http>>,
     provider: Arc<Provider<Http>>,
 ) -> Option<(U256, (U256, i32, u16, u16, u16, u8, bool), i32, u128, u32)> {
-    // Логируем начало мультиколла
     debug!(
         "[UNISWAP_V3_MULTICALL_DEBUG] Начало мультиколла для пула {:?}",
         pool_address
     );
 
-    // Инициализируем мультиколл
     let mut multicall = Multicall::new(provider, None).await.ok()?;
-    // Добавляем вызовы функций контракта
     multicall
-        .add_call(pool_contract.liquidity(), true)              // Ликвидность пула
-        .add_call(pool_contract.slot_0(), true)                 // Данные slot0 (sqrtPriceX96, tick, etc.)
-        .add_call(pool_contract.tick_spacing(), true) // Интервал тиков
-        .add_call(pool_contract.max_liquidity_per_tick(), true) // Максимальная ликвидность на тик
-        .add_call(pool_contract.fee(), true); // Комиссия пула
+        .add_call(pool_contract.liquidity(), true)
+        .add_call(pool_contract.slot_0(), true)
+        .add_call(pool_contract.tick_spacing(), true)
+        .add_call(pool_contract.max_liquidity_per_tick(), true)
+        .add_call(pool_contract.fee(), true);
 
-    // Выполняем мультиколл и обрабатываем результат
     let result = multicall
         .call::<(u128, (U256, i32, u16, u16, u16, u8, bool), i32, u128, u32)>()
         .await
@@ -862,59 +768,31 @@ async fn fetch_pool_data_multicall(
         })
         .ok()?;
 
-    // Логируем успешное выполнение
     debug!(
         "[UNISWAP_V3_MULTICALL_DEBUG] Успешный мультиколл для пула {:?}",
         pool_address
     );
-    Some((
-        U256::from(result.0), // Конвертируем ликвидность в U256
-        result.1,             // Данные slot0
-        result.2,             // tick_spacing
-        result.3,             // max_liquidity_per_tick
-        result.4,             // fee
-    ))
+    Some((U256::from(result.0), result.1, result.2, result.3, result.4))
 }
 
 /// Обрабатывает данные пула Uniswap V3
-///
-/// # Описание
-/// Вызывает мультиколл для получения всех необходимых данных пула (ликвидность, slot0, tick_spacing,
-/// max_liquidity_per_tick, fee) и возвращает их в структурированном виде.
-///
-/// # Параметры
-/// * `pool_address` - Адрес пула
-/// * `pool_contract` - Контракт пула Uniswap V3
-///
-/// # Возвращаемое значение
-/// * `Option<(U512, (U256, i32, u16, u16, u16, u8, bool), i32, u128, u32)>` - Данные пула или None при ошибке
 pub async fn process_pool_data(
     pool_address: H160,
     pool_contract: Arc<UniswapV3Pool<Provider<Http>>>,
-) -> Option<(
-    U256,
-    (ethers::types::U256, i32, u16, u16, u16, u8, bool),
-    i32,
-    u128,
-    u32,
-)> {
-    // Логируем начало обработки
+) -> Option<(U256, (U256, i32, u16, u16, u16, u8, bool), i32, u128, u32)> {
     debug!(
         "[UNISWAP_V3_PROC_DEBUG] Начало обработки данных пула {:?}",
         pool_address
     );
 
-    // Вызываем мультиколл для получения всех данных
     let result =
         fetch_pool_data_multicall(pool_address, &pool_contract, pool_contract.client()).await?;
 
-    // Логируем успешное получение данных
     debug!(
         "[UNISWAP_V3_PROC_DEBUG][{:?}] Данные получены: ликвидность: {}, тик: {}, комиссия: {}",
         pool_address, result.0, result.1 .1, result.4
     );
 
-    // Возвращаем результат
     debug!(
         "[UNISWAP_V3_PROC_DEBUG] Конец обработки данных пула {:?}",
         pool_address
