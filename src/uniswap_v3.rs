@@ -327,7 +327,7 @@ pub fn calculate_token_liquidity(
 ) -> (U256, U256) {
     debug!(
         "[LIQUIDITY_CALC] 💧 Начало расчёта ликвидности для пула {:?} (токены: {}/{}), текущий тик: {}",
-        pool.uniswap_pool_address,
+        pool.graph_pool_address,
         pool.uniswap_token_a_symbol,
         pool.uniswap_token_b_symbol,
         current_tick
@@ -345,7 +345,7 @@ pub fn calculate_token_liquidity(
     if tick_map.is_empty() {
         debug!(
             "[LIQUIDITY_CALC] 💧 tick_map пустой, возвращаем нули для пула {:?}",
-            pool.uniswap_pool_address
+            pool.graph_pool_address
         );
         return (U256::zero(), U256::zero());
     }
@@ -527,7 +527,7 @@ pub async fn build_uniswap_v3_pool(
     }
 
     let pool = UniswapPool {
-        uniswap_pool_address: pool_address.into(),
+        graph_pool_address: pool_address.into(),
         uniswap_dex: "uniswap_v3".to_string().into(),
         uniswap_token_a_decimals: token_a_info.decimals,
         uniswap_token_b_decimals: token_b_info.decimals,
@@ -545,8 +545,8 @@ pub async fn build_uniswap_v3_pool(
         uniswap_fee_tier: fee,
         tick_map: tick_map.clone(),
         is_active: true,
-        liquidity_token0: U256::zero(),
-        liquidity_token1: U256::zero(),
+        liquidity_token_a: U256::zero(),
+        liquidity_token_b: U256::zero(),
     };
 
     let (liquidity_token0, liquidity_token1) =
@@ -561,8 +561,8 @@ pub async fn build_uniswap_v3_pool(
     }
 
     let pool = UniswapPool {
-        liquidity_token0,
-        liquidity_token1,
+        liquidity_token_a: liquidity_token0,
+        liquidity_token_b: liquidity_token1,
         ..pool
     };
 
@@ -652,7 +652,7 @@ pub async fn sync_pools(
                 Some(pool) => {
                     debug!(
                         "[UNISWAP_V3_SYNC_POOL_DEBUG][{:?}] Пул построен: {:?}",
-                        current_addresses, pool.uniswap_pool_address
+                        current_addresses, pool.graph_pool_address
                     );
                     if pool.is_active {
                         let graph_inner = graph.load().as_ref().clone();
@@ -707,7 +707,7 @@ pub async fn sync_pools(
         }
 
         let processed = phase1_processed.fetch_add(1, Ordering::SeqCst) + 1;
-        info!(
+        warn!(
             "[UNISWAP_V3_SYNC_POOL] Прогресс: {}/{} пулов из кэша обработано",
             processed, original_count
         );

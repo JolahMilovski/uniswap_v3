@@ -1,5 +1,4 @@
 pub mod aave_v3_flash_monitor;
-
 pub mod path_builder;
 pub mod provider;
 pub mod take_gas_price;
@@ -55,41 +54,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
 
     // Настройка ротации логов (ежеминутно) и запись в файл
-    let file_appender = rolling::minutely("./logs", "uniswap_bot_log.txt");
+    let file_appender = rolling::hourly("./logs", "uniswap_bot_log.txt");
 
     let (non_blocking, _guard): (NonBlocking, WorkerGuard) = NonBlockingBuilder::default()
         .buffered_lines_limit(128_000) // Буфер на 128_000 событий
         .lossy(false) // Не терять логи, применять обратное давление
-        .thread_name("uniswap-logger")
+        .thread_name("unilog")
         .finish(file_appender);
 
-    // Мониторинг потери логов
-    let error_counter = non_blocking.error_counter();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
-        loop {
-            interval.tick().await;
-            let dropped = error_counter.dropped_lines();
-            if dropped > 0 {
-                warn!("[LOGGING] Потеряно {} логов из-за переполнения буфера", dropped);
-            }
-        }
-    });
 
 
     let file_layer = fmt::layer()
         .with_writer(non_blocking)
         .with_ansi(true)
-        .with_target(true)
+        .with_target(false)
         .with_line_number(true)
-        .with_thread_names(true);
+        .with_thread_names(false);
 
     // Настройка вывода логов в консоль
     let stdout_layer = fmt::layer()
         .with_ansi(std::io::stdout().is_terminal())
-        .with_target(true)
+        .with_target(false)
         .with_line_number(true)
-        .with_thread_names(true)
+        .with_thread_names(false)
         .with_level(true)
         .event_format(CustomEventFormat::new(true));
 
@@ -104,11 +91,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             uniswap::take_gas_price=warn,\
             uniswap::token=warn,\
             uniswap::token_white_list=warn,\
-            uniswap::trade_simulator=info,\
+            uniswap::trade_simulator=warn,\
             uniswap::uniswap_cache=warn,\
             uniswap::tick_fetcher=warn,\
-            uniswap::uniswap_events=info,\
-            uniswap::uniswap_graph=info,\
+            uniswap::uniswap_events=warn,\
+            uniswap::uniswap_graph=warn,\
             uniswap::uniswap_v3=warn,\
             h2=off,\
             hyper=off,\
@@ -188,7 +175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //==========================================================================================     Инициализация графа Uniswap
 
     let graph: Arc<ArcSwap<UniversalGraph>> =
-        Arc::new(ArcSwap::from_pointee(UniversalGraph::new()));
+        Arc::new(ArcSwap::from_pointee(UniversalGraph::new(32)));
     let graph_for_sync = Arc::clone(&graph);
     let graph_for_paths = Arc::clone(&graph);
     let graph_for_shutdown = Arc::clone(&graph);
@@ -407,6 +394,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 //================================================================================= ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ =================================================================================
+
+
 #[derive(Clone)]
 struct CustomEventFormat {
     use_ansi: bool,
