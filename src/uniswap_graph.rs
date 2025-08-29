@@ -13,9 +13,9 @@ use tracing::{debug, error, warn};
 use std::collections::hash_map::RandomState;
 
 // Тип для представления чисел в формате Q96.64
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, PartialOrd, Eq, Ord)]
 pub struct Q96_64 {
-    pub(crate) value: U256, // Хранит число в формате Q96.64 (96 бит целая часть, 64 бита дробная)
+    pub value: U256, // Хранит число в формате Q96.64 (96 бит целая часть, 64 бита дробная)
 }
 
 impl Q96_64 {
