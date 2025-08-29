@@ -91,7 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             uniswap::take_gas_price=warn,\
             uniswap::token=warn,\
             uniswap::token_white_list=warn,\
-            uniswap::trade_simulator=warn,\
+            uniswap::trade_simulator=debug,\
             uniswap::uniswap_cache=warn,\
             uniswap::tick_fetcher=warn,\
             uniswap::uniswap_events=warn,\

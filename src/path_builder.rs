@@ -2,7 +2,7 @@ use crate::{aave_v3_flash_monitor::AaveTokenLiquidity, uniswap_graph::UniversalG
 use arc_swap::ArcSwap;
 use colored::Colorize;
 use dashmap::DashMap;
-use ethers::types::{Address, U256};
+use ethers::types::Address;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -24,17 +24,13 @@ pub struct ArbitragePath {
     pub pools: Vec<Address>,
 }
 
-/// Информация о пуле для заимствования с оптимизацией возврата
+/// Информация о пуле для заимствования
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BorrowPoolInfo {
     /// Адрес пула
     pub pool_address: Address,
     /// Уровень комиссии пула (например, 3000 для 0.3%)
     pub fee_tier: u32,
-    /// Предпочтительность займа того же токена
-    pub prefer_same_token: bool,
-    /// Токен, который нужно вернуть в этот пул
-    pub repay_token: Address,
 }
 
 /// Основная структура для построения и управления путями арбитража
@@ -164,7 +160,6 @@ impl PathBuilder {
         let token0 = *pool.uniswap_token_a;
         let token1 = *pool.uniswap_token_b;
         let fee_tier = pool.uniswap_fee_tier;
-        let sqrt_price_x96 = pool.uniswap_sqrt_price;
 
         debug!(
             "[{}] Обработка пула {:?}: токены ({:?}, {:?}), комиссия {}",
@@ -179,17 +174,9 @@ impl PathBuilder {
         self.add_token_relation(related_list, token0, token1, pool_address);
         self.add_token_relation(related_list, token1, token0, pool_address);
 
-        // Расчет параметров для займа
-        let (prefer_same_token, repay_token) = self.calculate_borrow_preferences(
-            fee_tier,
-            sqrt_price_x96,
-            token0,
-            token1,
-        );
-
         // Добавление информации о пуле для займа
-        self.add_borrow_pool(token0, pool_address, fee_tier, prefer_same_token, repay_token);
-        self.add_borrow_pool(token1, pool_address, fee_tier, prefer_same_token, repay_token);
+        self.add_borrow_pool(token0, pool_address, fee_tier);
+        self.add_borrow_pool(token1, pool_address, fee_tier);
     }
 
     /// Добавляет связь между токенами в граф
@@ -206,47 +193,12 @@ impl PathBuilder {
             .push((to_token, pool_address));
     }
 
-    /// Вычисляет предпочтения для займа из пула
-    fn calculate_borrow_preferences(
-        &self,
-        fee_tier: u32,
-        sqrt_price_x96: U256,
-        token0: Address,
-        token1: Address,
-    ) -> (bool, Address) {
-        let borrow_amount = U256::from(1_000_000_000_000_000_000u64); // 1 ETH в wei
-        
-        // Комиссия при займе того же токена
-        let fee_same = borrow_amount * U256::from(fee_tier) / U256::from(1_000_000);
-        
-        // Комиссия при займе парного токена (с учетом конвертации туда-обратно)
-        let fee_paired = borrow_amount * U256::from(fee_tier) * 2 / U256::from(1_000_000);
-        
-        // Цена парного токена в терминах основного
-        let price_paired = (sqrt_price_x96 * sqrt_price_x96) / U256::from(2).pow(U256::from(192));
-        
-        // Конвертация комиссии в парном токене обратно в основной
-        let fee_paired_converted = if price_paired.is_zero() {
-            U256::max_value() // Избегаем деления на ноль
-        } else {
-            fee_paired / price_paired
-        };
-
-        // Определение предпочтений
-        let prefer_same_token = fee_same <= fee_paired_converted;
-        let repay_token = if prefer_same_token { token0 } else { token1 };
-
-        (prefer_same_token, repay_token)
-    }
-
     /// Добавляет пул в список доступных для займа
     fn add_borrow_pool(
         &mut self,
         token: Address,
         pool_address: Address,
         fee_tier: u32,
-        prefer_same_token: bool,
-        repay_token: Address,
     ) {
         self.borrow_pools
             .entry(token)
@@ -254,8 +206,6 @@ impl PathBuilder {
             .push(BorrowPoolInfo {
                 pool_address,
                 fee_tier,
-                prefer_same_token,
-                repay_token,
             });
     }
 
@@ -421,7 +371,7 @@ impl PathBuilder {
     pub fn find_optimal_borrow_pool(
         &self,
         token: Address,
-        path: &[Address],
+        _path: &[Address],
     ) -> Option<BorrowPoolInfo> {
         let mut pools: Vec<_> = self.borrow_pools
             .get(&token)?
@@ -429,17 +379,8 @@ impl PathBuilder {
             .map(|info| info.clone())
             .collect();
 
-        // Сортировка по приоритетам:
-        // 1. Минимальная комиссия
+        // Сортировка по минимальной комиссии
         pools.sort_by(|a, b| a.fee_tier.cmp(&b.fee_tier));
-        
-        // 2. Наличие repay_token в пути
-        pools.sort_by(|a, b| {
-            path.contains(&b.repay_token).cmp(&path.contains(&a.repay_token))
-        });
-        
-        // 3. Предпочтение direct borrow
-        pools.sort_by(|a, b| b.prefer_same_token.cmp(&a.prefer_same_token));
 
         debug!(
             "[{}] Выбор оптимального пула для токена {:?} - найдено {} вариантов",

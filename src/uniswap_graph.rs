@@ -1,8 +1,9 @@
+
 use dashmap::DashMap;
 use ethers::types::{Address, U256};
 use im::OrdMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_with::{serde_as, DeserializeAs, DisplayFromStr, SerializeAs};
+use serde_with::{serde_as, DeserializeAs, SerializeAs, DisplayFromStr};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{rename, File};
 use std::io::{Write};
@@ -10,6 +11,166 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, warn};
 use std::collections::hash_map::RandomState;
+
+// Тип для представления чисел в формате Q96.64
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Q96_64 {
+    pub(crate) value: U256, // Хранит число в формате Q96.64 (96 бит целая часть, 64 бита дробная)
+}
+
+impl Q96_64 {
+    // Константа для масштабирования дробной части (2^64)
+    const FRACTION_DENOMINATOR: U256 = U256([0, 1, 0, 0]); // 2^64
+
+    // Создание из U256 (предполагается, что значение уже в формате Q96.64)
+    pub fn from_u256(value: U256) -> Result<Self, String> {
+        if value >> 160 != U256::zero() {
+            return Err("Переполнение Q96.64".to_string());
+        }
+        Ok(Q96_64 { value })
+    }
+
+    // Конвертация в U256
+    pub fn to_u256(&self) -> U256 {
+        self.value
+    }
+
+    // Создание из целой и дробной части
+    pub fn from_parts(integer: u128, fraction: u64) -> Result<Self, String> {
+        if integer >> 96 != 0 {
+            return Err("Переполнение целой части Q96.64".to_string());
+        }
+        let value = (U256::from(integer) << 64) | U256::from(fraction);
+        Ok(Q96_64 { value })
+    }
+
+    // Получение целой части (96 бит)
+    pub fn integer_part(&self) -> U256 {
+        self.value >> 64
+    }
+
+    // Получение дробной части (64 бита)
+    pub fn fractional_part(&self) -> U256 {
+        self.value & (Self::FRACTION_DENOMINATOR - U256::one())
+    }
+
+    // Сложение с проверкой переполнения
+    pub fn add(self, other: Q96_64) -> Result<Self, String> {
+        let result = self.value.checked_add(other.value).ok_or("Переполнение при сложении Q96.64")?;
+        if result >> 160 != U256::zero() {
+            return Err("Переполнение Q96.64".to_string());
+        }
+        Ok(Q96_64 { value: result })
+    }
+
+    // Вычитание с проверкой переполнения
+    pub fn sub(self, other: Q96_64) -> Result<Self, String> {
+        let result = self.value.checked_sub(other.value).ok_or("Переполнение при вычитании Q96.64")?;
+        Ok(Q96_64 { value: result })
+    }
+
+    // Умножение с учётом масштабирования
+    pub fn mul(self, other: Q96_64) -> Result<Self, String> {
+        let (high, low) = full_multiply(self.value, other.value);
+        let scaled = (high << 64) | (low >> 64);
+        if scaled >> 160 != U256::zero() {
+            return Err("Переполнение при умножении Q96.64".to_string());
+        }
+        Ok(Q96_64 { value: scaled })
+    }
+
+    // Деление с учётом масштабирования
+    pub fn div(self, other: Q96_64) -> Result<Self, String> {
+        if other.value.is_zero() {
+            return Err("Деление на ноль в Q96.64".to_string());
+        }
+        let scaled = (self.value << 64) / other.value;
+        if scaled >> 160 != U256::zero() {
+            return Err("Переполнение при делении Q96.64".to_string());
+        }
+        Ok(Q96_64 { value: scaled })
+    }
+}
+
+// Вспомогательная функция для умножения U256
+fn full_multiply(a: U256, b: U256) -> (U256, U256) {
+    let a_high = a >> 128;
+    let a_low = a & ((U256::from(1) << 128) - U256::from(1));
+    let b_high = b >> 128;
+    let b_low = b & ((U256::from(1) << 128) - U256::from(1));
+
+    let low_low = a_low * b_low;
+    let high_low = a_high * b_low;
+    let low_high = a_low * b_high;
+    let high_high = a_high * b_high;
+
+    let intermediate = low_low
+        .checked_add((high_low << 128).checked_add(low_high << 128).unwrap())
+        .unwrap();
+    let high = high_high
+        .checked_add(high_low >> 128)
+        .unwrap()
+        .checked_add(low_high >> 128)
+        .unwrap();
+    (high, intermediate)
+}
+
+// Сериализация Q96_64 как строки
+impl Serialize for Q96_64 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let s = format!(
+            "{}.{}",
+            self.integer_part(),
+            self.fractional_part()
+        );
+        serializer.serialize_str(&s)
+    }
+}
+
+// Десериализация Q96_64 из строки
+impl<'de> Deserialize<'de> for Q96_64 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let parts: Vec<&str> = s.split('.').collect();
+        if parts.len() != 2 {
+            return Err(serde::de::Error::custom("Неверный формат Q96.64"));
+        }
+        let integer = U256::from_dec_str(parts[0]).map_err(serde::de::Error::custom)?;
+        let fraction = U256::from_dec_str(parts[1]).map_err(serde::de::Error::custom)?;
+        if integer >> 96 != U256::zero() || fraction >> 64 != U256::zero() {
+            return Err(serde::de::Error::custom("Переполнение при десериализации Q96.64"));
+        }
+        Q96_64::from_parts(integer.as_u128(), fraction.as_u64())
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+// Реализация SerializeAs для serde_with
+struct Q96_64AsString;
+
+impl SerializeAs<Q96_64> for Q96_64AsString {
+    fn serialize_as<S>(source: &Q96_64, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        source.serialize(serializer)
+    }
+}
+
+impl<'de> DeserializeAs<'de, Q96_64> for Q96_64AsString {
+    fn deserialize_as<D>(deserializer: D) -> Result<Q96_64, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Q96_64::deserialize(deserializer)
+    }
+}
 
 // Структура для сериализации снимка графа в JSON
 #[derive(Serialize, Deserialize)]
@@ -21,49 +182,49 @@ struct UniversalGraphSnapshot {
 // Основная структура графа Uniswap V3
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct UniversalGraph {
-    pub nodes: DashMap<Address, (Address, Address), RandomState>, // Карта адресов пулов и их токенов (token_a, token_b)
-    pub edges: DashMap<Address, UniswapPool, RandomState>,        // Карта адресов пулов и их данных
+    pub nodes: DashMap<Address, (Address, Address), RandomState>,
+    pub edges: DashMap<Address, UniswapPool, RandomState>,
 }
 
-// Структура пула Uniswap V3 с добавленными полями ликвидности токенов
+// Структура пула Uniswap V3
 #[serde_as]
-#[derive(Serialize, Clone, Debug, Deserialize)]
+#[derive(Serialize, Default, Clone, Debug, Deserialize)]
 pub struct UniswapPool {
     #[serde_as(as = "ArcAsInner")]
-    pub graph_pool_address: Arc<Address>, // Адрес пула
+    pub graph_pool_address: Arc<Address>,
     #[serde_as(as = "ArcAsInner")]
-    pub uniswap_dex: Arc<String>, 
+    pub uniswap_dex: Arc<String>,
     #[serde_as(as = "ArcAsInner")]
-    pub uniswap_token_a: Arc<Address>, // Адрес первого токена (token0)
-    pub uniswap_token_a_decimals: u8, // Десятичные разряды token0
+    pub uniswap_token_a: Arc<Address>,
+    pub uniswap_token_a_decimals: u8,
     #[serde_as(as = "ArcAsInner")]
-    pub uniswap_token_a_symbol: Arc<String>, // Символ token0
+    pub uniswap_token_a_symbol: Arc<String>,
     #[serde_as(as = "DisplayFromStr")]
-    pub liquidity_token_a: U256, // Доступная ликвидность token0
+    pub liquidity_token_a: U256,
     #[serde_as(as = "ArcAsInner")]
-    pub uniswap_token_b: Arc<Address>, // Адрес второго токена (token1)
-    pub uniswap_token_b_decimals: u8, // Десятичные разряды token1
+    pub uniswap_token_b: Arc<Address>,
+    pub uniswap_token_b_decimals: u8,
     #[serde_as(as = "ArcAsInner")]
-    pub uniswap_token_b_symbol: Arc<String>, // Символ token1
+    pub uniswap_token_b_symbol: Arc<String>,
     #[serde_as(as = "DisplayFromStr")]
-    pub uniswap_liquidity: U256, // Общая ликвидность пула
+    pub uniswap_liquidity: U256,
+    #[serde_as(as = "Q96_64AsString")]
+    pub uniswap_sqrt_price: Q96_64, // Изменено на Q96.64
     #[serde_as(as = "DisplayFromStr")]
-    pub uniswap_sqrt_price: U256, // Квадратный корень текущей цены
+    pub liquidity_token_b: U256,
+    pub uniswap_tick_current: i32,
+    pub uniswap_tick_lower: i32,
+    pub uniswap_tick_upper: i32,
+    pub uniswap_tick_spacing: i32,
     #[serde_as(as = "DisplayFromStr")]
-    pub liquidity_token_b: U256, // Доступная ликвидность token1
-    pub uniswap_tick_current: i32,    // Текущий тик
-    pub uniswap_tick_lower: i32,      // Нижний тик пула
-    pub uniswap_tick_upper: i32,      // Верхний тик пула
-    pub uniswap_tick_spacing: i32,    // Шаг тиков
-    #[serde_as(as = "DisplayFromStr")]
-    pub uniswap_max_liquidity_per_tick: U256, // Максимальная ликвидность на тик
-    pub uniswap_fee_tier: u32,        // Уровень комиссии пула (bps: 100, 500, 3000, 10000)
+    pub uniswap_max_liquidity_per_tick: U256,
+    pub uniswap_fee_tier: u32,
     #[serde_as(as = "OrdMapAsBTreeMap")]
-    pub tick_map: OrdMap<i32, (i128, U256)>, // Карта тиков (тик -> (delta_liquidity, amount))
-    pub is_active: bool,              // Активность пула
+    pub tick_map: OrdMap<i32, (i128, U256)>,
+    pub is_active: bool,
 }
 
-// Сериализация и десериализация Arc<T> для сохранения данных в JSON
+// Сериализация и десериализация Arc<T>
 struct ArcAsInner;
 
 impl<T: Serialize> SerializeAs<Arc<T>> for ArcAsInner {
@@ -78,13 +239,13 @@ impl<T: Serialize> SerializeAs<Arc<T>> for ArcAsInner {
 impl<'de, T: Deserialize<'de>> DeserializeAs<'de, Arc<T>> for ArcAsInner {
     fn deserialize_as<D>(deserializer: D) -> Result<Arc<T>, D::Error>
     where
-        D: serde::Deserializer<'de>,
+        D: Deserializer<'de>,
     {
         Ok(Arc::new(T::deserialize(deserializer)?))
     }
 }
 
-// Сериализация и десериализация OrdMap<i32, (i128, U256)> как BTreeMap для JSON
+// Сериализация и десериализация OrdMap<i32, (i128, U256)>
 struct OrdMapAsBTreeMap;
 
 impl SerializeAs<OrdMap<i32, (i128, U256)>> for OrdMapAsBTreeMap {
@@ -118,21 +279,6 @@ impl<'de> DeserializeAs<'de, OrdMap<i32, (i128, U256)>> for OrdMapAsBTreeMap {
 }
 
 impl UniversalGraph {
-    /// Создает новый пустой граф с кастомным количеством шардов.
-    ///
-    /// Аргумент `shard_count` рекомендуется устанавливать равным ожидаемому
-    /// количеству пулов (pool_count) для поведения "1 пул = 1 шард".
-    ///
-    /// Примечание: если shard_count != реальному количеству пулов — шардирование
-    /// всё ещё будет работать, но в некоторых шардах могут оказаться несколько пулов.
-    ///
-    /// Проверка: shard_count должен быть степенью двойки для корректной работы DashMap.
-    /// Это необходимо, так как DashMap использует битовый сдвиг для выбора шарда
-    /// на основе хеша ключа. Если shard_count не степень двойки, распределение ключей
-    /// по шардам становится неравномерным, что приводит к дисбалансу нагрузки
-    /// и снижению производительности. Проверка использует битовую операцию
-    /// `shard_count & (shard_count - 1) == 0`, которая подтверждает, что число
-    /// имеет ровно один установленный бит (например, 1, 2, 4, 8, 16).
     pub fn new(shard_count: usize) -> Self {
         debug!("[UNISWAP_GRAPH_new] 🧿 Создание нового универсального графа с {} шардами", shard_count);
         assert!(shard_count > 0, "Количество шардов должно быть > 0");
@@ -146,44 +292,26 @@ impl UniversalGraph {
         }
     }
 
-    /// Обновляет или вставляет пул в граф, включая ликвидность token0 и token1.
-    ///
-    /// Метод асинхронный, чтобы позволить использование тайм-аута при доступе к DashMap.
-    /// Возвращает Ok(()) при успехе или Err с описанием ошибки.
     pub async fn upsert_pool(&self, new_pool: UniswapPool) -> Result<(), String> {
         let start = Instant::now();
         debug!(
-            "[UNISWAP_GRAPH_upsert_pool]🧿 Начало обновления/вставки пула {:?}, fee: {}, liquidity: {}, sqrt_price: {}, tick_current: {}, tick_map_size: {}, liquidity_token0: {}, liquidity_token1: {}",
+            "[UNISWAP_GRAPH_upsert_pool]🧿 Начало обновления пула {:?}, fee: {}, liquidity: {}, sqrt_price: {}.{}, tick_current: {}, tick_map_size: {}, liquidity_token0: {}, liquidity_token1: {}",
             new_pool.graph_pool_address,
             new_pool.uniswap_fee_tier,
             new_pool.uniswap_liquidity,
-            new_pool.uniswap_sqrt_price,
+            new_pool.uniswap_sqrt_price.integer_part(),
+            new_pool.uniswap_sqrt_price.fractional_part(),
             new_pool.uniswap_tick_current,
             new_pool.tick_map.len(),
             new_pool.liquidity_token_a,
             new_pool.liquidity_token_b
         );
 
-        // Проверка входных данных
         if new_pool.graph_pool_address.is_zero() {
             error!("[UNISWAP_GRAPH_upsert_pool] 🧿🧿 Ошибка: адрес пула нулевой");
             return Err("Адрес пула нулевой".to_string());
         }
 
-        debug!(
-            "[UNISWAP_GRAPH_upsert_pool] 🧿 Подробные данные пула: token_a: {:?}, token_b: {:?}, tick_lower: {}, tick_upper: {}, tick_spacing: {}, max_liquidity_per_tick: {}, is_active: {}, liquidity_token0: {}, liquidity_token1: {}",
-            new_pool.uniswap_token_a,
-            new_pool.uniswap_token_b,
-            new_pool.uniswap_tick_lower,
-            new_pool.uniswap_tick_upper,
-            new_pool.uniswap_tick_spacing,
-            new_pool.uniswap_max_liquidity_per_tick,
-            new_pool.is_active,
-            new_pool.liquidity_token_a,
-            new_pool.liquidity_token_b
-        );
-
-        // Проверка ликвидности пула
         if new_pool.uniswap_liquidity > U256::from(u128::MAX) {
             return Err(format!(
                 "Ликвидность пула 🧿🧿 превышает uint128: {}",
@@ -191,7 +319,6 @@ impl UniversalGraph {
             ));
         }
 
-        // Проверка максимальной ликвидности на тик
         if new_pool.uniswap_max_liquidity_per_tick > U256::from(u128::MAX) {
             return Err(format!(
                 "🧿🧿Максимальная ликвидность на тик превышает uint128: {}",
@@ -199,7 +326,6 @@ impl UniversalGraph {
             ));
         }
 
-        // Проверка ликвидности токенов
         if new_pool.liquidity_token_a > U256::from(u128::MAX)
             || new_pool.liquidity_token_b > U256::from(u128::MAX)
         {
@@ -209,18 +335,23 @@ impl UniversalGraph {
             ));
         }
 
+        if new_pool.uniswap_sqrt_price.to_u256() >> 160 != U256::zero() {
+            return Err(format!(
+                "🧿🧿 Значение uniswap_sqrt_price превышает Q96.64: {}",
+                new_pool.uniswap_sqrt_price.to_u256()
+            ));
+        }
+
         let pool_address = *new_pool.graph_pool_address;
         let token_a = *new_pool.uniswap_token_a;
         let token_b = *new_pool.uniswap_token_b;
 
-        debug!("[UNISWAP_GRAPH_upsert_pool] 🧿 Извлечены pool_address: {:?}, token_a: {:?}, token_b: {:?}",
-            pool_address,
-            token_a,
-            token_b
+        debug!(
+            "[UNISWAP_GRAPH_upsert_pool] 🧿 Извлечены pool_address: {:?}, token_a: {:?}, token_b: {:?}", 
+            pool_address, token_a, token_b
         );
 
         let get_mut_start = Instant::now();
-
         match tokio::time::timeout(std::time::Duration::from_secs(10), async {
             self.edges.get_mut(&pool_address)
         })
@@ -228,92 +359,27 @@ impl UniversalGraph {
         {
             Ok(Some(mut existing_pool)) => {
                 debug!(
-                    "[UNISWAP_GRAPH_upsert_pool] 🧿 Доступ к edges получен за {:?}, найден существующий пул {:?}",
-                    get_mut_start.elapsed(),
-                    pool_address
+                    "[UNISWAP_GRAPH_upsert_pool] 🧿 Доступ к edges за {:?}, найден пул {:?}", 
+                    get_mut_start.elapsed(), pool_address
                 );
-                debug!(
-                    "[UNISWAP_GRAPH_upsert_pool] 🧿 Текущие данные пула: liquidity: {}, sqrt_price: {}, tick_current: {}, tick_map_size: {}, liquidity_token0: {}, liquidity_token1: {}, is_active: {}",
-                    existing_pool.uniswap_liquidity,
-                    existing_pool.uniswap_sqrt_price,
-                    existing_pool.uniswap_tick_current,
-                    existing_pool.tick_map.len(),
-                    existing_pool.liquidity_token_a,
-                    existing_pool.liquidity_token_b,
-                    existing_pool.is_active
-                );
-
-                // Обновление данных пула
                 existing_pool.uniswap_liquidity = new_pool.uniswap_liquidity;
-                debug!(
-                    "[UNISWAP_GRAPH_upsert_pool] 🧿 Обновлена ликвидность: {}",
-                    existing_pool.uniswap_liquidity
-                );
-
                 existing_pool.uniswap_sqrt_price = new_pool.uniswap_sqrt_price;
-                debug!(
-                    "[UNISWAP_GRAPH_upsert_pool] 🧿 Обновлена sqrt_price: {}",
-                    existing_pool.uniswap_sqrt_price
-                );
-
                 existing_pool.uniswap_tick_current = new_pool.uniswap_tick_current;
-                debug!(
-                    "[UNISWAP_GRAPH_upsert_pool] 🧿 Обновлен текущий тик: {}",
-                    existing_pool.uniswap_tick_current
-                );
-
                 existing_pool.is_active = new_pool.is_active;
-                debug!(
-                    "[UNISWAP_GRAPH_upsert_pool] 🧿 Обновлен статус is_active: {}",
-                    existing_pool.is_active
-                );
-
                 existing_pool.liquidity_token_a = new_pool.liquidity_token_a;
-                debug!(
-                    "[UNISWAP_GRAPH_upsert_pool]🧿 Обновлена ликвидность token0: {}",
-                    existing_pool.liquidity_token_a
-                );
-
                 existing_pool.liquidity_token_b = new_pool.liquidity_token_b;
+                existing_pool.tick_map = existing_pool.tick_map.clone().union(new_pool.tick_map.clone());
                 debug!(
-                    "[UNISWAP_GRAPH_upsert_pool] 🧿 Обновлена ликвидность token1: {}",
-                    existing_pool.liquidity_token_b
-                );
-
-                debug!(
-                    "[UNISWAP_GRAPH_upsert_pool] 🧿 Начало объединения tick_map, старый размер: {}, новый размер: {}",
-                    existing_pool.tick_map.len(),
-                    new_pool.tick_map.len()
-                );
-
-                let union_start = Instant::now();
-                existing_pool.tick_map = existing_pool
-                    .tick_map
-                    .clone()
-                    .union(new_pool.tick_map.clone());
-                warn!(
-                    "[UNISWAP_GRAPH_upsert_pool] 🧿 Завершено объединение tick_map за {} мкс, итоговый размер: {}",
-                    union_start.elapsed().as_micros(),
-                    existing_pool.tick_map.len()
-                );
-
-                debug!(
-                    "[UNISWAP_GRAPH_upsert_pool] 🧿 Обновлен пул: {:?}",
-                    pool_address
-                );
-                debug!(
-                    "[UNISWAP_GRAPH_upsert_pool] 🧿 Попытка вставки в nodes: pool_address: {:?}, tokens: ({:?}, {:?})",
-                    pool_address,
-                    token_a,
-                    token_b
+                    "[UNISWAP_GRAPH_upsert_pool] 🧿 Вставка в nodes: pool_address: {:?}, tokens: ({:?}, {:?})",
+                    pool_address, token_a, token_b
                 );
                 match self.nodes.insert(pool_address, (token_a, token_b)) {
                     Some(_) => debug!(
-                        "[UNISWAP_GRAPH_upsert_pool] 🧿 Обновлена запись в nodes для пула {:?}",
+                        "[UNISWAP_GRAPH_upsert_pool] 🧿 Обновлена запись в nodes для пула {:?}", 
                         pool_address
                     ),
                     None => debug!(
-                        "[UNISWAP_GRAPH_upsert_pool]🧿 Новая запись в nodes для пула {:?}",
+                        "[UNISWAP_GRAPH_upsert_pool]🧿 Новая запись в nodes для пула {:?}", 
                         pool_address
                     ),
                 }
@@ -325,32 +391,30 @@ impl UniversalGraph {
                     pool_address
                 );
                 debug!(
-                    "[UNISWAP_GRAPH_upsert_pool]🧿🧿🧿 Вставка нового пула в edges: {:?}",
+                    "[UNISWAP_GRAPH_upsert_pool]🧿🧿🧿 Вставка нового пула в edges: {:?}", 
                     pool_address
                 );
                 match self.edges.insert(pool_address, new_pool.clone()) {
                     Some(_) => debug!(
-                        "[UNISWAP_GRAPH_upsert_pool] 🧿 Обновлена запись в edges для пула {:?}",
+                        "[UNISWAP_GRAPH_upsert_pool] 🧿 Обновлена запись в edges для пула {:?}", 
                         pool_address
                     ),
                     None => debug!(
-                        "[UNISWAP_GRAPH_upsert_pool]🧿 Новая запись в edges для пула {:?}",
+                        "[UNISWAP_GRAPH_upsert_pool]🧿 Новая запись в edges для пула {:?}", 
                         pool_address
                     ),
                 }
                 debug!(
                     "[UNISWAP_GRAPH_upsert_pool] 🧿 Вставка в nodes: pool_address: {:?}, tokens: ({:?}, {:?})",
-                    pool_address,
-                    token_a,
-                    token_b
+                    pool_address, token_a, token_b
                 );
                 match self.nodes.insert(pool_address, (token_a, token_b)) {
                     Some(_) => debug!(
-                        "[UNISWAP_GRAPH_upsert_pool] 🧿 Обновлена запись в nodes для пула {:?}",
+                        "[UNISWAP_GRAPH_upsert_pool] 🧿 Обновлена запись в nodes для пула {:?}", 
                         pool_address
                     ),
                     None => debug!(
-                        "[UNISWAP_GRAPH_upsert_pool]🧿 Новая запись в nodes для пула {:?}",
+                        "[UNISWAP_GRAPH_upsert_pool]🧿 Новая запись в nodes для пула {:?}", 
                         pool_address
                     ),
                 }
@@ -358,7 +422,6 @@ impl UniversalGraph {
                     "[UNISWAP_GRAPH_upsert_pool] 🧿🧿🧿 Новый пул {:?} успешно создан",
                     pool_address
                 );
-                // Проверяем, что пул действительно добавлен
                 if self.edges.contains_key(&pool_address) {
                     debug!("[UNISWAP_GRAPH_upsert_pool] 🧿 Подтверждено: пул {:?} присутствует в edges", pool_address);
                 } else {
@@ -380,16 +443,12 @@ impl UniversalGraph {
 
         let duration = start.elapsed();
         warn!(
-            "[UNISWAP_GRAPH_upsert_pool] 🧿 Завершено выполнение upsert_pool для {:?}: время выполнения: {:?}",
+            "[UNISWAP_GRAPH_upsert_pool] 🧿 Завершено выполнение upsert_pool для {:?}: время выполнения: {:?}", 
             pool_address, duration
         );
         Ok(())
     }
 
-    /// Сохраняет граф в JSON-файл.
-    ///
-    /// Метод создает временный файл для атомарной записи, чтобы избежать повреждения данных.
-    /// Возвращает Ok(()) при успехе или Err с ошибкой ввода/вывода.
     pub fn save_graph_to_json(&self, path: &str) -> std::io::Result<()> {
         debug!(
             "[UNISWAP_GRAPH_save_graph_to_json] 🧿 Начало сохранения графа в JSON файл: {}",
@@ -432,9 +491,6 @@ impl UniversalGraph {
         Ok(())
     }
 
-    /// Возвращает адреса всех пулов.
-    ///
-    /// Собирает адреса из nodes в HashSet для уникальности.
     pub fn get_pool_addresses(&self) -> HashSet<Address> {
         debug!("[UNISWAP_GRAPH_get_pool_addresses] 🧿 Получение адресов всех пулов");
         let addresses: HashSet<Address> = self.nodes.iter().map(|r| *r.key()).collect();
@@ -445,9 +501,6 @@ impl UniversalGraph {
         addresses
     }
 
-    /// Создает снимок графа для сериализации.
-    ///
-    /// Копирует данные из DashMap в HashMap для удобства сериализации.
     fn snapshot(&self) -> UniversalGraphSnapshot {
         debug!("[UNISWAP_GRAPH_snapshot] 🧿 Создание снимка текущего состояния графа");
         let nodes_count = self.nodes.len();
