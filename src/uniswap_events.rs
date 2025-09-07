@@ -27,7 +27,7 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 
-use crate::uniswap_graph::Q96_64;
+use crate::uniswap_graph::Q64_96;
 use crate::{
     uniswap_graph::UniversalGraph,
     uniswap_v3::{calculate_token_liquidity, process_pool_data, UniswapV3Pool},
@@ -221,7 +221,7 @@ pub struct FlashEvent {
 #[derive(Debug, Default, Clone)]
 pub struct EventPoolUpdate {
     pub liquidity: U256,
-    pub sqrt_price_x96: Q96_64,
+    pub sqrt_price_x96: Q64_96,
     pub current_tick: i32,
     pub tick_map: OrdMap<i32, (i128, U256)>,
 }
@@ -247,6 +247,7 @@ pub struct PoolEventInfo {
 
 impl UniswapEventSubscriber {
     pub fn new(provider: Arc<Provider<Http>>) -> Self {
+        
         let subscriber = Self {
             provider,
             subscribed_pools: DashSet::new(),
@@ -264,7 +265,7 @@ impl UniswapEventSubscriber {
         block_sender: watch::Sender<u64>,
     ) -> anyhow::Result<()> {
         debug!("[    UNISWAP_EVENTS_DEBUG    ] Запуск subscribe_to_new_blocks через HTTP-опрос");
-        const POLL_INTERVAL: Duration = Duration::from_secs(2);
+        const POLL_INTERVAL: Duration = Duration::from_secs(1);
         let mut last_sent_block: u64 = 0;
         let mut interval = interval(POLL_INTERVAL);
 
@@ -647,6 +648,7 @@ impl UniswapEventSubscriber {
         simulator_tx: Sender<PoolEventInfo>,
         is_paths_built: Arc<AtomicBool>,
     ) -> anyhow::Result<EventPoolUpdate> {
+        
         debug!("[UNISWAP_EVENTS_UPDATE_GRAPH_DEBUG 📥][{:?}] Начало update_graph_from_event, event_id: 🆔 {}", pool_address, pool_event_info.event_id);
 
         let start_time = Instant::now();
@@ -814,7 +816,7 @@ pub async fn polling_event(
     provider: Arc<Provider<Http>>,
     simulator_tx: mpsc::Sender<PoolEventInfo>,
 ) -> anyhow::Result<()> {
-    let max_chunk_size: u64 = 200;
+    let max_chunk_size: u64 = 10; // Ограничение до 10 блоков
     let mut block_receiver = block_receiver.clone();
     info!(
         "[UNISWAP_EVENTS_POLLING] Начало polling_event. Количество подписанных пулов: {}. Пулы: {:?}", 
@@ -828,7 +830,7 @@ pub async fn polling_event(
     );
 
     let mut pending_events: Vec<PoolEventInfo> = Vec::new();
-    let processed_event_ids: Arc<DashSet<u64>> = Arc::new(DashSet::new()); // Добавлено: Хранилище обработанных event_id
+    let processed_event_ids: Arc<DashSet<u64>> = Arc::new(DashSet::new());
 
     loop {
         let simulator_tx = simulator_tx.clone();
@@ -882,6 +884,11 @@ pub async fn polling_event(
         let mut all_events = Vec::new();
         while current_from <= block_to {
             let current_to = (current_from + max_chunk_size - 1).min(block_to);
+            let block_range = current_to.saturating_sub(current_from) + 1;
+            warn!(
+                "[UNISWAP_EVENTS_POLLING_WARN] Количество опрошенных блоков: {} (from_block: {}, to_block: {})",
+                block_range, current_from, current_to
+            );
             debug!(
                 "[UNISWAP_EVENTS_POLLING_DEBUG] Подготовка к fetch_events: block_from: {}, block_to: {}. Количество подписанных пулов: {}", 
                 current_from, current_to, self.subscribed_pools.len()
@@ -894,7 +901,6 @@ pub async fn polling_event(
             loop {
                 match self.fetch_events(current_from, current_to).await {
                     Ok(events) => {
-                        // Фильтрация уже обработанных событий
                         let new_events: Vec<PoolEventInfo> = events
                             .into_iter()
                             .filter(|e| processed_event_ids.insert(e.event_id))
@@ -982,7 +988,6 @@ pub async fn polling_event(
     self.is_polling_active.store(false, Ordering::Release);
     Ok(())
 }
-
     
     pub fn add_pool_handler(
         &self,

@@ -12,22 +12,22 @@ use std::time::Instant;
 use tracing::{debug, error, warn};
 use std::collections::hash_map::RandomState;
 
-// Тип для представления чисел в формате Q96.64
+// Q64_96 (64 бита целой части, 96 бит дробной)
 #[derive(Clone, Copy, Default, Debug, PartialEq, PartialOrd, Eq, Ord)]
-pub struct Q96_64 {
-    pub value: U256, // Хранит число в формате Q96.64 (96 бит целая часть, 64 бита дробная)
+pub struct Q64_96 {
+    pub value: U256, // Хранит число в формате Q64.96 (64 бита целой части, 96 бит дробной)
 }
 
-impl Q96_64 {
-    // Константа для масштабирования дробной части (2^64)
-    const FRACTION_DENOMINATOR: U256 = U256([0, 1, 0, 0]); // 2^64
+impl Q64_96 {
+    // Константа для масштабирования дробной части (2^96)
+    const FRACTION_DENOMINATOR: U256 = U256([0, 1 << (96 - 64), 0, 0]); // 2^96
 
-    // Создание из U256 (предполагается, что значение уже в формате Q96.64)
+    // Создание из U256 (предполагается, что значение уже в формате Q64.96)
     pub fn from_u256(value: U256) -> Result<Self, String> {
         if value >> 160 != U256::zero() {
-            return Err("Переполнение Q96.64".to_string());
+            return Err("Переполнение Q64.96".to_string());
         }
-        Ok(Q96_64 { value })
+        Ok(Q64_96 { value })
     }
 
     // Конвертация в U256
@@ -36,61 +36,66 @@ impl Q96_64 {
     }
 
     // Создание из целой и дробной части
-    pub fn from_parts(integer: u128, fraction: u64) -> Result<Self, String> {
-        if integer >> 96 != 0 {
-            return Err("Переполнение целой части Q96.64".to_string());
+    pub fn from_parts(integer: u128, fraction: u128) -> Result<Self, String> {
+        if integer >> 64 != 0 {
+            return Err("Переполнение целой части Q64.96".to_string());
         }
-        let value = (U256::from(integer) << 64) | U256::from(fraction);
-        Ok(Q96_64 { value })
+        if fraction >> 96 != 0 {
+            return Err("Переполнение дробной части Q64.96".to_string());
+        }
+        let value = (U256::from(integer) << 96) | U256::from(fraction);
+        Ok(Q64_96 { value })
     }
 
-    // Получение целой части (96 бит)
+    // Получение целой части (64 бита)
     pub fn integer_part(&self) -> U256 {
-        self.value >> 64
+        self.value >> 96
     }
 
-    // Получение дробной части (64 бита)
+    // Получение дробной части (96 бит)
     pub fn fractional_part(&self) -> U256 {
         self.value & (Self::FRACTION_DENOMINATOR - U256::one())
     }
 
     // Сложение с проверкой переполнения
-    pub fn add(self, other: Q96_64) -> Result<Self, String> {
-        let result = self.value.checked_add(other.value).ok_or("Переполнение при сложении Q96.64")?;
+    pub fn add(self, other: Q64_96) -> Result<Self, String> {
+        let result = self.value.checked_add(other.value).ok_or("Переполнение при сложении Q64.96")?;
         if result >> 160 != U256::zero() {
-            return Err("Переполнение Q96.64".to_string());
+            return Err("Переполнение Q64.96".to_string());
         }
-        Ok(Q96_64 { value: result })
+        Ok(Q64_96 { value: result })
     }
 
     // Вычитание с проверкой переполнения
-    pub fn sub(self, other: Q96_64) -> Result<Self, String> {
-        let result = self.value.checked_sub(other.value).ok_or("Переполнение при вычитании Q96.64")?;
-        Ok(Q96_64 { value: result })
+    pub fn sub(self, other: Q64_96) -> Result<Self, String> {
+        let result = self.value.checked_sub(other.value).ok_or("Переполнение при вычитании Q64.96")?;
+        Ok(Q64_96 { value: result })
     }
 
     // Умножение с учётом масштабирования
-    pub fn mul(self, other: Q96_64) -> Result<Self, String> {
+    pub fn mul(self, other: Q64_96) -> Result<Self, String> {
         let (high, low) = full_multiply(self.value, other.value);
-        let scaled = (high << 64) | (low >> 64);
+        let scaled = (high << 96) | (low >> 96);
         if scaled >> 160 != U256::zero() {
-            return Err("Переполнение при умножении Q96.64".to_string());
+            return Err("Переполнение при умножении Q64.96".to_string());
         }
-        Ok(Q96_64 { value: scaled })
+        Ok(Q64_96 { value: scaled })
     }
 
     // Деление с учётом масштабирования
-    pub fn div(self, other: Q96_64) -> Result<Self, String> {
+    pub fn div(self, other: Q64_96) -> Result<Self, String> {
         if other.value.is_zero() {
-            return Err("Деление на ноль в Q96.64".to_string());
+            return Err("Деление на ноль в Q64.96".to_string());
         }
-        let scaled = (self.value << 64) / other.value;
+        let scaled = (self.value << 96) / other.value;
         if scaled >> 160 != U256::zero() {
-            return Err("Переполнение при делении Q96.64".to_string());
+            return Err("Переполнение при делении Q64.96".to_string());
         }
-        Ok(Q96_64 { value: scaled })
+        Ok(Q64_96 { value: scaled })
     }
+   
 }
+
 
 // Вспомогательная функция для умножения U256
 fn full_multiply(a: U256, b: U256) -> (U256, U256) {
@@ -116,7 +121,7 @@ fn full_multiply(a: U256, b: U256) -> (U256, U256) {
 }
 
 // Сериализация Q96_64 как строки
-impl Serialize for Q96_64 {
+impl Serialize for Q64_96 {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -131,7 +136,7 @@ impl Serialize for Q96_64 {
 }
 
 // Десериализация Q96_64 из строки
-impl<'de> Deserialize<'de> for Q96_64 {
+impl<'de> Deserialize<'de> for Q64_96 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -146,16 +151,16 @@ impl<'de> Deserialize<'de> for Q96_64 {
         if integer >> 96 != U256::zero() || fraction >> 64 != U256::zero() {
             return Err(serde::de::Error::custom("Переполнение при десериализации Q96.64"));
         }
-        Q96_64::from_parts(integer.as_u128(), fraction.as_u64())
+        Q64_96::from_parts(integer.as_u128(), fraction.as_u128())
             .map_err(serde::de::Error::custom)
     }
 }
 
 // Реализация SerializeAs для serde_with
-struct Q96_64AsString;
+struct Q64_96AsString;
 
-impl SerializeAs<Q96_64> for Q96_64AsString {
-    fn serialize_as<S>(source: &Q96_64, serializer: S) -> Result<S::Ok, S::Error>
+impl SerializeAs<Q64_96> for Q64_96AsString {
+    fn serialize_as<S>(source: &Q64_96, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
@@ -163,12 +168,12 @@ impl SerializeAs<Q96_64> for Q96_64AsString {
     }
 }
 
-impl<'de> DeserializeAs<'de, Q96_64> for Q96_64AsString {
-    fn deserialize_as<D>(deserializer: D) -> Result<Q96_64, D::Error>
+impl<'de> DeserializeAs<'de, Q64_96> for Q64_96AsString {
+    fn deserialize_as<D>(deserializer: D) -> Result<Q64_96, D::Error>
     where
         D: Deserializer<'de>,
     {
-        Q96_64::deserialize(deserializer)
+        Q64_96::deserialize(deserializer)
     }
 }
 
@@ -208,8 +213,8 @@ pub struct UniswapPool {
     pub uniswap_token_b_symbol: Arc<String>,
     #[serde_as(as = "DisplayFromStr")]
     pub uniswap_liquidity: U256,
-    #[serde_as(as = "Q96_64AsString")]
-    pub uniswap_sqrt_price: Q96_64, // Изменено на Q96.64
+    #[serde_as(as = "Q64_96AsString")]
+    pub uniswap_sqrt_price: Q64_96, 
     #[serde_as(as = "DisplayFromStr")]
     pub liquidity_token_b: U256,
     pub uniswap_tick_current: i32,

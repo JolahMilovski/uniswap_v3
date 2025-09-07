@@ -47,11 +47,14 @@ pub struct PathBuilder {
     /// Флаг завершения построения путей
     #[serde(skip)]
     pub is_paths_built: Arc<AtomicBool>,
+    /// Для дедупликации путей
+    #[serde(skip)]
+    unique_paths: HashSet<(Vec<Address>, Vec<Address>)>,
 }
 
 impl PathBuilder {
     /// Создает новый экземпляр PathBuilder
-    pub fn new(
+pub fn new(
         aave_rx: watch::Receiver<AaveTokenLiquidity>,
         is_paths_built: Arc<AtomicBool>,
     ) -> Self {
@@ -74,6 +77,7 @@ impl PathBuilder {
             pool_to_paths: DashMap::new(),
             borrow_pools: DashMap::new(),
             is_paths_built,
+            unique_paths: HashSet::new(),
         }
     }
 
@@ -118,9 +122,12 @@ impl PathBuilder {
         self.paths.clear();
         self.pool_to_paths.clear();
         self.borrow_pools.clear();
+        self.unique_paths.clear();
     }
 
-    /// Строит граф связей между токенами и индексирует пулы для заимствования
+
+
+/// Строит граф связей между токенами и индексирует пулы для заимствования
     fn build_related_list(
         &mut self,
         graph: &Arc<ArcSwap<UniversalGraph>>,
@@ -140,14 +147,62 @@ impl PathBuilder {
 
         // Сортировка пулов по комиссии для каждого токена
         self.sort_borrow_pools_by_fee();
-        
         warn!(
             "[{}] Построено {} связей между токенами",
             "UNISWAP_PATH_BUILDER 🧬".green(),
             related_list.len()
         );
-        
         related_list
+    }
+
+
+    /// Регистрирует найденный арбитражный путь
+    fn register_arbitrage_path(&mut self, tokens: &[Address], pools: &[Address]) {
+        let key = (tokens.to_vec(), pools.to_vec());
+        if self.unique_paths.contains(&key) {
+            debug!(
+                "[{}] Дубликат пути {:?}, пропуск",
+                "UNISWAP_PATH_BUILDER 🧬".green(),
+                tokens
+            );
+            return;
+        }
+        self.unique_paths.insert(key);
+
+        let path = ArbitragePath {
+            tokens: tokens.to_vec(),
+            pools: pools.to_vec(),
+        };
+
+        let path_index = self.paths.len();
+        self.paths.push(path);
+
+        // Индексация пулов
+        for pool in pools {
+            self.pool_to_paths
+                .entry(*pool)
+                .or_default()
+                .push(path_index);
+        }
+
+        // Валидация доступности займа для промежуточных токенов
+        for &token in &tokens[1..tokens.len() - 1] {
+            if !self.borrow_pools.contains_key(&token) {
+                warn!(
+                    "[{}] Нет доступных пулов для займа промежуточного токена {:?}",
+                    "UNISWAP_PATH_BUILDER 🧬".green(),
+                    token
+                );
+            }
+        }
+
+        debug!(
+            "[{}] Зарегистрирован новый путь #{}: токены {:?}, пулы {:?}",
+            "UNISWAP_PATH_BUILDER 🧬".green(),
+            path_index,
+            tokens,
+            pools
+        );
     }
 
     /// Обрабатывает отдельный пул, добавляя связи и информацию для займа
@@ -316,43 +371,6 @@ impl PathBuilder {
         }
     }
 
-    /// Регистрирует найденный арбитражный путь
-    fn register_arbitrage_path(&mut self, tokens: &[Address], pools: &[Address]) {
-        let path = ArbitragePath {
-            tokens: tokens.to_vec(),
-            pools: pools.to_vec(),
-        };
-
-        let path_index = self.paths.len();
-        self.paths.push(path);
-
-        // Индексация пулов
-        for pool in pools {
-            self.pool_to_paths
-                .entry(*pool)
-                .or_default()
-                .push(path_index);
-        }
-
-        // Валидация доступности займа для промежуточных токенов
-        for &token in &tokens[1..tokens.len() - 1] {
-            if !self.borrow_pools.contains_key(&token) {
-                warn!(
-                    "[{}] Нет доступных пулов для займа промежуточного токена {:?}",
-                    "UNISWAP_PATH_BUILDER 🧬".green(),
-                    token
-                );
-            }
-        }
-
-        debug!(
-            "[{}] Зарегистрирован новый путь #{}: токены {:?}, пулы {:?}",
-            "UNISWAP_PATH_BUILDER 🧬".green(),
-            path_index,
-            tokens,
-            pools
-        );
-    }
 
     /// Определяет, следует ли посещать указанный пул
     fn should_visit_pool(

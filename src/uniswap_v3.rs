@@ -5,7 +5,7 @@ use crate::uniswap_cache::UniswapPoolCache;
 use crate::uniswap_events::UniswapEventSubscriber;
 use crate::uniswap_graph::UniswapPool;
 use crate::uniswap_graph::UniversalGraph;
-use crate::uniswap_graph::Q96_64;
+use crate::uniswap_graph::Q64_96;
 
 use arc_swap::ArcSwap;
 use colored::Colorize;
@@ -171,7 +171,7 @@ abigen!(
 );
 
 lazy_static! {
-    static ref Q96: U256 = U256::from(1) << 96;
+    static ref Q64: U256 = U256::from(1) << 96;
 }
 
 
@@ -213,7 +213,7 @@ fn full_multiply(a: U256, b: U256) -> (U256, U256) {
 }
 
 /// Преобразует тик в sqrt_price_x96, соответствующее TickMath.sol
-pub fn tick_to_sqrt_price(tick: i32) -> Result<Q96_64, String> {
+pub fn tick_to_sqrt_price(tick: i32) -> Result<Q64_96, String> {
     debug!(
         "[UNISWAP_V3_SQRT_PRICE_DEBUG] Начало преобразования тика в sqrt_price_x96, тик: {}",
         tick
@@ -298,17 +298,17 @@ pub fn tick_to_sqrt_price(tick: i32) -> Result<Q96_64, String> {
 
     debug!(
         "[UNISWAP_V3_SQRT_PRICE_DEBUG] Конец преобразования тика в sqrt_price_x96, результат: {}.{}",
-        Q96_64::from_u256(sqrt_price).map(|p| p.integer_part()).unwrap_or(U256::zero()),
-        Q96_64::from_u256(sqrt_price).map(|p| p.fractional_part()).unwrap_or(U256::zero())
+        Q64_96::from_u256(sqrt_price).map(|p| p.integer_part()).unwrap_or(U256::zero()),
+        Q64_96::from_u256(sqrt_price).map(|p| p.fractional_part()).unwrap_or(U256::zero())
     );
 
-    Q96_64::from_u256(sqrt_price).map_err(|e| format!("Ошибка конвертации sqrt_price: {}", e))
+    Q64_96::from_u256(sqrt_price).map_err(|e| format!("Ошибка конвертации sqrt_price: {}", e))
 }
 
 const Q96_U256: U256 = U256([0, 1 << (96 - 64), 0, 0]); // 2^96
 
 /// Делит Q96^2 на sqrt_price_x96
-fn q96_squared_div(sqrt_price_x96: Q96_64) -> Result<Q96_64, String> {
+fn q96_squared_div(sqrt_price_x96: Q64_96) -> Result<Q64_96, String> {
     debug!("[Q96_SQUARED_DIV] 💧 Начало деления Q96^2 на sqrt_price_x96={}.{}", 
            sqrt_price_x96.integer_part(), sqrt_price_x96.fractional_part());
 
@@ -346,7 +346,7 @@ fn q96_squared_div(sqrt_price_x96: Q96_64) -> Result<Q96_64, String> {
         return Err("Переполнение результата деления".to_string());
     }
 
-    let q96_64_result = Q96_64::from_u256(result).map_err(|e| {
+    let q96_64_result = Q64_96::from_u256(result).map_err(|e| {
         warn!("[Q96_SQUARED_DIV] 💧 Ошибка преобразования результата: {}", e);
         format!("Ошибка преобразования результата: {}", e)
     })?;
@@ -361,7 +361,7 @@ pub fn calculate_token_liquidity(
     pool: &UniswapPool,
     tick_map: &OrdMap<i32, (i128, U256)>,
     current_tick: i32,
-    sqrt_price_x96: Q96_64,
+    sqrt_price_x96: Q64_96,
 ) -> Result<(U256, U256), String> {
     debug!(
         "[LIQUIDITY_CALC] 💧 Начало расчёта ликвидности для пула {:?} (токены: {}/{}), текущий тик: {}",
@@ -930,7 +930,7 @@ async fn fetch_pool_data_multicall(
     pool_address: H160,
     pool_contract: &UniswapV3Pool<Provider<Http>>,
     provider: Arc<Provider<Http>>,
-) -> Option<(U256, (Q96_64, i32, u16, u16, u16, u8, bool), i32, u128, u32)> {
+) -> Option<(U256, (Q64_96, i32, u16, u16, u16, u8, bool), i32, u128, u32)> {
     debug!(
         "[UNISWAP_V3_MULTICALL_DEBUG] Начало мультиколла для пула {:?}",
         pool_address
@@ -957,7 +957,7 @@ async fn fetch_pool_data_multicall(
         .ok()?;
 
     let slot0 = (
-        Q96_64::from_u256(result.1.0).map_err(|e| {
+        Q64_96::from_u256(result.1.0).map_err(|e| {
             warn!(
                 "[UNISWAP_V3_MULTICALL] Ошибка конвертации sqrtPriceX96 в Q96_64: {}",
                 e
@@ -986,7 +986,7 @@ async fn fetch_pool_data_multicall(
 pub async fn process_pool_data(
     pool_address: H160,
     pool_contract: Arc<UniswapV3Pool<Provider<Http>>>,
-) -> Option<(U256, (Q96_64, i32, u16, u16, u16, u8, bool), i32, u128, u32)> {
+) -> Option<(U256, (Q64_96, i32, u16, u16, u16, u8, bool), i32, u128, u32)> {
     debug!(
         "[UNISWAP_V3_PROC_DEBUG] Начало обработки данных пула {:?}",
         pool_address

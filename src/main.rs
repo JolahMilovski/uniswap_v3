@@ -91,7 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             uniswap::take_gas_price=warn,\
             uniswap::token=warn,\
             uniswap::token_white_list=warn,\
-            uniswap::trade_simulator=debug,\
+            uniswap::trade_simulator=warn,\
             uniswap::uniswap_cache=warn,\
             uniswap::tick_fetcher=warn,\
             uniswap::uniswap_events=warn,\
@@ -253,8 +253,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Создание задачи для обработки событий
     let is_paths_built_for_polling = Arc::clone(&is_paths_built);
     let event_tx_for_polling = event_tx.clone();
+
     let (simulator_tx, simulator_rx) = mpsc::channel::<PoolEventInfo>(2000);
     //let token_cache_clone = Arc::clone(&token_cache);
+
     let polling_handle = spawn({
         let graph = Arc::clone(&pulling_graph);
         let provider_http = Arc::clone(&provider_http_for_polling);
@@ -361,8 +363,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         TradeSimulator::new(Arc::clone(&path_builder), aave_rx, Arc::clone(&graph));
 
     info!("[MAIN] Запуск TradeSimulator");
+    
     let simulation_handle = spawn(async move {
+
         trade_simulator.run(simulator_rx).await;
+        
         info!("[MAIN_TRADE_SIMULATOR] TradeSimulator завершил работу");
     });
 
