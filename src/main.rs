@@ -22,7 +22,7 @@ use tokio::{
 };
 
 use tracing::{error, info, warn, Level};
-use tracing_appender::{non_blocking::{NonBlocking, NonBlockingBuilder, WorkerGuard}, rolling};
+use tracing_appender::{non_blocking::NonBlockingBuilder, rolling};
 use tracing_subscriber::fmt;
 use tracing_subscriber::fmt::FormatFields;
 use tracing_subscriber::prelude::*;
@@ -53,63 +53,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Загрузка переменных окружения из .env файла
     dotenv().ok();
 
-    // Настройка ротации логов (ежеминутно) и запись в файл
-    let file_appender = rolling::hourly("./logs", "uniswap_bot_log.txt");
-
-    let (non_blocking, _guard): (NonBlocking, WorkerGuard) = NonBlockingBuilder::default()
-        .buffered_lines_limit(128_000) // Буфер на 128_000 событий
-        .lossy(false) // Не терять логи, применять обратное давление
-        .thread_name("unilog")
-        .finish(file_appender);
-
-
-
-    let file_layer = fmt::layer()
-        .with_writer(non_blocking)
-        .with_ansi(true)
-        .with_target(false)
-        .with_line_number(true)
-        .with_thread_names(false);
-
-    // Настройка вывода логов в консоль
-    let stdout_layer = fmt::layer()
-        .with_ansi(std::io::stdout().is_terminal())
-        .with_target(false)
-        .with_line_number(true)
-        .with_thread_names(false)
-        .with_level(true)
-        .event_format(CustomEventFormat::new(true));
-
-    // Настройка фильтра логирования
-    let filter = EnvFilter::builder()
-        .with_default_directive(Level::DEBUG.into())
-        .parse(
-            "debug,\
-            uniswap::aave_v3_flash_monitor=warn,\
-            uniswap::path_builder=warn,\
-            uniswap::provider=warn,\
-            uniswap::take_gas_price=warn,\
-            uniswap::token=warn,\
-            uniswap::token_white_list=warn,\
-            uniswap::trade_simulator=warn,\
-            uniswap::uniswap_cache=warn,\
-            uniswap::tick_fetcher=warn,\
-            uniswap::uniswap_events=warn,\
-            uniswap::uniswap_graph=warn,\
-            uniswap::uniswap_v3=warn,\
-            h2=off,\
-            hyper=off,\
-            ",
-        )
-        .expect("Неверная конфигурация EnvFilter");
-
-    // Инициализация логгера
-    tracing::subscriber::set_global_default(
-        tracing_subscriber::registry()
-            .with(file_layer)
-            .with(stdout_layer)
-            .with(filter)
-    ).expect("Ошибка настройки логгера");
+    // НАСТРОЙКА РАЗНЫХ УРОВНЕЙ ЛОГИРОВАНИЯ ДЛЯ ТЕРМИНАЛА И ФАЙЛА
+    setup_logging()?;
 
     // Логирование инициализации логгера
     info!("[MAIN] Логгер инициализирован в {:?}", chrono::Utc::now());
@@ -399,6 +344,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 //================================================================================= ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ =================================================================================
+
+
+/// Настраивает систему логирования с разными уровнями для терминала и файла
+fn setup_logging() -> Result<(), Box<dyn std::error::Error>> {
+    // Создаем директорию для логов, если её нет
+    std::fs::create_dir_all("logs")?;
+
+    // НАСТРОЙКА ФАЙЛОВОГО ЛОГГЕРА (DEBUG и выше)
+    let file_appender = rolling::hourly("./logs", "uniswap_bot_log.txt");
+    
+    let (non_blocking_file, _file_guard) = NonBlockingBuilder::default()
+        .buffered_lines_limit(128_000_000)
+        .lossy(false)
+        .thread_name("file_logger")
+        .finish(file_appender);
+
+    let file_layer = fmt::layer()
+        .with_writer(non_blocking_file)
+        .with_ansi(true) 
+        .with_target(true)
+        .with_line_number(true)
+        .with_thread_names(true)
+        .with_level(true)
+        .with_filter(
+            EnvFilter::builder()
+                .with_default_directive(Level::DEBUG.into())
+                .parse("debug,h2=off,hyper=off")?
+        );
+
+    // НАСТРОЙКА ТЕРМИНАЛЬНОГО ЛОГГЕРА (WARN и ERROR)
+    let stdout_layer = fmt::layer()
+        .with_writer(std::io::stdout)
+        .with_ansi(std::io::stdout().is_terminal())
+        .with_target(false)
+        .with_line_number(false)
+        .with_thread_names(false)
+        .with_level(false)
+        .event_format(CustomEventFormat::new(true))
+        .with_filter(
+            EnvFilter::builder()
+                .with_default_directive(Level::WARN.into())
+                .parse("warn,h2=off,hyper=off")?
+        );
+
+    // Установка логгера
+    tracing_subscriber::registry()
+        .with(file_layer)
+        .with(stdout_layer)
+        .init();
+
+    Ok(())
+}
+
 
 
 #[derive(Clone)]
