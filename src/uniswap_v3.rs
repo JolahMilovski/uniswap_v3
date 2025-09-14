@@ -850,7 +850,7 @@ pub async fn sync_pools(
                                 graph.store(Arc::new(graph_inner));
                                 phase1_active_count.fetch_add(1, Ordering::SeqCst);
                                 event_subscriber.subscribed_pools.insert(current_addresses);
-                                info!(
+                                warn!(
                                     "{} Пул с адресом {:?} добавлен в список подписки. Всего подписанных пулов: {}",
                                     "INFO".bright_yellow().blink(),
                                     current_addresses,
@@ -922,8 +922,12 @@ pub async fn sync_pools(
         "[UNISWAP_V3_SYNC_POOL] Обработано: {} пулов из кэша",
         phase1_active_count.load(Ordering::SeqCst)
     );
+    
     Ok(())
+
 }
+
+
 
 /// Получает данные пула Uniswap V3 с использованием мультиколла
 async fn fetch_pool_data_multicall(

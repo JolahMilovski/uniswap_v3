@@ -57,9 +57,9 @@ abigen!(
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct AaveTokenLiquidity {
     #[serde_as(as = "HashSet<DisplayFromStr>")]
-    pub token_address: HashSet<Address>,
+    pub aave_token_address: HashSet<Address>,
     #[serde_as(as = "HashMap<DisplayFromStr, (_, DisplayFromStr)>")]
-    pub token_info: HashMap<Address, (String, U256)>, // symbol, virtual_balance
+    pub aave_token_info: HashMap<Address, (String, U256)>, // symbol, virtual_balance
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -131,14 +131,14 @@ pub async fn get_aave_data(
 
                 for result in results {
                     if let Some((addr, (symbol, virtual_balance))) = result {
-                        new_data.token_address.insert(addr);
-                        new_data.token_info.insert(addr, (symbol, virtual_balance));
+                        new_data.aave_token_address.insert(addr);
+                        new_data.aave_token_info.insert(addr, (symbol, virtual_balance));
                     } else {
                         all_ok = false;
                     }
                 }
 
-                if all_ok && !new_data.token_info.is_empty() {
+                if all_ok && !new_data.aave_token_info.is_empty() {
                     let snapshot = AaveLiquiditySnapshot {
                         timestamp: Utc::now().to_rfc3339(),
                         data: new_data.clone(),
@@ -154,7 +154,7 @@ pub async fn get_aave_data(
                                 } else {
                                     info!(
                                         "[ AAVE ] Сохранено {} токенов в aave_liquidity.json",
-                                        snapshot.data.token_info.len()
+                                        snapshot.data.aave_token_info.len()
                                     );
                                 }
                             }
@@ -182,7 +182,7 @@ pub async fn get_aave_data(
                             fallback_data = snapshot.data.clone();
                             info!(
                                 "[ AAVE ] Загружены данные из файла: {} токенов, время: {}",
-                                snapshot.data.token_info.len(),
+                                snapshot.data.aave_token_info.len(),
                                 snapshot.timestamp
                             );
                             let _ = aave_sender.send(fallback_data.clone());
@@ -216,7 +216,7 @@ pub async fn get_aave_data(
         }
 
         // Если данные из файла пусты, отправляем пустые данные
-        if fallback_data.token_info.is_empty() {
+        if fallback_data.aave_token_info.is_empty() {
             error!("[ AAVE ] Нет данных для fallback, отправка пустых данных");
             let _ = aave_sender.send(AaveTokenLiquidity::default());
         }
