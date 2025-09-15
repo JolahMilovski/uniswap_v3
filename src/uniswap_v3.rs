@@ -174,7 +174,6 @@ lazy_static! {
     static ref Q64: U256 = U256::from(1) << 96;
 }
 
-
 /// Вспомогательная функция для умножения двух U256 с разбиением на старшую и младшую части
 fn full_multiply(a: U256, b: U256) -> (U256, U256) {
     let a_high = a >> 128;
@@ -309,8 +308,11 @@ const Q96_U256: U256 = U256([0, 1 << (96 - 64), 0, 0]); // 2^96
 
 /// Делит Q96^2 на sqrt_price_x96
 fn q96_squared_div(sqrt_price_x96: Q64_96) -> Result<Q64_96, String> {
-    debug!("[Q96_SQUARED_DIV] 💧 Начало деления Q96^2 на sqrt_price_x96={}.{}", 
-           sqrt_price_x96.integer_part(), sqrt_price_x96.fractional_part());
+    debug!(
+        "[Q96_SQUARED_DIV] 💧 Начало деления Q96^2 на sqrt_price_x96={}.{}",
+        sqrt_price_x96.integer_part(),
+        sqrt_price_x96.fractional_part()
+    );
 
     let max_safe_price = U256::from(1) << 160;
     let min_safe_price = U256::from(1) << 32;
@@ -320,13 +322,17 @@ fn q96_squared_div(sqrt_price_x96: Q64_96) -> Result<Q64_96, String> {
         return Err("Нулевая sqrt_price_x96".to_string());
     }
     if sqrt_price_x96.to_u256() > max_safe_price {
-        warn!("[Q96_SQUARED_DIV] 💧 sqrt_price_x96 {} превышает безопасный предел", 
-              sqrt_price_x96.to_u256());
+        warn!(
+            "[Q96_SQUARED_DIV] 💧 sqrt_price_x96 {} превышает безопасный предел",
+            sqrt_price_x96.to_u256()
+        );
         return Err("Переполнение sqrt_price_x96".to_string());
     }
     if sqrt_price_x96.to_u256() < min_safe_price {
-        warn!("[Q96_SQUARED_DIV] 💧 sqrt_price_x96 {} ниже минимального предела", 
-              sqrt_price_x96.to_u256());
+        warn!(
+            "[Q96_SQUARED_DIV] 💧 sqrt_price_x96 {} ниже минимального предела",
+            sqrt_price_x96.to_u256()
+        );
         return Err("sqrt_price_x96 слишком мала".to_string());
     }
 
@@ -340,19 +346,28 @@ fn q96_squared_div(sqrt_price_x96: Q64_96) -> Result<Q64_96, String> {
             warn!("[Q96_SQUARED_DIV] 💧 Ошибка деления Q96^2 на sqrt_price_x96");
             "Ошибка деления Q96^2".to_string()
         })?;
-    
+
     if result > max_safe_price {
-        warn!("[Q96_SQUARED_DIV] 💧 Результат деления {} превышает безопасный предел", result);
+        warn!(
+            "[Q96_SQUARED_DIV] 💧 Результат деления {} превышает безопасный предел",
+            result
+        );
         return Err("Переполнение результата деления".to_string());
     }
 
     let q96_64_result = Q64_96::from_u256(result).map_err(|e| {
-        warn!("[Q96_SQUARED_DIV] 💧 Ошибка преобразования результата: {}", e);
+        warn!(
+            "[Q96_SQUARED_DIV] 💧 Ошибка преобразования результата: {}",
+            e
+        );
         format!("Ошибка преобразования результата: {}", e)
     })?;
 
-    debug!("[Q96_SQUARED_DIV] 💧 Результат: {}.{}", 
-           q96_64_result.integer_part(), q96_64_result.fractional_part());
+    debug!(
+        "[Q96_SQUARED_DIV] 💧 Результат: {}.{}",
+        q96_64_result.integer_part(),
+        q96_64_result.fractional_part()
+    );
     Ok(q96_64_result)
 }
 
@@ -414,14 +429,16 @@ pub fn calculate_token_liquidity(
     if sqrt_price_x96.to_u256() > max_safe_price {
         warn!(
             "[LIQUIDITY_CALC] 💧 Пропуск пула {:?}: sqrt_price_x96 {} превышает безопасный предел",
-            pool.graph_pool_address, sqrt_price_x96.to_u256()
+            pool.graph_pool_address,
+            sqrt_price_x96.to_u256()
         );
         return Err("Переполнение sqrt_price_x96".to_string());
     }
     if sqrt_price_x96.to_u256() < min_safe_price {
         warn!(
             "[LIQUIDITY_CALC] 💧 Пропуск пула {:?}: sqrt_price_x96 {} ниже минимального предела",
-            pool.graph_pool_address, sqrt_price_x96.to_u256()
+            pool.graph_pool_address,
+            sqrt_price_x96.to_u256()
         );
         return Err("sqrt_price_x96 слишком мала".to_string());
     }
@@ -608,7 +625,6 @@ pub fn calculate_token_liquidity(
     Ok((amount_token0, amount_token1))
 }
 
-
 /// Создаёт пул Uniswap V3
 pub async fn build_uniswap_v3_pool(
     pool_address: Address,
@@ -755,8 +771,6 @@ pub async fn build_uniswap_v3_pool(
     );
     Some(pool)
 }
-
-
 
 /// Синхронизирует пулы Uniswap V3 с кэша и обновляет граф
 pub async fn sync_pools(
@@ -922,12 +936,9 @@ pub async fn sync_pools(
         "[UNISWAP_V3_SYNC_POOL] Обработано: {} пулов из кэша",
         phase1_active_count.load(Ordering::SeqCst)
     );
-    
+
     Ok(())
-
 }
-
-
 
 /// Получает данные пула Uniswap V3 с использованием мультиколла
 async fn fetch_pool_data_multicall(
@@ -961,20 +972,21 @@ async fn fetch_pool_data_multicall(
         .ok()?;
 
     let slot0 = (
-        Q64_96::from_u256(result.1.0).map_err(|e| {
-            warn!(
-                "[UNISWAP_V3_MULTICALL] Ошибка конвертации sqrtPriceX96 в Q96_64: {}",
+        Q64_96::from_u256(result.1 .0)
+            .map_err(|e| {
+                warn!(
+                    "[UNISWAP_V3_MULTICALL] Ошибка конвертации sqrtPriceX96 в Q96_64: {}",
+                    e
+                );
                 e
-            );
-            e
-        })
-        .ok()?,
-        result.1.1,
-        result.1.2,
-        result.1.3,
-        result.1.4,
-        result.1.5,
-        result.1.6,
+            })
+            .ok()?,
+        result.1 .1,
+        result.1 .2,
+        result.1 .3,
+        result.1 .4,
+        result.1 .5,
+        result.1 .6,
     );
 
     debug!(
@@ -1015,4 +1027,3 @@ pub async fn process_pool_data(
     );
     Some(result)
 }
-

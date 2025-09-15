@@ -246,7 +246,6 @@ pub struct PoolEventInfo {
 
 impl UniswapEventSubscriber {
     pub fn new(provider: Arc<Provider<Http>>) -> Self {
-        
         let subscriber = Self {
             provider,
             subscribed_pools: DashSet::new(),
@@ -395,7 +394,11 @@ impl UniswapEventSubscriber {
             });
             let event_id = self.event_counter.fetch_add(1, Ordering::SeqCst);
 
-            warn!("[UNISWAP_EVENTS_COUNTER_DEBUG] Получено событий: пул={:?}, event_id 🆔 {}", address, event_id + 1);
+            warn!(
+                "[UNISWAP_EVENTS_COUNTER_DEBUG] Получено событий: пул={:?}, event_id 🆔 {}",
+                address,
+                event_id + 1
+            );
 
             let entry = event_map.entry(address).or_insert_with(|| {
                 let block_number_u64 = log.block_number.map(|n| n.as_u64()).unwrap_or(0);
@@ -647,7 +650,6 @@ impl UniswapEventSubscriber {
         //simulator_tx: Sender<PoolEventInfo>,
         //is_paths_built: Arc<AtomicBool>,
     ) -> anyhow::Result<EventPoolUpdate> {
-        
         debug!("[UNISWAP_EVENTS_UPDATE_GRAPH_DEBUG 📥][{:?}] Начало update_graph_from_event, event_id: 🆔 {}", pool_address, pool_event_info.event_id);
 
         let start_time = Instant::now();
@@ -678,8 +680,9 @@ impl UniswapEventSubscriber {
                 &new_pool.tick_map,
                 new_pool.uniswap_tick_current,
                 new_pool.uniswap_sqrt_price,
-            ).map_err(|e| anyhow!("Ошибка вычисления ликвидности: {}", e))?;
-            
+            )
+            .map_err(|e| anyhow!("Ошибка вычисления ликвидности: {}", e))?;
+
             new_pool.liquidity_token_a = liquidity_token0;
             new_pool.liquidity_token_b = liquidity_token1;
             // ------------------------------------------------
@@ -695,7 +698,7 @@ impl UniswapEventSubscriber {
                 pool_address, pool_event_info.event_id
             );
         }
-/*
+        /*
 
         // Отправка события в simulator_tx после обновления графа
         if is_paths_built.load(Ordering::Acquire) {
@@ -807,307 +810,304 @@ impl UniswapEventSubscriber {
         (map, changed_pools)
     }
 
-pub async fn polling_event(
-    &self,
-    block_receiver: &watch::Receiver<u64>,
-    graph: Arc<ArcSwap<UniversalGraph>>,
-    event_tx: broadcast::Sender<HashMap<Address, PoolEventInfo>>,
-    is_paths_built: Arc<AtomicBool>,
-    provider: Arc<Provider<Http>>,
-    simulator_tx: mpsc::Sender<PoolEventInfo>,
-) -> anyhow::Result<()> {
-    let max_chunk_size: u64 = 10; // Ограничение до 10 блоков
-    let mut block_receiver = block_receiver.clone();
-    info!(
+    pub async fn polling_event(
+        &self,
+        block_receiver: &watch::Receiver<u64>,
+        graph: Arc<ArcSwap<UniversalGraph>>,
+        event_tx: broadcast::Sender<HashMap<Address, PoolEventInfo>>,
+        is_paths_built: Arc<AtomicBool>,
+        provider: Arc<Provider<Http>>,
+        simulator_tx: mpsc::Sender<PoolEventInfo>,
+    ) -> anyhow::Result<()> {
+        let max_chunk_size: u64 = 10; // Ограничение до 10 блоков
+        let mut block_receiver = block_receiver.clone();
+        info!(
         "[UNISWAP_EVENTS_POLLING] Начало polling_event. Количество подписанных пулов: {}. Пулы: {:?}", 
         self.subscribed_pools.len(), self.subscribed_pools.iter().map(|p| *p).collect::<Vec<Address>>()
     );
 
-    let mut block_from = *block_receiver.borrow();
-    info!(
-        "[UNISWAP_EVENTS_POLLING] Установлен начальный блок: {}",
-        block_from
-    );
+        let mut block_from = *block_receiver.borrow();
+        info!(
+            "[UNISWAP_EVENTS_POLLING] Установлен начальный блок: {}",
+            block_from
+        );
 
-    let mut pending_events: Vec<PoolEventInfo> = Vec::new();
-    let processed_event_ids: Arc<DashSet<u64>> = Arc::new(DashSet::new());
+        let mut pending_events: Vec<PoolEventInfo> = Vec::new();
+        let processed_event_ids: Arc<DashSet<u64>> = Arc::new(DashSet::new());
 
-    loop {
-        let simulator_tx = simulator_tx.clone();
+        loop {
+            let simulator_tx = simulator_tx.clone();
 
-        if block_receiver.changed().await.is_err() {
-            error!(
+            if block_receiver.changed().await.is_err() {
+                error!(
                 "[UNISWAP_EVENTS_POLLING_ERROR] Канал block_receiver закрыт, завершение polling_event. Количество подписанных пулов: {}", 
                 self.subscribed_pools.len()
             );
-            self.is_polling_active.store(false, Ordering::Release);
-            break;
-        }
+                self.is_polling_active.store(false, Ordering::Release);
+                break;
+            }
 
-        let block_to = *block_receiver.borrow();
-        debug!("[UNISWAP_EVENTS_POLLING_DEBUG] Получен block_to: {}. Количество подписанных пулов: {}", 
+            let block_to = *block_receiver.borrow();
+            debug!("[UNISWAP_EVENTS_POLLING_DEBUG] Получен block_to: {}. Количество подписанных пулов: {}", 
             block_to, self.subscribed_pools.len()
         );
 
-        if self.subscribed_pools.is_empty() {
-            warn!(
+            if self.subscribed_pools.is_empty() {
+                warn!(
                 "[UNISWAP_EVENTS_POLLING_WARN] Нет подписанных пулов, пропуск обработки. Количество подписанных пулов: {}", 
                 self.subscribed_pools.len()
             );
-            block_from = *block_receiver.borrow();
-            debug!(
+                block_from = *block_receiver.borrow();
+                debug!(
                 "[UNISWAP_EVENTS_POLLING_DEBUG] Обновлен block_from: {}. Количество подписанных пулов: {}", 
                 block_from, self.subscribed_pools.len()
             );
-            continue;
-        }
+                continue;
+            }
 
-        for pool_address in self.subscribed_pools.iter() {
-            let pool_address = *pool_address.key();
-            if !self.pool_handlers.contains_key(&pool_address) {
-                self.add_pool_handler(
-                    pool_address,
-                    Arc::clone(&graph),
-                    Arc::clone(&provider),
-                    event_tx.subscribe(),
-                    simulator_tx.clone(),
-                    Arc::clone(&is_paths_built),
-                );
-                debug!(
+            for pool_address in self.subscribed_pools.iter() {
+                let pool_address = *pool_address.key();
+                if !self.pool_handlers.contains_key(&pool_address) {
+                    self.add_pool_handler(
+                        pool_address,
+                        Arc::clone(&graph),
+                        Arc::clone(&provider),
+                        event_tx.subscribe(),
+                        simulator_tx.clone(),
+                        Arc::clone(&is_paths_built),
+                    );
+                    debug!(
                     "[UNISWAP_EVENTS_POLLING_DEBUG] Добавлен обработчик для пула {:?}. Количество обработчиков: {}", 
                     pool_address, self.pool_handlers.len()
                 );
+                }
             }
-        }
 
-        let mut current_from = block_from;
-        let mut all_events = Vec::new();
-        while current_from <= block_to {
-            let current_to = (current_from + max_chunk_size - 1).min(block_to);
-            let block_range = current_to.saturating_sub(current_from) + 1;
-            debug!(
+            let mut current_from = block_from;
+            let mut all_events = Vec::new();
+            while current_from <= block_to {
+                let current_to = (current_from + max_chunk_size - 1).min(block_to);
+                let block_range = current_to.saturating_sub(current_from) + 1;
+                debug!(
                 "[UNISWAP_EVENTS_POLLING_WARN] Количество опрошенных блоков: {} (from_block: {}, to_block: {})",
                 block_range, current_from, current_to
             );
-            debug!(
+                debug!(
                 "[UNISWAP_EVENTS_POLLING_DEBUG] Подготовка к fetch_events: block_from: {}, block_to: {}. Количество подписанных пулов: {}", 
                 current_from, current_to, self.subscribed_pools.len()
             );
 
-            let mut attempts = 0;
-            const MAX_ATTEMPTS: u32 = 5;
-            const RETRY_DELAY_MS: u64 = 5;
+                let mut attempts = 0;
+                const MAX_ATTEMPTS: u32 = 5;
+                const RETRY_DELAY_MS: u64 = 5;
 
-            loop {
-                match self.fetch_events(current_from, current_to).await {
-                    Ok(events) => {
-                        let new_events: Vec<PoolEventInfo> = events
-                            .into_iter()
-                            .filter(|e| processed_event_ids.insert(e.event_id))
-                            .collect();
-                        if !new_events.is_empty() {
-                            debug!(
+                loop {
+                    match self.fetch_events(current_from, current_to).await {
+                        Ok(events) => {
+                            let new_events: Vec<PoolEventInfo> = events
+                                .into_iter()
+                                .filter(|e| processed_event_ids.insert(e.event_id))
+                                .collect();
+                            if !new_events.is_empty() {
+                                debug!(
                                 "[UNISWAP_EVENTS_POLLING_DEBUG] Получено {} новых событий для блоков {}–{}. Event_id: 🆔 {:?}", 
                                 new_events.len(), current_from, current_to,
                                 new_events.iter().map(|e| e.event_id).collect::<Vec<u64>>()
                             );
+                            }
+                            all_events.extend(new_events);
+                            break;
                         }
-                        all_events.extend(new_events);
-                        break;
-                    }
-                    Err(e) => {
-                        attempts += 1;
-                        if attempts >= MAX_ATTEMPTS {
-                            error!(
+                        Err(e) => {
+                            attempts += 1;
+                            if attempts >= MAX_ATTEMPTS {
+                                error!(
                                 "[UNISWAP_EVENTS_POLLING_ERROR] Превышено {} попыток fetch_events для блоков {}–{}: {}. Количество подписанных пулов: {}", 
                                 MAX_ATTEMPTS, current_from, current_to, e, self.subscribed_pools.len()
                             );
-                            break;
-                        }
-                        warn!(
+                                break;
+                            }
+                            warn!(
                             "[UNISWAP_EVENTS_POLLING_WARN] Ошибка fetch_events для блоков {}–{}, попытка {}/{}: {}. Повтор через {} мс", 
                             current_from, current_to, attempts, MAX_ATTEMPTS, e, RETRY_DELAY_MS
                         );
-                        tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+                            tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+                        }
                     }
                 }
+                current_from = current_to + 1;
             }
-            current_from = current_to + 1;
-        }
 
-        pending_events.extend(all_events);
-        if !pending_events.is_empty() {
-            let (event_map, changed_pools) =
-                self.aggregate_events(pending_events.clone(), Arc::clone(&graph));
+            pending_events.extend(all_events);
+            if !pending_events.is_empty() {
+                let (event_map, changed_pools) =
+                    self.aggregate_events(pending_events.clone(), Arc::clone(&graph));
 
-            debug!("[UNISWAP_EVENTS_POLLING_DEBUG] Собрано {} событий для {} пулов. Event_id: 🆔 {:?}", event_map.len(), changed_pools.len(), event_map.iter().map(|(_, info)| info.event_id).collect::<Vec<u64>>());
+                debug!("[UNISWAP_EVENTS_POLLING_DEBUG] Собрано {} событий для {} пулов. Event_id: 🆔 {:?}", event_map.len(), changed_pools.len(), event_map.iter().map(|(_, info)| info.event_id).collect::<Vec<u64>>());
 
-            if let Err(e) = event_tx.send(event_map.clone()) {
-                error!(
+                if let Err(e) = event_tx.send(event_map.clone()) {
+                    error!(
                     "[UNISWAP_EVENTS_POLLING_ERROR] Ошибка отправки {} событий в broadcast-канал event_tx: {}. Пулы: {:?}", 
                     event_map.len(), e, changed_pools
                 );
-                if matches!(e, broadcast::error::SendError { .. }) {
-                    error!(
+                    if matches!(e, broadcast::error::SendError { .. }) {
+                        error!(
                         "[UNISWAP_EVENTS_POLLING_ERROR] Канал event_tx закрыт, завершение polling_event. Количество подписанных пулов: {}", 
                         self.subscribed_pools.len()
                     );
-                    self.is_polling_active.store(false, Ordering::Release);
-                    break;
-                }
-            } else {
-                debug!(
+                        self.is_polling_active.store(false, Ordering::Release);
+                        break;
+                    }
+                } else {
+                    debug!(
                     "[UNISWAP_EVENTS_POLLING_DEBUG] Успешно отправлены {} событий в broadcast-канал event_tx. Event_id: 🆔 {:?}", 
                     event_map.len(),
                     event_map.iter().map(|(_, info)| info.event_id).collect::<Vec<u64>>()
                 );
-            }
-            pending_events.clear();
-        } else {
-            debug!(
+                }
+                pending_events.clear();
+            } else {
+                debug!(
                 "[UNISWAP_EVENTS_POLLING_DEBUG] Нет новых событий для обработки в диапазоне block_from: {}–block_to: {}. Количество подписанных пулов: {}", 
                 block_from, block_to, self.subscribed_pools.len()
             );
-        }
+            }
 
-        if block_to >= block_from {
-            block_from = block_to + 1;
-            self.last_processed_block
-                .store(block_from, Ordering::Release);
-            debug!(
+            if block_to >= block_from {
+                block_from = block_to + 1;
+                self.last_processed_block
+                    .store(block_from, Ordering::Release);
+                debug!(
                 "[UNISWAP_EVENTS_POLLING_DEBUG] Обновлен block_from: {}. Количество подписанных пулов: {}", 
                 block_from, self.subscribed_pools.len()
             );
+            }
         }
-    }
 
-    error!(
+        error!(
         "[UNISWAP_EVENTS_POLLING_ERROR] Завершение polling_event. Количество подписанных пулов: {}. Состояние is_polling_active: {}", 
         self.subscribed_pools.len(), self.is_polling_active.load(Ordering::Acquire)
     );
-    self.is_polling_active.store(false, Ordering::Release);
-    Ok(())
-}
-    
-
-
-pub fn add_pool_handler(
-    &self,
-    pool_address: Address,
-    graph: Arc<ArcSwap<UniversalGraph>>,
-    provider: Arc<Provider<Http>>,
-    event_rx: broadcast::Receiver<HashMap<Address, PoolEventInfo>>,
-    simulator_tx: mpsc::Sender<PoolEventInfo>,
-    is_paths_built: Arc<AtomicBool>,
-) {
-    if self.pool_handlers.contains_key(&pool_address) {
-        debug!(
-            "[UNISWAP_EVENTS_POOL_HANDLER_DEBUG][{:?}] Обработчик для пула уже существует",
-            pool_address
-        );
-        return;
+        self.is_polling_active.store(false, Ordering::Release);
+        Ok(())
     }
 
-    let subscriber = Arc::new(self.clone());
-    let processed_events = Arc::new(DashSet::new());
-
-    let handle = tokio::spawn({
-        let graph = Arc::clone(&graph);
-        let provider = Arc::clone(&provider);
-        let simulator_tx = simulator_tx.clone();
-        let processed_events = Arc::clone(&processed_events);
-        async move {
-            let start_time = Instant::now();
-            let mut event_rx = event_rx;
+    pub fn add_pool_handler(
+        &self,
+        pool_address: Address,
+        graph: Arc<ArcSwap<UniversalGraph>>,
+        provider: Arc<Provider<Http>>,
+        event_rx: broadcast::Receiver<HashMap<Address, PoolEventInfo>>,
+        simulator_tx: mpsc::Sender<PoolEventInfo>,
+        is_paths_built: Arc<AtomicBool>,
+    ) {
+        if self.pool_handlers.contains_key(&pool_address) {
             debug!(
-                "[UNISWAP_EVENTS_POOL_HANDLER_DEBUG] Запуск обработчика для пула {:?}",
+                "[UNISWAP_EVENTS_POOL_HANDLER_DEBUG][{:?}] Обработчик для пула уже существует",
                 pool_address
             );
-            while let Ok(event_map) = event_rx.recv().await {
-                if let Some(event) = event_map.get(&pool_address) {
-                    info!(
+            return;
+        }
+
+        let subscriber = Arc::new(self.clone());
+        let processed_events = Arc::new(DashSet::new());
+
+        let handle = tokio::spawn({
+            let graph = Arc::clone(&graph);
+            let provider = Arc::clone(&provider);
+            let simulator_tx = simulator_tx.clone();
+            let processed_events = Arc::clone(&processed_events);
+            async move {
+                let start_time = Instant::now();
+                let mut event_rx = event_rx;
+                debug!(
+                    "[UNISWAP_EVENTS_POOL_HANDLER_DEBUG] Запуск обработчика для пула {:?}",
+                    pool_address
+                );
+                while let Ok(event_map) = event_rx.recv().await {
+                    if let Some(event) = event_map.get(&pool_address) {
+                        info!(
                         "[UNISWAP_EVENTS_POOL_HANDLER_DEBUG] Обработка события с ID 🆔 {} для пула {:?}", 
                         event.event_id, pool_address
                     );
-                    if processed_events.insert(event.event_id) {
-                        let event_start_time = Instant::now();
-                        if let Err(e) = subscriber
-                            .update_graph_from_event(
-                                event,
-                                Arc::clone(&graph),
-                                pool_address,
-                                Arc::clone(&provider),
-                                //simulator_tx.clone(),
-                                // Arc::clone(&is_paths_built),
-                            )
-                            .await
-                        {
-                            error!(
+                        if processed_events.insert(event.event_id) {
+                            let event_start_time = Instant::now();
+                            if let Err(e) = subscriber
+                                .update_graph_from_event(
+                                    event,
+                                    Arc::clone(&graph),
+                                    pool_address,
+                                    Arc::clone(&provider),
+                                    //simulator_tx.clone(),
+                                    // Arc::clone(&is_paths_built),
+                                )
+                                .await
+                            {
+                                error!(
                                 "[UNISWAP_EVENTS_POOL_HANDLER_ERROR][{:?}] Ошибка обработки события с ID 🆔 {}: {:?}", 
                                 pool_address, event.event_id, e
                             );
-                            continue;
-                        }
-                        let elapsed_ms = event_start_time.elapsed().as_millis();
-                        warn!(
+                                continue;
+                            }
+                            let elapsed_ms = event_start_time.elapsed().as_millis();
+                            warn!(
                             "[UNISWAP_EVENTS_POOL_HANDLER] Для пула {:?} событие с ID 🆔 {} обработано за {} мс", 
                             pool_address, event.event_id, elapsed_ms
                         );
 
-                        if elapsed_ms <= 5000 {
-                            if is_paths_built.load(Ordering::Acquire) {
-                                match simulator_tx.try_send(event.clone()) {
-                                    Ok(()) => {
-                                        warn!(
+                            if elapsed_ms <= 5000 {
+                                if is_paths_built.load(Ordering::Acquire) {
+                                    match simulator_tx.try_send(event.clone()) {
+                                        Ok(()) => {
+                                            warn!(
                                             "[UNISWAP_EVENTS_POOL_HANDLER][{:?}] Событие с 🆔 {} отправлено в simulator_tx",
                                             pool_address, event.event_id
                                         );
-                                    }
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
-                                        warn!(
+                                        }
+                                        Err(mpsc::error::TrySendError::Full(_)) => {
+                                            warn!(
                                             "[UNISWAP_EVENTS_POOL_HANDLER_WARN][{:?}] Канал simulator_tx переполнен, событие ID 🆔 {} не отправлено",
                                             pool_address, event.event_id
                                         );
-                                    }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                                        error!(
+                                        }
+                                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                                            error!(
                                             "[UNISWAP_EVENTS_POOL_HANDLER_ERROR][{:?}] Канал simulator_tx закрыт, событие ID 🆔 {} не отправлено",
                                             pool_address, event.event_id
                                         );
+                                        }
                                     }
-                                }
-                            } else {
-                                debug!(
+                                } else {
+                                    debug!(
                                     "[UNISWAP_EVENTS_POOL_HANDLER_DEBUG][{:?}] Пути не построены, отправка события ID 🆔 {} в simulator_tx пропущена",
                                     pool_address, event.event_id
                                 );
-                            }
-                        } else {
-                            warn!(
+                                }
+                            } else {
+                                warn!(
                                 "[UNISWAP_EVENTS_POOL_HANDLER_WARN][{:?}] Событие ID 🆔 {} пропущено для симуляции (время обработки: {} мс > 1000 мс)",
                                 pool_address, event.event_id, elapsed_ms
                             );
-                        }
-                    } else {
-                        debug!(
+                            }
+                        } else {
+                            debug!(
                             "[UNISWAP_EVENTS_POOL_HANDLER_DEBUG][{:?}] Событие ID 🆔 {} уже обработано, пропуск", 
                             pool_address, event.event_id
                         );
+                        }
                     }
                 }
+                error!(
+                    "[UNISWAP_EVENTS_POOL_HANDLER_ERROR][{:?}] Обработчик завершил работу за {} мс",
+                    pool_address,
+                    start_time.elapsed().as_millis()
+                );
             }
-            error!(
-                "[UNISWAP_EVENTS_POOL_HANDLER_ERROR][{:?}] Обработчик завершил работу за {} мс",
-                pool_address,
-                start_time.elapsed().as_millis()
-            );
-        }
-    });
-    self.pool_handlers.insert(pool_address, handle);
-    warn!(
+        });
+        self.pool_handlers.insert(pool_address, handle);
+        warn!(
         "[UNISWAP_EVENTS_POOL_HANDLER] Обработчик для пула {:?} добавлен. Количество обработчиков: {}", 
         pool_address, self.pool_handlers.len()
     );
-}
-
+    }
 }

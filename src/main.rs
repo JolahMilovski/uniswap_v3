@@ -22,7 +22,10 @@ use tokio::{
 };
 
 use tracing::{error, info, warn, Level};
-use tracing_appender::{non_blocking::{NonBlocking, NonBlockingBuilder, WorkerGuard}, rolling};
+use tracing_appender::{
+    non_blocking::{NonBlocking, NonBlockingBuilder, WorkerGuard},
+    rolling,
+};
 use tracing_subscriber::fmt;
 use tracing_subscriber::fmt::FormatFields;
 use tracing_subscriber::prelude::*;
@@ -52,89 +55,87 @@ use uniswap_graph::UniversalGraph;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Загрузка переменных окружения из .env файла
     dotenv().ok();
-      /*
-    // Настройка ротации логов и запись в файл + вывод терминал
-    let file_appender = rolling::hourly("./logs", "uniswap_bot_log.txt");
-    
-    let (non_blocking, _guard): (NonBlocking, WorkerGuard) = NonBlockingBuilder::default()
-    .buffered_lines_limit(1280000) // Буфер на 128_000 событий
-    .lossy(false) // Не терять логи, применять обратное давление
-    .thread_name("unilog")
-    .finish(file_appender);
+
+    /*
+        // Настройка ротации логов и запись в файл + вывод терминал
+        let file_appender = rolling::hourly("./logs", "uniswap_bot_log.txt");
+
+        let (non_blocking, _guard): (NonBlocking, WorkerGuard) = NonBlockingBuilder::default()
+        .buffered_lines_limit(1280000) // Буфер на 128_000 событий
+        .lossy(false) // Не терять логи, применять обратное давление
+        .thread_name("unilog")
+        .finish(file_appender);
 
 
-/* */
-let file_layer = fmt::layer()
-.with_writer(non_blocking)
-.with_ansi(true)
-.with_target(false)
-.with_line_number(true)
-.with_thread_names(false);
+    let file_layer = fmt::layer()
+    .with_writer(non_blocking)
+    .with_ansi(true)
+    .with_target(false)
+    .with_line_number(true)
+    .with_thread_names(false);
 
-// Настройка вывода логов в консоль
-let stdout_layer = fmt::layer()
-.with_ansi(std::io::stdout().is_terminal())
-.with_target(false)
-.with_line_number(true)
-.with_thread_names(false)
-.with_level(true)
-.event_format(CustomEventFormat::new(true));
+    // Настройка вывода логов в консоль
+    let stdout_layer = fmt::layer()
+    .with_ansi(std::io::stdout().is_terminal())
+    .with_target(false)
+    .with_line_number(true)
+    .with_thread_names(false)
+    .with_level(true)
+    .event_format(CustomEventFormat::new(true));
 
-// Настройка фильтра логирования
-let filter = EnvFilter::builder()
-.with_default_directive(Level::DEBUG.into())
-.parse(
-    "debug,\
-    uniswap::aave_v3_flash_monitor=warn,\
-    uniswap::path_builder=warn,\
-    uniswap::provider=warn,\
-    uniswap::take_gas_price=warn,\
-    uniswap::token=warn,\
-    uniswap::token_white_list=warn,\
-    uniswap::trade_simulator=info,\
-    uniswap::uniswap_cache=warn,\
-    uniswap::tick_fetcher=warn,\
-    uniswap::uniswap_events=warn,\
-    uniswap::uniswap_graph=warn,\
-    uniswap::uniswap_v3=warn,\
-    h2=off,\
-    hyper=off,\
-    ",
-    )
-    .expect("Неверная конфигурация EnvFilter");
+    // Настройка фильтра логирования
+    let filter = EnvFilter::builder()
+    .with_default_directive(Level::DEBUG.into())
+    .parse(
+        "debug,\
+        uniswap::aave_v3_flash_monitor=warn,\
+        uniswap::path_builder=warn,\
+        uniswap::provider=warn,\
+        uniswap::take_gas_price=warn,\
+        uniswap::token=warn,\
+        uniswap::token_white_list=warn,\
+        uniswap::trade_simulator=info,\
+        uniswap::uniswap_cache=warn,\
+        uniswap::tick_fetcher=warn,\
+        uniswap::uniswap_events=warn,\
+        uniswap::uniswap_graph=warn,\
+        uniswap::uniswap_v3=warn,\
+        h2=off,\
+        hyper=off,\
+        ",
+        )
+        .expect("Неверная конфигурация EnvFilter");
 
-// Инициализация логгера
-tracing::subscriber::set_global_default(
-    tracing_subscriber::registry()
-    .with(file_layer)
-    .with(stdout_layer)
-    .with(filter)
-    ).expect("Ошибка настройки логгера");
-    */  
-    
-    
-  
+    // Инициализация логгера
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::registry()
+        .with(file_layer)
+        .with(stdout_layer)
+        .with(filter)
+        ).expect("Ошибка настройки логгера");
+        */
+
     // вывод только в файл
     let file_appender = rolling::hourly("./logs", "uniswap_bot_log.txt");
-        let (non_blocking, _guard): (NonBlocking, WorkerGuard) = NonBlockingBuilder::default()
-            .buffered_lines_limit(1280000) // Буфер на 1280000 событий
-            .lossy(false) // Не терять логи, применять обратное давление
-            .thread_name("unilog")
-            .finish(file_appender);
+    let (non_blocking, _guard): (NonBlocking, WorkerGuard) = NonBlockingBuilder::default()
+        .buffered_lines_limit(1_280_000) // Буфер на 1280000 событий
+        .lossy(false) // Не терять логи, применять обратное давление
+        .thread_name("unilog")
+        .finish(file_appender);
 
-        let file_layer = fmt::layer()
-            .with_writer(non_blocking)
-            .with_ansi(true)
-            .with_target(false)
-            .with_line_number(true)
-            .with_thread_names(false)
-            .event_format(CustomEventFormat::new(true));
+    let file_layer = fmt::layer()
+        .with_writer(non_blocking)
+        .with_ansi(true)
+        .with_target(false)
+        .with_line_number(true)
+        .with_thread_names(false)
+        .event_format(CustomEventFormat::new(true));
 
-        // Настройка фильтра логирования (без изменений)
-        let filter = EnvFilter::builder()
-            .with_default_directive(Level::DEBUG.into())
-            .parse(
-                "debug,\
+    // Настройка фильтра логирования (без изменений)
+    let filter = EnvFilter::builder()
+        .with_default_directive(Level::DEBUG.into())
+        .parse(
+            "debug,\
                 uniswap::aave_v3_flash_monitor=warn,\
                 uniswap::path_builder=warn,\
                 uniswap::provider=warn,\
@@ -150,16 +151,14 @@ tracing::subscriber::set_global_default(
                 h2=off,\
                 hyper=off,\
                 ",
-            )
-            .expect("Неверная конфигурация EnvFilter");
+        )
+        .expect("Неверная конфигурация EnvFilter");
 
-        // Инициализация логгера только с file_layer
-        tracing::subscriber::set_global_default(
-            tracing_subscriber::registry()
-                .with(file_layer)
-                .with(filter)
-        ).expect("Ошибка настройки логгера");
-          
+    // Инициализация логгера только с file_layer
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::registry().with(file_layer).with(filter),
+    )
+    .expect("Ошибка настройки логгера");
 
     // Логирование инициализации логгера
     info!("[MAIN] Логгер инициализирован в {:?}", chrono::Utc::now());
@@ -413,11 +412,10 @@ tracing::subscriber::set_global_default(
         TradeSimulator::new(Arc::clone(&path_builder), aave_rx, Arc::clone(&graph));
 
     info!("[MAIN] Запуск TradeSimulator");
-    
-    let simulation_handle = spawn(async move {
 
+    let simulation_handle = spawn(async move {
         trade_simulator.run(simulator_rx).await;
-        
+
         info!("[MAIN_TRADE_SIMULATOR] TradeSimulator завершил работу");
     });
 
@@ -449,7 +447,6 @@ tracing::subscriber::set_global_default(
 }
 
 //================================================================================= ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ =================================================================================
-
 
 #[derive(Clone)]
 struct CustomEventFormat {

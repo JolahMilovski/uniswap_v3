@@ -1,33 +1,48 @@
 //! trade_simulator.rs
-//! Модуль для симуляции арбитражных операций по путям Uniswap V3 с использованием флеш-займов Aave и возможных флеш-свапов Uniswap.
+//!
+//! Модуль для симуляции арбитражных операций по путям Uniswap V3 с использованием флеш-займов Aave
+//! и флеш-свопов Uniswap для создания искусственного ценового дисбаланса.
 //!
 //! # Основные возможности
 //! - Обработка событий пулов через поток `PoolEventInfo`.
-//! - Поиск оптимального размера флеш-займа из Aave для максимальной прибыли (многоуровневый алгоритм).
-//! - Точная симуляция свапов по тиковой модели Uniswap V3 (без учёта газа и MEV).
-//! - Фильтрация путей по минимальному порогу прибыли, заданному в `MIN_PROFIT_THRESHOLD_BY_TOKEN`.
-//! - Поддержка дополнительного займа токенов через флеш-свапы из сторонних пулов с ограничением <90% их ликвидности.
+//! - Симуляция mint ликвидности в пулах A→B и B→C для сдвига цены на 0.5–2%.
+//! - Использование 95% ликвидности Aave для арбитража (A→B→C→A) и флеш-свопов для покрытия недостающей ликвидности (до 90% пула).
+//! - Точная симуляция свопов по тиковой модели Uniswap V3 с расчётами цен в формате Q64.96.
+//! - Burn/collect для возврата ликвидности и комиссий.
+//! - Фильтрация путей по минимальному порогу прибыли (`MIN_PROFIT_THRESHOLD_BY_TOKEN`).
+//! - Логирование всех шагов для отладки.
 //!
-//! # Новый алгоритм поиска оптимальной суммы займа
-//! 1. Проход: расчет для максимальной доступной суммы в Aave
-//! 2. Проход: проверка на -5%, -10%, -15%, -20%, -25% от максимума
-//! 3. Проход: детальный поиск вокруг лучшего значения из второго прохода 
-//! 4. Проход: точный поиск с тиковой математикой в узком диапазоне
+//! # Алгоритм работы
+//! 1. Получение события пула (`PoolEventInfo`) через `run`.
+//! 2. Построение арбитражных путей через `PathBuilder`.
+//! 3. Расчёт mint для пулов A→B и B→C с целевым сдвигом цены (1% по умолчанию).
+//! 4. Использование 95% ликвидности Aave для mint и арбитража, дополнение флеш-свопами.
+//! 5. Выполнение арбитражного свопа (A→B→C→A) для "отработки" заминченной ликвидности.
+//! 6. Burn/collect для возврата ликвидности и комиссий.
+//! 7. Проверка профита: `profit_net > MIN_PROFIT_THRESHOLD_BY_TOKEN` и `total_fee_earned ≥ total_fees`.
+//! 8. Возврат лучших путей через `PathSimulationResult`.
 
 use crate::{
     aave_v3_flash_monitor::AaveTokenLiquidity,
     path_builder::{ArbitragePath, BorrowPoolInfo, PathBuilder},
     uniswap_events::PoolEventInfo,
-    uniswap_graph::{self, UniswapPool, UniversalGraph, Q64_96},
+    uniswap_graph::{UniswapPool, UniversalGraph, Q64_96},
     uniswap_v3::tick_to_sqrt_price,
 };
 
 use arc_swap::ArcSwap;
 use colored::Colorize;
-use ethers::{types::{Address, U256}, utils::hex};
+use ethers::{
+    types::{Address, U256},
+    utils::hex,
+};
 use lazy_static::lazy_static;
-use std::{collections::{HashMap, HashSet}, env, sync::Arc};
-use tokio::{sync::mpsc::Receiver as MpscReceiver};
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    sync::Arc,
+};
+use tokio::sync::mpsc::Receiver as MpscReceiver;
 use tracing::{debug, error, info, warn};
 
 lazy_static! {
@@ -40,7 +55,7 @@ lazy_static! {
             let mut m = HashMap::new();
             // Mai Stablecoin (MAI)
             m.insert(Address::from_slice(&hex::decode("3f56e0c36d275367b8c502090edf38289b3dea0d").unwrap()), U256::from(100_000_000_000_000_000_000u128));
-            // USD Coin (USDC)            
+            // USD Coin (USDC)
             m.insert(Address::from_slice(&hex::decode("af88d065e77c8cc2239327c5edb3a432268e5831").unwrap()), U256::from(100_000_000));
             // Bridged USDC (USDC.e)
             m.insert(Address::from_slice(&hex::decode("ff970a61a04b1ca14834a43f5de4533ebddb5cc8").unwrap()), U256::from(100_000_000));
@@ -98,6 +113,28 @@ lazy_static! {
         }
         scaled_thresholds
     };
+
+     pub static ref DEFAULT_ARBITRAGE_STRATEGY_CONFIG: ArbitrageStrategyConfig = {
+        let target_bps: u32 = env::var("TARGET_PRICE_IMPACT_BPS")
+            .unwrap_or("100".to_string()) // 1% по умолчанию
+            .parse()
+            .unwrap_or(100);
+        let aave_utilization: u64 = env::var("AAVE_UTILIZATION_PERCENT")
+            .unwrap_or("95".to_string())
+            .parse()
+            .unwrap_or(95);
+        let uniswap_utilization: u64 = env::var("UNISWAP_BORROW_PERCENT")
+            .unwrap_or("90".to_string())
+            .parse()
+            .unwrap_or(90);
+
+        ArbitrageStrategyConfig {
+            target_price_impact_bps: target_bps,
+            aave_utilization_percent: aave_utilization,
+            uniswap_borrow_utilization: uniswap_utilization,
+        }
+    };
+
 }
 
 /// ==== Константы ====
@@ -105,8 +142,9 @@ const MIN_TICK: i32 = -887_272;
 const MAX_TICK: i32 = 887_272;
 const AAVE_FLASH_FEE_NUM: u128 = 9;
 const AAVE_FLASH_FEE_DEN: u128 = 10_000;
-const DEFAULT_PRICE_IMPACT_BPS: u32 = 50; /// Максимальное допустимое ценовое воздействие по умолчанию (50 базисных пунктов = 0.5%)
-
+const DEFAULT_PRICE_IMPACT_BPS: u32 = 50;
+/// Максимальное допустимое ценовое воздействие по умолчанию (50 базисных пунктов = 0.5%)
+const PROTOCOL_FEE_SHARE: u32 = 300_000; // 30% комиссии протокола
 
 /// ==== Утилиты для работы с U256 / Q-форматами ====
 
@@ -114,7 +152,9 @@ const DEFAULT_PRICE_IMPACT_BPS: u32 = 50; /// Максимальное допу�
 fn pow10_u256(n: u32) -> U256 {
     let mut r = U256::one();
     let ten = U256::from(10u8);
-    for _ in 0..n { r = r * ten; }
+    for _ in 0..n {
+        r = r * ten;
+    }
     r
 }
 
@@ -129,11 +169,17 @@ fn mul_div_u256(a: U256, b: U256, c: U256) -> U256 {
     match a.checked_mul(b) {
         Some(prod) => match prod.checked_div(c) {
             Some(result) => {
-                debug!("[  MUL_DIV_U256] Успешное вычисление: ({} * {}) / {} = {}", a, b, c, result);
+                debug!(
+                    "[  MUL_DIV_U256] Успешное вычисление: ({} * {}) / {} = {}",
+                    a, b, c, result
+                );
                 result
             }
             None => {
-                error!("[  MUL_DIV_U256] Переполнение при делении: prod={} / {}", prod, c);
+                error!(
+                    "[  MUL_DIV_U256] Переполнение при делении: prod={} / {}",
+                    prod, c
+                );
                 U256::zero()
             }
         },
@@ -142,11 +188,17 @@ fn mul_div_u256(a: U256, b: U256, c: U256) -> U256 {
             let q = &full / c;
             match U256::try_from(q) {
                 Ok(result) => {
-                    debug!("[  MUL_DIV_U256] Успешное вычисление через full_mul: ({} * {}) / {} = {}", a, b, c, result);
+                    debug!(
+                        "[  MUL_DIV_U256] Успешное вычисление через full_mul: ({} * {}) / {} = {}",
+                        a, b, c, result
+                    );
                     result
                 }
                 Err(_) => {
-                    error!("[  MUL_DIV_U256] Переполнение при умножении: a={} * b={}", a, b);
+                    error!(
+                        "[  MUL_DIV_U256] Переполнение при умножении: a={} * b={}",
+                        a, b
+                    );
                     U256::zero()
                 }
             }
@@ -154,7 +206,25 @@ fn mul_div_u256(a: U256, b: U256, c: U256) -> U256 {
     }
 }
 
+// Структура конфигурации стратегии арбитража
+#[derive(Debug, Clone)]
+pub struct ArbitrageStrategyConfig {
+    pub target_price_impact_bps: u32,
+    pub aave_utilization_percent: u64,
+    pub uniswap_borrow_utilization: u64,
+}
 
+// Структура для параметров mint
+#[derive(Debug, Clone)]
+pub struct MintParameters {
+    pub pool_address: Address,
+    pub zero_for_one: bool,
+    pub amount_desired: U256,
+    pub amount_actual: U256,
+    pub tick_lower: i32,
+    pub tick_upper: i32,
+    pub liquidity: U256,
+}
 
 /// ==== Snapshot графа ====
 #[derive(Clone)]
@@ -178,7 +248,7 @@ pub struct PathSimulationResult {
 /// Структура для хранения состояния хопа
 #[derive(Clone, Copy, Debug)]
 pub struct HopState {
-    pub sqrt_price_x96: Q64_96, 
+    pub sqrt_price_x96: Q64_96,
     pub sqrt_target_x96: Q64_96,
     pub liquidity: U256,
     pub fee_pips: u32,
@@ -196,1160 +266,1343 @@ pub struct TradeSimulator {
 }
 
 impl TradeSimulator {
-
-pub fn new(
-    route_builder: Arc<PathBuilder>,
-    aave_liquidity_rx: tokio::sync::watch::Receiver<AaveTokenLiquidity>,
-    graph: Arc<ArcSwap<UniversalGraph>>,
-) -> Self {
-    info!(
-        "[{}] Инициализация симулятора: путей = {}, пулов = {}",
-        "TRADE_SIMULATOR ⚡".green(),
-        route_builder.paths.len(),
-        route_builder.pool_to_paths.len()
-    );
-    TradeSimulator {
-        route_builder,
-        aave_liquidity_rx,
-        graph,
-    }
-}
-
-pub async fn run(&mut self, mut simulator_rx: MpscReceiver<PoolEventInfo>) {
-
-    info!("[{}] ▶️ Запуск симулятора", "TRADE_SIMULATOR ⚡".green());
-
-    while let Some(event) = simulator_rx.recv().await {
-
-        let simulator = self.clone();
-
-        tokio::spawn(async move {
-            if let Err(e) = simulator.process_trade_event(event).await {
-                error!("[  {}] Ошибка process_trade_event: {:?}", "TRADE_SIMULATOR ⚡".green(), e);
-            }
-        });
-    }
-    warn!("[  {}] ▶️ Симулятор остановлен (входной канал закрыт)", "TRADE_SIMULATOR ⚡".green());
-}
-
-/// Создаёт снимок графа (pools, tick_maps, token_decimals)
-fn create_graph_snapshot(&self, route_pools: &[Address], borrow_pools: &[BorrowPoolInfo], event_id: &str) -> Arc<GraphSnapshotHolder> {
-    
-    debug!("[ CREATE_GRAPH_SNAPSHOT ] 🆔 = {} Создание снимка графа для пулов: {:?}", event_id, route_pools);
-    let mut pool_set: HashSet<Address> = HashSet::new();
-    for address in route_pools { pool_set.insert(*address); }
-    for borrow_pool_info in borrow_pools { pool_set.insert(borrow_pool_info.pool_address); }
-
-    let graph = self.graph.load();
-
-    let mut snapshot = GraphSnapshotHolder {
-        pools: HashMap::new(),
-        tick_maps: HashMap::new(),
-        token_decimals: HashMap::new(),
-    };
-
-    for addr in pool_set {
-        if let Some(pool) = graph.edges.get(&addr) {
-            snapshot.pools.insert(addr, pool.clone());
-            let mut tick_map: Vec<(i32, i128, U256)> = pool.tick_map.iter().map(|(k, v)| (*k, v.0, v.1)).collect();
-            tick_map.sort_by_key(|(t, _, _)| *t);
-            snapshot.tick_maps.insert(addr, tick_map);
-            snapshot.token_decimals.entry(Address::from_slice(&pool.uniswap_token_a.to_fixed_bytes()))
-                .or_insert(pool.uniswap_token_a_decimals);
-            snapshot.token_decimals.entry(Address::from_slice(&pool.uniswap_token_b.to_fixed_bytes()))
-                .or_insert(pool.uniswap_token_b_decimals);
+    pub fn new(
+        route_builder: Arc<PathBuilder>,
+        aave_liquidity_rx: tokio::sync::watch::Receiver<AaveTokenLiquidity>,
+        graph: Arc<ArcSwap<UniversalGraph>>,
+    ) -> Self {
+        info!(
+            "[{}] Инициализация симулятора: путей = {}, пулов = {}",
+            "TRADE_SIMULATOR ⚡".green(),
+            route_builder.paths.len(),
+            route_builder.pool_to_paths.len()
+        );
+        TradeSimulator {
+            route_builder,
+            aave_liquidity_rx,
+            graph,
         }
     }
 
-    debug!("[  CREATE_GRAPH_SNAPSHOT  ] Снимок для 🆔 = {} : пулов = {}, tick_maps = {}, decimals = {}", event_id, snapshot.pools.len(), snapshot.tick_maps.len(), snapshot.token_decimals.len());
-    Arc::new(snapshot)
+    /// Запускает симулятор, обрабатывая входящие события пулов
+    /// # Аргументы
+    /// * `simulator_rx` - Канал для получения событий пулов
+    pub async fn run(&mut self, mut simulator_rx: MpscReceiver<PoolEventInfo>) {
+        info!("[TRADE_SIMULATOR] ▶️ Запуск симулятора");
 
-}
+        while let Some(event) = simulator_rx.recv().await {
+            let event_clone = event.clone();
+            let simulator = self.clone();
+            tokio::spawn(async move {
+                let aave_liquidity = simulator.aave_liquidity_rx.borrow().clone();
+                let results = simulator
+                    .process_trade_event(event_clone, aave_liquidity)
+                    .await;
 
-
-
-
-async fn multi_level_borrow_optimization(
-    &self,
-    event_id: &str,
-    path_index: &str,
-    base_token: Address,
-    aave_available: U256,
-    snapshot: &GraphSnapshotHolder,
-    path: &ArbitragePath,
-) -> Option<PathSimulationResult> {
-    let decimals = snapshot.token_decimals.get(&base_token).copied().unwrap_or(18);
-    let max_borrow = aave_available.min(U256::from(1000) * U256::from(10).pow(U256::from(decimals)));
-
-    // Проверяем только максимальный займ
-    if let Some((profit_net, final_amount, used_fswap, _)) = self.compute_arbitrage_profit(
-        path,
-        max_borrow,
-        event_id,
-        path_index,
-        &Arc::new(snapshot.clone()),
-        DEFAULT_PRICE_IMPACT_BPS,
-    ).await {
-        if profit_net >= MIN_PROFIT_THRESHOLD_BY_TOKEN.get(&base_token).copied().unwrap_or(U256::zero()) {
-            return Some(PathSimulationResult {
-                path_index: path_index.parse().unwrap_or(0),
-                base_token,
-                borrow_optimal: max_borrow,
-                final_amount,
-                profit_net,
-                used_uniswap_flash_supplement: used_fswap,
+                if !results.is_empty() {
+                    info!(
+                        "[TRADE_SIMULATOR] 🆔={} Найдено {} прибыльных путей",
+                        event.event_id,
+                        results.len()
+                    );
+                    for result in results {
+                        info!(
+                            "[TRADE_SIMULATOR] 🆔={} Путь {}: profit_net={}, final_amount={}",
+                            event.event_id.to_string(),
+                            result.path_index,
+                            result.profit_net,
+                            result.final_amount
+                        );
+                    }
+                } else {
+                    debug!(
+                        "[TRADE_SIMULATOR] 🆔={} Нет прибыльных путей",
+                        event.event_id.to_string()
+                    );
+                }
             });
         }
+        warn!("[TRADE_SIMULATOR] ▶️ Симулятор остановлен (входной канал закрыт)");
     }
 
-    None
-}
+    /// Обрабатывает событие пула, симулируя арбитраж по всем путям
+    /// # Аргументы
+    /// * `event` - Событие пула (`PoolEventInfo`)
+    /// # Возвращает
+    /// Вектор результатов симуляции (`PathSimulationResult`) после фильтрации
+    async fn process_trade_event(
+        &self,
+        event: PoolEventInfo,
+        aave_liquidity: AaveTokenLiquidity,
+    ) -> Vec<PathSimulationResult> {
+        debug!(
+            "[PROCESS_TRADE_EVENT] 🆔={} Обработка события для пула {:?}",
+            event.event_id, event.address
+        );
+        let route_pools = vec![event.address];
+        let snapshot = self.create_graph_snapshot(&route_pools, &[], event.event_id);
 
-
-/// Вычисляет предпочтения для займа из пула, выбирая токен с наименьшей комиссией.
-/// 
-/// # Аргументы
-/// * `fee_tier` - комиссия пула в pips (например, 3000 для 0.3%).
-/// * `sqrt_price_x96` - текущая цена пула в формате Q64.96.
-/// * `token0` - адрес первого токена пула.
-/// * `token1` - адрес второго токена пула.
-/// * `event_id` - идентификатор события для логирования.
-/// * `path_index` - индекс пути для логирования.
-/// * `snapshot` - снимок состояния графа с данными пулов.
-/// * `pool_address` - адрес пула Uniswap V3.
-///
-/// # Возвращает
-/// Кортеж `(prefer_same_token, repay_token)`:
-/// - `prefer_same_token` - `true`, если предпочтительнее занимать token0.
-/// - `repay_token` - адрес токена для погашения займа.
-pub fn calculate_borrow_preferences(
-    &self,
-    fee_tier: u32,
-    sqrt_price_x96: Q64_96,
-    token0: Address,
-    token1: Address,
-    event_id: &str,
-    path_index: &str,
-    snapshot: &Arc<GraphSnapshotHolder>,
-    pool_address: Address,
-) -> (bool, Address) {
-    debug!("[TRADE_SIMULATOR] 🆔 = {} путь = {} Расчёт предпочтений для займа: fee_tier={}", event_id, path_index, fee_tier);
-
-    // Получение ликвидности пула из snapshot
-    let pool = snapshot.pools.get(&pool_address).expect("Пул не найден в снимке");
-    let liquidity_token0 = pool.liquidity_token_a;
-    let liquidity_token1 = pool.liquidity_token_b;
-
-    let mut best_fee_same = U256::max_value();
-    let mut best_fee_paired_converted = U256::max_value();
-
-    // Проверяем диапазон процентов ликвидности: 50%, 60%, 70%, 80%, 90%, 100%
-    for pct in (50..=100).step_by(10) {
-        // Расчёт суммы займа для token0 и token1
-        let borrow_amount_token0 = mul_div_u256(liquidity_token0, U256::from(pct), U256::from(100));
-        let borrow_amount_token1 = mul_div_u256(liquidity_token1, U256::from(pct), U256::from(100));
-
-        // Расчёт комиссий для token0 и token1
-        let fee_same = mul_div_u256(borrow_amount_token0, U256::from(fee_tier), U256::from(1_000_000));
-        let fee_paired = mul_div_u256(borrow_amount_token1, U256::from(fee_tier) * U256::from(2), U256::from(1_000_000));
-
-        // Конверсия цены с использованием Q64_96 для точности
-        let q96 = Q64_96::from_u256(U256::from(1u128 << 96)).unwrap_or_default();
-        let price_paired_q96 = sqrt_price_x96.mul(sqrt_price_x96).unwrap_or_default();
-        let price_paired = price_paired_q96.div(q96).unwrap_or_default();
-
-        // Конвертация комиссии token1 в token0
-        let fee_paired_converted = if price_paired.to_u256().is_zero() {
-            U256::max_value()
+        let paths = if let Some(indexes) = self.route_builder.pool_to_paths.get(&event.address) {
+            indexes
+                .iter()
+                .map(|&i| self.route_builder.paths[i].clone())
+                .collect()
         } else {
-            mul_div_u256(fee_paired, U256::one(), price_paired.to_u256())
+            Vec::new()
         };
 
-        // Обновляем минимальные комиссии
-        if fee_same < best_fee_same {
-            best_fee_same = fee_same;
-        }
-        if fee_paired_converted < best_fee_paired_converted {
-            best_fee_paired_converted = fee_paired_converted;
-        }
-    }
+        let mut results = Vec::new();
 
-    // Сравнение минимальных комиссий для выбора предпочтительного токена
-    let prefer_same_token = best_fee_same <= best_fee_paired_converted;
-    let repay_token = if prefer_same_token { token0 } else { token1 };
-
-    debug!(
-        "[TRADE_SIMULATOR] 🆔 = {} путь = {} Расчёт предпочтений: prefer_same_token={}, repay_token={:?}, best_fee_same={}, best_fee_paired_converted={}",
-        event_id, path_index, prefer_same_token, repay_token, best_fee_same, best_fee_paired_converted
-    );
-
-    (prefer_same_token, repay_token)
-}
-
-/// Вычисляет один шаг свопа в пуле Uniswap V3 с учётом комиссии и ценового воздействия.
-/// 
-/// # Аргументы
-/// * `sqrt_price_current` - текущая цена пула в формате Q64.96.
-/// * `sqrt_price_target` - целевая цена пула в формате Q64.96.
-/// * `liquidity` - текущая ликвидность пула.
-/// * `amount_in` - входная сумма в токенах.
-/// * `fee` - комиссия пула в pips.
-/// * `zero_for_one` - направление свопа (`true` для token0 -> token1).
-/// * `event_id` - идентификатор события для логирования.
-/// * `path_index` - индекс пути для логирования.
-/// * `_tick_current` - текущий тик (не используется).
-/// * `_pool_addr` - адрес пула (для логирования).
-/// * `price_impact_bps` - максимальное ценовое воздействие в базисных пунктах (не используется).
-///
-/// # Возвращает
-/// Кортеж `(amount_in, amount_out, new_price, price_impact)`:
-/// - `amount_in` - использованная входная сумма.
-/// - `amount_out` - выходная сумма.
-/// - `new_price` - новая цена пула в формате Q64.96.
-/// - `price_impact` - ценовое воздействие (всегда 0, не реализовано).
-fn compute_swap_step(
-    &self,
-    sqrt_price_current: Q64_96,
-    sqrt_price_target: Q64_96,
-    liquidity: U256,
-    amount_in: U256,
-    fee: u32,
-    zero_for_one: bool,
-    event_id: &str,
-    path_index: &str,
-    _tick_current: i32,
-    _pool_addr: Address,
-    _price_impact_bps: u32,
-) -> (U256, U256, Q64_96, U256) {
-    // Защита от нулевой ликвидности или входа
-    if liquidity.is_zero() || amount_in.is_zero() {
-        debug!("[SWAP_STEP] 🆔={} путь={} нулевая ликвидность/вход: liq={}, in={}", 
-              event_id, path_index, liquidity, amount_in);
-        return (U256::zero(), U256::zero(), sqrt_price_current, U256::zero());
-    }
-
-    // Расчёт комиссии с защитой от переполнения
-    let fee_amount = amount_in.checked_mul(U256::from(fee))
-        .and_then(|v| v.checked_div(U256::from(1_000_000)))
-        .unwrap_or_else(|| {
-            error!("[SWAP_STEP] 🆔={} путь={} переполнение комиссии", event_id, path_index);
-            U256::zero()
-        });
-    
-    let amount_in_after_fee = amount_in.saturating_sub(fee_amount);
-
-    // Вычисление новой цены
-    let (new_price, amount_out) = {
-        let q96 = Q64_96::from_u256(U256::from(1u128 << 96)).unwrap_or_default();
-        let liquidity_u128 = liquidity.as_u128();
-
-        if zero_for_one {
-            // zeroForOne: токен0 -> токен1 (цена уменьшается)
-            if sqrt_price_current <= sqrt_price_target {
-                debug!("[SWAP_STEP] 🆔={} путь={} неверный порядок цен для zeroForOne", 
-                      event_id, path_index);
-                return (U256::zero(), U256::zero(), sqrt_price_current, U256::zero());
+        for (i, path) in paths.iter().enumerate() {
+            debug!(
+                "[PROCESS_TRADE_EVENT] 🆔={} Путь {}: {:?}",
+                event.event_id, i, path
+            );
+            if let Some(result) = self
+                .compute_aave_borrow_amount(&path, event.event_id, &i.to_string(), &snapshot, &aave_liquidity)
+                .await
+            {
+                results.push(PathSimulationResult {
+                    path_index: i,
+                    base_token: path.tokens[0],
+                    borrow_optimal: result.0,
+                    final_amount: result.2,
+                    profit_net: result.1,
+                    used_uniswap_flash_supplement: result.3,
+                });
             }
-
-            // Вычисление новой цены по формуле x = y / (L/sqrt(P) + y/sqrt(P_target))
-            let term1 = Q64_96::from_u256(U256::from(liquidity_u128))
-                .and_then(|l| l.mul(sqrt_price_current))
-                .and_then(|v| v.div(q96))
-                .unwrap_or_default();
-
-            let term2 = Q64_96::from_u256(amount_in_after_fee)
-                .and_then(|a| a.mul(sqrt_price_target))
-                .and_then(|v| v.div(q96))
-                .unwrap_or_default();
-
-            let denominator = Q64_96::from_u256(U256::from(liquidity_u128))
-                .and_then(|l| l.add(term2))
-                .unwrap_or_default();
-
-            let new_price = term1.div(denominator).and_then(|v| sqrt_price_current.sub(v)).unwrap_or_default();
-
-            // Вычисление выходного количества
-            let amount_out = if new_price.to_u256().is_zero() {
-                U256::zero()
-            } else {
-                let price_diff = sqrt_price_current.sub(new_price).unwrap_or_default().to_u256();
-                mul_div_u256(
-                    U256::from(liquidity_u128) * price_diff,
-                    U256::one(),
-                    new_price.to_u256().max(U256::one()) // Защита от деления на 0
-                )
-            };
-
-            (new_price, amount_out)
-        } else {
-            // !zeroForOne: токен1 -> токен0 (цена увеличивается)
-            let delta = Q64_96::from_u256(amount_in_after_fee)
-                .and_then(|a| a.mul(q96))
-                .and_then(|v| v.div(Q64_96::from_u256(U256::from(liquidity_u128)).unwrap_or_default()))
-                .unwrap_or_default();
-
-            let new_price = sqrt_price_current.add(delta).unwrap_or_default();
-
-            // Вычисление выходного количества
-            let amount_out = if new_price > sqrt_price_current {
-                let numerator = U256::from(liquidity_u128) * new_price.sub(sqrt_price_current).unwrap_or_default().to_u256();
-                let denominator = mul_div_u256(
-                    new_price.to_u256() * sqrt_price_current.to_u256(),
-                    U256::one(),
-                    U256::from(1u128 << 96)
-                ).max(U256::one()); // Защита от деления на 0
-                numerator / denominator
-            } else {
-                U256::zero()
-            };
-
-            (new_price, amount_out)
         }
-    };
 
-    let amount_out_adjusted = mul_div_u256(amount_out, U256::from(995), U256::from(1000));
-    let price_impact = U256::zero();
-
-    debug!("[SWAP_STEP] 🆔={} путь={} шаг: in={}, out={}, price={:?}, impact={}bps", 
-          event_id, path_index, amount_in, amount_out_adjusted, new_price, price_impact);
-    
-    (amount_in, amount_out_adjusted, new_price, price_impact)
-}
-
-/// Вычисляет входную сумму для перехода к следующему тику в пуле.
-/// 
-/// # Аргументы
-/// * `hop` - структура `HopState` с данными пула (цена, ликвидность, направление).
-///
-/// # Возвращает
-/// `Option<U256>` - входная сумма с учётом комиссии или `None` при ошибке.
-fn input_to_next_tick_local(hop: HopState) -> Option<U256> {
-    debug!("[INPUT_TO_NEXT_TICK] пул={:?}, tick={}, zero_for_one={}", hop.pool_addr, hop.tick_current, hop.zero_for_one);
-    if hop.liquidity.is_zero() || hop.sqrt_price_x96.to_u256().is_zero() || hop.sqrt_target_x96.to_u256().is_zero() {
-        debug!("[INPUT_TO_NEXT_TICK] нулевые параметры — возврат None");
-        return None;
+        self.filter_by_min_profit_threshold(results)
     }
 
-    let q96 = Q64_96::from_u256(U256::from(1u128 << 96)).unwrap_or_default();
-    let amount_in = if hop.zero_for_one {
-        // Для zero_for_one: цена уменьшается, sqrt_price_x96 > sqrt_target_x96
-        if hop.sqrt_price_x96 <= hop.sqrt_target_x96 {
-            debug!("[INPUT_TO_NEXT_TICK] некорректные цены: sqrt_price_x96 <= sqrt_target_x96");
-            return None;
-        }
-        let price_diff = hop.sqrt_price_x96.sub(hop.sqrt_target_x96).unwrap_or_default();
-        let num = hop.liquidity * price_diff.to_u256();
-        let denom = hop.sqrt_target_x96.mul(hop.sqrt_price_x96).unwrap_or_default().div(q96).unwrap_or_default();
-        mul_div_u256(num, U256::one(), denom.to_u256().max(U256::one()))
-    } else {
-        // Для !zero_for_one: цена увеличивается, sqrt_price_x96 < sqrt_target_x96
-        if hop.sqrt_price_x96 >= hop.sqrt_target_x96 {
-            debug!("[INPUT_TO_NEXT_TICK] некорректные цены: sqrt_price_x96 >= sqrt_target_x96");
-            return None;
-        }
-        let price_diff = hop.sqrt_target_x96.sub(hop.sqrt_price_x96).unwrap_or_default();
-        let num = hop.liquidity * q96.to_u256();
-        let denom = price_diff.to_u256();
-        mul_div_u256(num, U256::one(), denom.max(U256::one()))
-    };
-
-    let fee = mul_div_u256(amount_in, U256::from(hop.fee_pips), U256::from(1_000_000u128));
-    let amount_in_with_fee = amount_in.saturating_add(fee);
-
-    debug!("[INPUT_TO_NEXT_TICK] результат: amount_in={}, fee={}, total={}", amount_in, fee, amount_in_with_fee);
-    if amount_in_with_fee.is_zero() {
-        None
-    } else {
-        Some(amount_in_with_fee)
-    }
-}
-
-/// Вычисляет выходную сумму для свопа в пуле Uniswap V3.
-/// 
-/// # Аргументы
-/// * `sqrt_price_x96` - текущая цена пула в формате Q64.96.
-/// * `_liquidity` - текущая ликвидность пула (u128, для совместимости).
-/// * `tick_map` - карта тиков с ликвидностью.
-/// * `tick_current` - текущий тик пула.
-/// * `fee_tier` - комиссия пула в pips.
-/// * `amount_in` - входная сумма в токенах.
-/// * `zero_for_one` - направление свопа (`true` для token0 -> token1).
-/// * `event_id` - идентификатор события для логирования.
-/// * `path_index` - индекс пути для логирования.
-/// * `pool_addr` - адрес пула (для логирования).
-/// * `_price_impact_bps` - максимальное ценовое воздействие (не используется).
-///
-/// # Возвращает
-/// Кортеж `(amount_out, price_impact)`:
-/// - `amount_out` - выходная сумма.
-/// - `price_impact` - ценовое воздействие (всегда 0, не реализовано).
-fn compute_amount_out(
-    &self,
-    sqrt_price_x96: Q64_96,
-    _liquidity: u128,
-    tick_map: &[(i32, i128, U256)],
-    tick_current: i32,
-    fee_tier: u32,
-    amount_in: U256,
-    zero_for_one: bool,
-    event_id: &str,
-    path_index: &str,
-    pool_addr: Address,
-    _price_impact_bps: u32,
-) -> (U256, U256) {
-    if amount_in.is_zero() || tick_map.is_empty() {
-        debug!("[COMPUTE_AMOUNT_OUT] 🆔 ={} путь={} нулевой вход или tick_map — возврат (0, 0)", event_id, path_index);
-        return (U256::zero(), U256::zero());
-    }
-
-    let mut sqrt_price_current = sqrt_price_x96;
-    let mut liquidity_active = tick_map.iter()
-        .filter(|(t, _, liq)| *t <= tick_current && liq > &U256::zero())
-        .fold(U256::zero(), |acc, (_, delta, _)| acc.saturating_add(U256::from(delta.unsigned_abs())));
-    let mut amount_remaining = amount_in;
-    let mut amount_out_total = U256::zero();
-    let mut tick_current = tick_current;
-    let total_price_impact = U256::zero();
-
-    debug!("[COMPUTE_AMOUNT_OUT] 🆔 ={} путь={} старт: amount_in={}, tick={}, zero_for_one={}", 
-           event_id, path_index, amount_in, tick_current, zero_for_one);
-
-    while !amount_remaining.is_zero() && !liquidity_active.is_zero() {
-        let tick_next = Self::find_next_initialized_tick(tick_current, zero_for_one, tick_map);
-        
-        if (zero_for_one && tick_next <= MIN_TICK) || (!zero_for_one && tick_next >= MAX_TICK) {
-            debug!("[COMPUTE_AMOUNT_OUT] 🆔 ={} путь={} достигнут предел тиков: tick_next={}", event_id, path_index, tick_next);
-            break;
-        }
-
-        let sqrt_price_next = tick_to_sqrt_price(tick_next).unwrap_or(uniswap_graph::Q64_96 { value: U256::zero() });
-        if sqrt_price_next.to_u256().is_zero() {
-            debug!("[COMPUTE_AMOUNT_OUT] 🆔 ={} путь={} нулевая sqrt_price_next для tick={}", event_id, path_index, tick_next);
-            break;
-        }
-
-        // Создаём HopState для вызова input_to_next_tick_local
-        let hop = HopState {
-            sqrt_price_x96: sqrt_price_current,
-            sqrt_target_x96: sqrt_price_next,
-            liquidity: liquidity_active,
-            fee_pips: fee_tier,
-            zero_for_one,
-            tick_current,
-            pool_addr,
-        };
-
-        // Вычисляем сумму для перехода к следующему тику
-        let amount_in_step = Self::input_to_next_tick_local(hop).unwrap_or(U256::zero());
-        if amount_in_step.is_zero() {
-            debug!("[COMPUTE_AMOUNT_OUT] 🆔 ={} путь={} нулевая входная сумма для перехода к следующему тику", event_id, path_index);
-            break;
-        }
-
-        let amount_to_use = amount_remaining.min(amount_in_step);
-
-        let (amt_in_step, amt_out_step, sp_new, _step_price_impact) = self.compute_swap_step(
-            sqrt_price_current,
-            sqrt_price_next,
-            liquidity_active,
-            amount_to_use,
-            fee_tier,
-            zero_for_one,
-            event_id,
-            path_index,
-            tick_current,
-            pool_addr,
-            _price_impact_bps,
+    /// Вычисляет оптимальную сумму займа из Aave и прибыль от арбитража
+    /// # Аргументы
+    /// * `path` - Арбитражный путь
+    /// * `event_id` - Идентификатор события
+    /// * `path_index` - Индекс пути
+    /// * `snapshot` - Снапшот графа пулов
+    /// # Возвращает
+    /// Кортеж (borrow_optimal, profit_after_fee, final_amount, used_flash_swap) или None
+    async fn compute_aave_borrow_amount(
+        &self,
+        path: &ArbitragePath,
+        event_id: u64,
+        path_index: &str,
+        snapshot: &Arc<GraphSnapshotHolder>,
+        aave_liquidity: &AaveTokenLiquidity,
+    ) -> Option<(U256, U256, U256, bool)> {
+        let base_token = path.tokens.first().copied().unwrap_or_default();
+        debug!(
+            "[COMPUTE_AAVE_BORROW_AMOUNT] 🆔={} путь={} начало расчета, base_token={:?}",
+            event_id, path_index, base_token
         );
 
-        if amt_in_step.is_zero() {
-            debug!("[COMPUTE_AMOUNT_OUT] 🆔 ={} путь={} нулевой шаг входа — прерывание", event_id, path_index);
-            break;
-        }
+        let aave_liquidity = aave_liquidity;
 
-        amount_remaining = amount_remaining.saturating_sub(amt_in_step);
-        amount_out_total = amount_out_total.saturating_add(amt_out_step);
-        sqrt_price_current = sp_new;
+        let max_borrow = aave_liquidity
+            .aave_token_info
+            .get(&base_token)
+            .map(|(_, virtual_balance)| *virtual_balance)
+            .unwrap_or(U256::zero());
 
-        let crossed = if zero_for_one { 
-            sp_new <= sqrt_price_next 
-        } else { 
-            sp_new >= sqrt_price_next 
-        };
-        
-        if crossed {
-            liquidity_active = U256::from(Self::update_liquidity_on_tick_cross(
-                liquidity_active.as_u128(), 
-                tick_next, 
-                tick_map, 
-                zero_for_one
-            ));
-            tick_current = tick_next;
-            
-            debug!("[COMPUTE_AMOUNT_OUT] 🆔 ={} путь={} переход тика: tick={}, ликвидность={}", 
-                   event_id, path_index, tick_current, liquidity_active);
-            
-            if liquidity_active.is_zero() {
-                debug!("[COMPUTE_AMOUNT_OUT] 🆔 ={} путь={} ликвидность исчерпана", event_id, path_index);
-                break;
-            }
-        }
-    }
-
-    debug!("[COMPUTE_AMOUNT_OUT] 🆔 ={} путь={} итог: amount_out={}", 
-           event_id, path_index, amount_out_total);
-    
-    (amount_out_total, total_price_impact)
-}
-
-
-/// Симулирует своп в пуле, возвращая выходную сумму.
-///
-/// # Аргументы
-/// * `pool_addr` - адрес пула для свопа
-/// * `amount_in` - входная сумма в нативных decimals токена
-/// * `zero_for_one` - направление свопа
-/// * `event_id` - идентификатор события
-/// * `path_index` - индекс пути
-/// * `snapshot` - снимок состояния графа
-/// * `price_impact_bps` - максимальное допустимое ценовое воздействие
-///
-/// # Возвращает
-/// Option с выходной суммой или None при ошибке
-fn simulate_swap(
-    &self,
-    pool_addr: &Address,
-    amount_in: U256,
-    zero_for_one: bool,
-    event_id: &str,
-    path_index: &str,
-    snapshot: &Arc<GraphSnapshotHolder>,
-    price_impact_bps: u32,
-) -> Option<U256> {
-    // Получение данных пула из снимка
-    let pool = snapshot.pools.get(pool_addr)?;
-    let tick_map = snapshot.tick_maps.get(pool_addr)?;
-
-    // Определение decimals входного и выходного токенов
-    let (in_token_decimals, out_token_decimals) = if zero_for_one {
-        (pool.uniswap_token_a_decimals, pool.uniswap_token_b_decimals)
-    } else {
-        (pool.uniswap_token_b_decimals, pool.uniswap_token_a_decimals)
-    };
-
-    debug!("[SWAP] {}/{}: {} ({}d) -> {} ({}d), price_impact_limit={}bps", 
-           event_id, path_index,
-           if zero_for_one { "tokenA" } else { "tokenB" }, in_token_decimals,
-           if zero_for_one { "tokenB" } else { "tokenA" }, out_token_decimals,
-           price_impact_bps);
-
-    // Нормализация входной суммы к 18 decimals
-    let amount_in_normalized = Self::normalize_amount(amount_in, in_token_decimals);
-
-    // Вычисление свопа с учетом ценового воздействия
-    let (amount_out_normalized, _price_impact) = self.compute_amount_out(
-        pool.uniswap_sqrt_price,
-        pool.uniswap_liquidity.as_u128(),
-        tick_map,
-        pool.uniswap_tick_current,
-        pool.uniswap_fee_tier,
-        amount_in_normalized,
-        zero_for_one,
-        event_id,
-        path_index,
-        *pool_addr,
-        price_impact_bps,
-    );
-
-    // Денормализация результата к нативным decimals выходного токена
-    let amount_out = Self::denormalize_amount(amount_out_normalized, out_token_decimals);
-
-    debug!("[SWAP] Результат: {} -> {} (норм: {} -> {})",
-           amount_in, amount_out, amount_in_normalized, amount_out_normalized);
-
-    Some(amount_out)
-}
-    
-/// Вычисляет арбитражную прибыль с учётом ценового воздействия и decimals.
-///
-/// # Аргументы
-/// * `path` - арбитражный путь
-/// * `amount` - сумма займа в нативных decimals
-/// * `event_id` - идентификатор события
-/// * `path_index` - индекс пути
-/// * `snapshot` - снимок состояния графа
-/// * `price_impact_bps` - максимальное допустимое ценовое воздействие
-///
-/// # Возвращает
-/// Option с кортежем (profit, final_amount, used_fswap, total_price_impact)
-async fn compute_arbitrage_profit(
-    &self,
-    path: &ArbitragePath,
-    amount: U256,
-    event_id: &str,
-    path_index: &str,
-    snapshot: &Arc<GraphSnapshotHolder>,
-    price_impact_bps: u32,
-) -> Option<(U256, U256, bool, U256)> {
-    debug!("[COMPUTE_ARBITRAGE_PROFIT] 🆔 ={} путь={} amount={}, price_impact_limit={}bps", 
-           event_id, path_index, amount, price_impact_bps);
-    
-    let base_token = path.tokens.first().copied().unwrap_or_default();
-    let base_decimals = snapshot.token_decimals.get(&base_token).copied().unwrap_or(18);
-    
-    // Нормализация входной суммы к 18 decimals
-    let mut current_amount = Self::normalize_amount(amount, base_decimals);
-    let mut used_fswap = false;
-    let mut total_fswap_fee = U256::zero();
-    let total_price_impact = U256::zero();
-
-    // Проход по всем хопам пути
-    for (i, pool_addr) in path.pools.iter().enumerate() {
-        // Проверка наличия пула в снимке
-        if !snapshot.pools.contains_key(pool_addr) {
-            debug!("[COMPUTE_ARBITRAGE_PROFIT] пул {:?} отсутствует в snapshot", pool_addr);
+        if max_borrow.is_zero() {
+            debug!(
+                "[COMPUTE_AAVE_BORROW_AMOUNT] 🆔={} путь={} нет ликвидности Aave для {:?}",
+                event_id, path_index, base_token
+            );
             return None;
         }
-        
-        let pool = snapshot.pools.get(pool_addr).expect("checked exists");
-        let token_in = path.tokens[i];
-        let token_out = path.tokens[i + 1];
-        
-        // Получение decimals для точного расчета
-        let in_decimals = snapshot.token_decimals.get(&token_in).copied().unwrap_or(18);
-        let out_decimals = snapshot.token_decimals.get(&token_out).copied().unwrap_or(18);
-        
-        // Денормализация к нативным decimals пула
-        let amount_in_denormalized = Self::denormalize_amount(current_amount, in_decimals);
-        
-        // Определение направления свопа
-        let zero_for_one = if pool.uniswap_token_a == token_in.into() {
-            true
-        } else if pool.uniswap_token_b == token_in.into() {
-            false
-        } else {
-            debug!("[COMPUTE_ARBITRAGE_PROFIT] несоответствие токенов в пуле {:?}", pool_addr);
-            return None;
-        };
 
-        // Симуляция свопа с учетом ценового воздействия
-        if let Some(amount_out_denormalized) = self.simulate_swap(
-            pool_addr,
-            amount_in_denormalized,
-            zero_for_one,
-            event_id,
-            path_index,
-            snapshot,
-            price_impact_bps,
-        ) {
-            // Нормализация результата к 18 decimals для дальнейших вычислений
-            let amount_out_normalized = Self::normalize_amount(amount_out_denormalized, out_decimals);
+        if let Some((profit_net, final_amount, used_flash_swap, _)) = self
+            .compute_arbitrage_profit(
+                event_id,
+                path_index,
+                aave_liquidity,
+                snapshot,
+                path,
+            )
+            .await
+        {
+            let borrow_optimal = mul_div_u256(
+                max_borrow,
+                U256::from(DEFAULT_ARBITRAGE_STRATEGY_CONFIG.aave_utilization_percent),
+                U256::from(100),
+            );
+            let aave_fee = mul_div_u256(
+                borrow_optimal,
+                U256::from(AAVE_FLASH_FEE_NUM),
+                U256::from(AAVE_FLASH_FEE_DEN),
+            );
+            let profit_after_fee = profit_net.saturating_sub(aave_fee);
 
-            if amount_out_normalized.is_zero() {
-                debug!("[COMPUTE_ARBITRAGE_PROFIT] нулевой выход для пула {:?}", pool_addr);
+            if profit_after_fee.is_zero() {
+                debug!(
+                    "[COMPUTE_AAVE_BORROW_AMOUNT] 🆔={} путь={} прибыль после комиссии нулевая",
+                    event_id, path_index
+                );
                 return None;
             }
 
-            // Проверка ликвидности для следующего хопа (если есть)
-            if i < path.pools.len() - 1 {
-                let next_token = path.tokens[i + 1];
-                let next_pool_addr = path.pools[i + 1];
-                
-                // Денормализация для проверки ликвидности в нативных decimals
-                let next_token_decimals = snapshot.token_decimals.get(&next_token).copied().unwrap_or(18);
-                let amount_out_denormalized_for_check = Self::denormalize_amount(amount_out_normalized, next_token_decimals);
-                
-                let can_borrow = self.compute_uniswap_borrow_amount(
-                    next_token,
-                    next_pool_addr,
-                    amount_out_denormalized_for_check,
-                    event_id,
-                    snapshot,
-                ).await;
+            debug!("[COMPUTE_AAVE_BORROW_AMOUNT] 🆔={} путь={} успех: borrow_optimal={}, profit_net={}, final_amount={}", 
+                   event_id, path_index, borrow_optimal, profit_after_fee, final_amount);
 
-                if !can_borrow {
-                    debug!("[COMPUTE_ARBITRAGE_PROFIT] недостаточно ликвидности для следующего хопа, пул={:?}, токен={:?}", next_pool_addr, next_token);
-                    let (fswap_fee, covered) = self.estimate_flashswap_cover_cost(
-                        next_token,
-                        amount_out_denormalized_for_check,
-                        &path.pools,
-                        event_id,
-                        path_index,
-                        snapshot,
-                    ).await;
-                    if !covered {
-                        debug!("[COMPUTE_ARBITRAGE_PROFIT] флеш-свап не покрыл дефицит для токена {:?}", next_token);
-                        return None;
-                    }
-                    used_fswap = true;
-                    total_fswap_fee = total_fswap_fee.saturating_add(fswap_fee);
-                    debug!("[COMPUTE_ARBITRAGE_PROFIT] флеш-свап успешен для токена {:?}, комиссия={}", next_token, fswap_fee);
-                }
-            }
-
-            current_amount = amount_out_normalized;
-            debug!("[COMPUTE_ARBITRAGE_PROFIT] хоп {}: amount_out={} (норм: {})", 
-                   i, amount_out_denormalized, amount_out_normalized);
+            Some((
+                borrow_optimal,
+                profit_after_fee,
+                final_amount,
+                used_flash_swap,
+            ))
         } else {
-            debug!("[COMPUTE_ARBITRAGE_PROFIT] свап в пуле {:?} завершился с ошибкой", pool_addr);
-            return None;
-        }
-    }
-
-    // Расчет финальной прибыли
-    let final_amount_denormalized = Self::denormalize_amount(current_amount, base_decimals);
-    let amount_denormalized = Self::denormalize_amount(amount, base_decimals);
-
-    let profit = if final_amount_denormalized > amount_denormalized {
-        final_amount_denormalized.saturating_sub(amount_denormalized).saturating_sub(total_fswap_fee)
-    } else {
-        U256::zero()
-    };
-
-    debug!("[COMPUTE_ARBITRAGE_PROFIT] 🆔 ={} путь={} profit={}, final_amount={}, used_fswap={}, total_fswap_fee={}", 
-           event_id, path_index, profit, final_amount_denormalized, used_fswap, total_fswap_fee);
-    
-    if profit.is_zero() {
-        None
-    } else {
-        Some((profit, final_amount_denormalized, used_fswap, total_price_impact))
-    }
-}    
-    
-    
-    /// НОРМАЛИЗАЦИЯ СУММЫ К 18 DECIMALS
-fn normalize_amount(amount: U256, decimals: u8) -> U256 {
-        if decimals == 18 {
-            amount
-        } else if decimals > 18 {
-            // Уменьшаем precision: USDT (6d) -> 18d: amount * 10^(18-6)
-            amount * pow10_u256((18 - decimals) as u32)
-        } else {
-            // Увеличиваем precision: USDC (6d) -> 18d: amount * 10^(18-6)
-            amount * pow10_u256((18 - decimals) as u32)
-        }
-    }
-
-/// ДЕНОРМАЛИЗАЦИЯ СУММЫ К ЦЕЛЕВЫМ DECIMALS
-fn denormalize_amount(amount: U256, target_decimals: u8) -> U256 {
-        if target_decimals == 18 {
-            amount
-        } else if target_decimals > 18 {
-            // Увеличиваем precision: 18d -> USDT (6d): amount / 10^(18-6)
-            amount / pow10_u256((18 - target_decimals) as u32)
-        } else {
-            // Уменьшаем precision: 18d -> USDC (6d): amount / 10^(18-6)
-            amount / pow10_u256((18 - target_decimals) as u32)
-        }
-    }
-
-
-    
-/// Оценивает стоимость флеш-свапа для покрытия дефицита из топ-пула по ликвидности
-async fn estimate_flashswap_cover_cost(
-    &self,
-    needed_token: Address,
-    needed_amount: U256,
-    route_pools: &[Address],
-    event_id: &str,
-    path_index: &str,
-    snapshot: &Arc<GraphSnapshotHolder>,
-) -> (U256, bool) {
-    // Получаем топ-пул по max_liquidity (исключая route_pools)
-    if let Some(borrow_info) = self.route_builder.find_optimal_borrow_pool(needed_token, route_pools) {
-        if route_pools.contains(&borrow_info.pool_address) {
-            debug!("[ESTIMATE_FSWAP_COST] 🆔={} путь={} пул {:?} в маршруте — пропуск", event_id, path_index, borrow_info.pool_address);
-            return (U256::zero(), false);
-        }
-
-        if let Some(pool) = snapshot.pools.get(&borrow_info.pool_address) {
-         let (prefer_same_token, _repay_token) = self.calculate_borrow_preferences(
-            borrow_info.fee_tier,
-            pool.uniswap_sqrt_price,
-            *pool.uniswap_token_a,
-            *pool.uniswap_token_b,
-            event_id,
-            path_index,
-            snapshot,
-            borrow_info.pool_address,
-        );
-
-            let liquidity_token = if prefer_same_token && pool.uniswap_token_a == needed_token.into() {
-                pool.liquidity_token_a
-            } else if !prefer_same_token && pool.uniswap_token_b == needed_token.into() {
-                pool.liquidity_token_b
-            } else {
-                U256::zero()
-            };
-
-            let mut max_available = U256::zero();
-            for pct in (50..=100).step_by(10) {
-                let available_pct = mul_div_u256(liquidity_token, U256::from(pct), U256::from(100));
-                if available_pct > max_available {
-                    max_available = available_pct;
-                }
-            }
-
-            let take = needed_amount.min(max_available);
-            let fee_cost = mul_div_u256(take, U256::from(borrow_info.fee_tier), U256::from(1_000_000u128));
-            let covered = take >= needed_amount;
-
-            debug!("[ESTIMATE_FSWAP_COST] 🆔={} путь={} топ-пул {:?}: take={}, fee={}, covered={}", event_id, path_index, borrow_info.pool_address, take, fee_cost, covered);
-            (fee_cost, covered)
-        } else {
-            debug!("[ESTIMATE_FSWAP_COST] 🆔={} путь={} топ-пул {:?} отсутствует в snapshot", event_id, path_index, borrow_info.pool_address);
-            (U256::zero(), false)
-        }
-    } else {
-        debug!("[ESTIMATE_FSWAP_COST] 🆔={} путь={} нет кандидатов для {:?}", event_id, path_index, needed_token);
-        (U256::zero(), false)
-    }
-}
-
-/// Проверяет возможность займа токена из пула Uniswap 
-async fn compute_uniswap_borrow_amount(
-        &self,
-        token: Address,
-        pool_address: Address,
-        amount: U256,
-        event_id: &str,
-        snapshot: &Arc<GraphSnapshotHolder>,
-    ) -> bool {
-        debug!("[  COMPUTE_BORROW_AMOUNT_UNISWAP] 🆔 ={} токен={:?}, пул={:?}, сумма={}", event_id, token, pool_address, amount);
-
-        if !snapshot.pools.contains_key(&pool_address) {
-            debug!("[  COMPUTE_BORROW_AMOUNT_UNISWAP] 🆔 ={} пул {:?} отсутствует", event_id, pool_address);
-            return false;
-        }
-        let pool = snapshot.pools.get(&pool_address).expect("checked exists");
-
-        let (prefer_same_token, _repay_token) = self.calculate_borrow_preferences(
-            pool.uniswap_fee_tier,
-            pool.uniswap_sqrt_price,
-            *pool.uniswap_token_a,
-            *pool.uniswap_token_b,
-            event_id,
-            "",
-            snapshot,
-            pool_address,
-        );
-
-        let liquidity_token = if prefer_same_token && pool.uniswap_token_a == token.into() {
-            pool.liquidity_token_a
-        } else if !prefer_same_token && pool.uniswap_token_b == token.into() {
-            pool.liquidity_token_b
-        } else {
-            U256::zero()
-        };
-
-        let mut max_available = U256::zero();
-        for pct in (50..=95).step_by(10) {
-            let available_pct = mul_div_u256(liquidity_token, U256::from(pct), U256::from(100));
-            if available_pct > max_available {
-                max_available = available_pct;
-            }
-        }
-
-        let result = max_available >= amount;
-        debug!("[  COMPUTE_BORROW_AMOUNT_UNISWAP] 🆔 = {} доступно = {}, требуется = {}, результат = {}", event_id, max_available, amount, result);
-        result
-        
-    }
-
-/// Обрабатывает событие пула
-pub async fn process_trade_event(&self, event: PoolEventInfo) -> Result<(), String> {
-        let event_id = &event.event_id.to_string();
-
-        debug!("[PROCESS_TRADE_EVENT] 🆔 = {} Начало обработки события для пула {:?}", event_id, event.address);
-
-        let pool_address = event.address;
-        debug!("[PROCESS_TRADE_EVENT] 🆔 = {} Всего путей в route_builder: {}, pool_to_paths: {}", event_id, self.route_builder.paths.len(), self.route_builder.pool_to_paths.len());
-
-        let aave_liquidity = self.aave_liquidity_rx.borrow().clone();
-        if aave_liquidity.aave_token_info.is_empty() {
-            debug!("[PROCESS_TRADE_EVENT] 🆔 = {} пустая ликвидность Aave — пропуск", event_id);
-            return Err("Empty Aave liquidity".to_string());
-        }
-
-        let route_indices = self
-            .route_builder
-            .pool_to_paths
-            .get(&pool_address)
-            .map(|entry| entry.value().clone())
-            .unwrap_or_default();
-        debug!("[PROCESS_TRADE_EVENT] 🆔 = {} Пул {} связан с путями: {:?}", event_id, pool_address, route_indices);
-
-        // Собираем все пулы из маршрутов
-        let mut route_pools: HashSet<Address> = HashSet::new();
-        for route_index in &route_indices {
-            if let Some(route) = self.route_builder.paths.get(*route_index) {
-                route_pools.extend(route.pools.iter().copied());
-            }
-        }
-        let route_pools: Vec<Address> = route_pools.into_iter().collect();
-
-        let snapshot = self.create_graph_snapshot(&route_pools, &[], &event_id);
-
-        let mut filtered_indices = Vec::new();
-
-        for route_index in route_indices {
-            let path_index = format!("{}-{}", event_id, route_index);
-            if let Some(route) = self.route_builder.paths.get(route_index) {
-                let base_token = route.tokens.first().copied().unwrap_or_default();
-                if !aave_liquidity.aave_token_info.contains_key(&base_token) {
-                    debug!("[PROCESS_TRADE_EVENT] 🆔 = {} путь = {} базовый_токен {:?} не в Aave — пропуск", event_id, path_index, base_token);
-                    continue;
-                }
-
-                let mut ok = true;
-                for p in &route.pools {
-                    if !snapshot.pools.contains_key(p) {
-                        debug!("[PROCESS_TRADE_EVENT] 🆔 = {} путь = {} пул {:?} отсутствует в snapshot — пропуск", event_id, path_index, p);
-                        ok = false;
-                        break;
-                    }
-                }
-                if snapshot.token_decimals.get(&base_token).is_none() {
-                    debug!("[PROCESS_TRADE_EVENT] 🆔 = {} путь = {} decimals базового токена {:?} отсутствуют — пропуск", event_id, path_index, base_token);
-                    ok = false;
-                }
-
-                if ok {
-                    filtered_indices.push(route_index);
-                }
-            }
-        }
-
-        info!("[PROCESS_TRADE_EVENT] 🆔 = {} найдено путей = {}", event_id, filtered_indices.len());
-
-        let mut best_profit = U256::zero();
-        let mut best_path_index = String::new();
-        let mut best_result: Option<PathSimulationResult> = None;
-
-        let results = self.simulate_all_paths_max_profit(&filtered_indices, &event_id, &snapshot).await;
-        
-        for result in &results {
-            let decimals = snapshot.token_decimals.get(&result.base_token).copied().unwrap_or(18);
-            let profit_scaled = result.profit_net / U256::from(10).pow(U256::from(decimals));
             warn!(
-                "[PROCESS_TRADE_EVENT] 🆔 = {} путь = {} borrow_max = {} profit = {} used_flash_swap = {}",
-                event_id, result.path_index, result.borrow_optimal, profit_scaled, result.used_uniswap_flash_supplement
+                "[COMPUTE_AAVE_BORROW_AMOUNT] 🆔={} путь={} не найдено прибыльных вариантов",
+                event_id, path_index
             );
-            if result.profit_net > best_profit {
-                best_profit = result.profit_net;
-                best_path_index = result.path_index.to_string();
-                best_result = Some(result.clone());
-            }
-        }
-
-        let filtered_results = self.filter_by_min_profit_threshold(results);
-
-        if filtered_results.is_empty() {
-            warn!("[PROCESS_TRADE_EVENT] 🆔 = {} нет прибыльных путей", event_id);
-            return Ok(());
-        }
-
-        let profitable_paths = self.select_final_arbitrage_opportunities(filtered_results, &event_id);
-
-        for result in &profitable_paths {
-            let decimals = snapshot.token_decimals.get(&result.base_token).copied().unwrap_or(18);
-            let profit_scaled = result.profit_net / U256::from(10).pow(U256::from(decimals));
-            warn!(
-                "[PROCESS_TRADE_EVENT] 🆔 = {} путь = {} сумма_займа = {} прибыль_нетто = {}",
-                event_id, result.path_index, result.borrow_optimal, profit_scaled
-            );
-        }
-
-        if let Some(result) = best_result {
-            let decimals = snapshot.token_decimals.get(&result.base_token).copied().unwrap_or(18);
-            let profit_scaled = result.profit_net / U256::from(10).pow(U256::from(decimals));
-            info!(
-                "[PROCESS_TRADE_EVENT] 🆔 = {} лучший путь = {} profit = {} borrow_max = {} used_flash_swap = {}",
-                event_id, best_path_index, profit_scaled, result.borrow_optimal, result.used_uniswap_flash_supplement
-            );
-        }
-
-        Ok(())
-    }
-
-
-/// Симулирует все пути с максимальной прибылью
-async fn simulate_all_paths_max_profit(
-        &self,
-        route_indices: &[usize],
-        event_id: &str,
-        snapshot: &Arc<GraphSnapshotHolder>,
-    ) -> Vec<PathSimulationResult> {
-        let mut results = Vec::new();
-        for route_index in route_indices {
-            if let Some(route) = self.route_builder.paths.get(*route_index) {
-                let path_index = format!("{}-{}", event_id, route_index);
-                if let Some((borrow_optimal, profit_net, final_amount, used_fswap)) =
-                    self.compute_aave_borrow_amount(&route, event_id, &path_index, snapshot).await
-                {
-                    results.push(PathSimulationResult {
-                        path_index: *route_index,
-                        base_token: route.tokens.first().copied().unwrap_or_default(),
-                        borrow_optimal,
-                        final_amount,
-                        profit_net,
-                        used_uniswap_flash_supplement: used_fswap,
-                    });
-                }
-            }
-        }
-        results
-    }
-
-/// Вычисляет оптимальную сумму займа из Aave.
-async fn compute_aave_borrow_amount(
-    &self,
-    path: &ArbitragePath,
-    event_id: &str,
-    path_index: &str,
-    snapshot: &Arc<GraphSnapshotHolder>,
-) -> Option<(U256, U256, U256, bool)> {
-    let base_token = path.tokens.first().copied().unwrap_or_default();
-    debug!("[  COMPUTE_AAVE_BORROW_AMOUNT] 🆔 ={} путь={} начало расчета", event_id, path_index);
-
-    let aave_liquidity = self.aave_liquidity_rx.borrow().clone();
-    if let Some((_, virtual_balance)) = aave_liquidity.aave_token_info.get(&base_token) {
-        let max_borrow = *virtual_balance;
-        debug!("[  COMPUTE_AAVE_BORROW_AMOUNT] доступно Aave: {} для {:?}", max_borrow, base_token);
-
-        if let Some(result) = self.multi_level_borrow_optimization(event_id, path_index, base_token,max_borrow, snapshot, path).await {
-            let fee = mul_div_u256(result.borrow_optimal, U256::from(AAVE_FLASH_FEE_NUM), U256::from(AAVE_FLASH_FEE_DEN));
-            let profit_after_fee = result.profit_net.saturating_sub(fee);
-
-            warn!("[ COMPUTE_AAVE_BORROW_AMOUNT ] 🆔 ={} путь={} сумма_займа = {}, прибыль_нетто = {}", 
-
-                event_id, path_index, result.borrow_optimal, profit_after_fee);
-
-            if profit_after_fee.is_zero() {
-                debug!("[  COMPUTE_AAVE_BORROW_AMOUNT] прибыль после комиссии нулевая");
-                None
-            } else {
-                Some((result.borrow_optimal, profit_after_fee, result.final_amount, result.used_uniswap_flash_supplement))
-            }        
-        } else {
-            warn!("[  COMPUTE_AAVE_BORROW_AMOUNT] Для события с 🆔 {:?} в пути {}  оптимизация не нашла прибыльных вариантов", event_id, path_index);
             None
         }
-    } else {
-        debug!("[  COMPUTE_AAVE_BORROW_AMOUNT] токен {:?} отсутствует в Aave", base_token);
-        None
     }
-}
-     
-    
-    /// Находит следующий тик ниже текущего
-fn find_next_tick_below(current_tick: i32, tick_map: &[(i32, i128, U256)]) -> (i32, bool) {
-            tick_map
-                .iter()
-                .rev()
-                .find(|(t, _, _)| *t < current_tick)
-                .map(|(t, _, _)| (*t, true))
-                .unwrap_or((MIN_TICK, false))
+
+    /// Рассчитывает параметры для mint, чтобы достичь целевого сдвига цены
+    /// # Аргументы
+    /// * `pool_address` - Адрес пула
+    /// * `target_price_impact_bps` - Целевой сдвиг цены в базисных пунктах (50–200)
+    /// * `snapshot` - Снапшот графа пулов
+    /// # Возвращает
+    /// Параметры mint или ошибку
+    async fn calculate_mint_parameters(
+        &self,
+        pool_address: Address,
+        target_price_impact_bps: u32,
+        snapshot: &Arc<GraphSnapshotHolder>,
+    ) -> Result<MintParameters, String> {
+        let pool = snapshot
+            .pools
+            .get(&pool_address)
+            .ok_or_else(|| format!("Пул {:?} не найден в снапшоте", pool_address))?;
+
+        let current_price = pool.uniswap_sqrt_price;
+        // Целевая цена: sqrt(current_price * (1 + impact / 10_000))
+        let impact = Q64_96::from_u256(U256::from(target_price_impact_bps))?;
+        let base = Q64_96::from_u256(U256::from(10_000))?;
+        let price_ratio = impact.div(base)?;
+        let multiplier = Q64_96::from_u256(U256::from(1))?.add(price_ratio)?;
+        let target_price = current_price.mul(multiplier.sqrt()?)?;
+
+        let price_diff = if target_price > current_price {
+            target_price.sub(current_price)?
+        } else {
+            current_price.sub(target_price)?
+        };
+
+        let numerator = price_diff
+            .to_u256()
+            .checked_mul(pool.uniswap_liquidity)
+            .ok_or("Переполнение при вычислении numerator")?;
+
+        let denominator_part1 = current_price.mul(Q64_96::from_u256(U256::from(2))?)?;
+        let price_ratio = price_diff.div(denominator_part1)?;
+        let denominator_part2 = Q64_96::from_u256(U256::from(1))?.sub(price_ratio)?;
+
+        let denominator = denominator_part1.mul(denominator_part2)?.to_u256();
+
+        let liquidity_delta = numerator
+            .checked_div(denominator)
+            .ok_or("Деление на ноль при расчете liquidity_delta")?;
+
+        let tick_current = pool.uniswap_tick_current;
+        let tick_spacing = pool.uniswap_tick_spacing;
+        let tick_lower = (tick_current - 10 * tick_spacing).max(MIN_TICK);
+        let tick_upper = (tick_current + 10 * tick_spacing).min(MAX_TICK);
+
+        let sqrt_price_lower = tick_to_sqrt_price(tick_lower)?;
+        let sqrt_price_upper = tick_to_sqrt_price(tick_upper)?;
+
+        let zero_for_one = target_price < current_price;
+        let (amount0, amount1) = if zero_for_one {
+            let sqrt_diff_current_lower = current_price.sub(sqrt_price_lower)?;
+            let amount1 = liquidity_delta
+                .checked_mul(sqrt_diff_current_lower.to_u256())
+                .ok_or("Переполнение при вычислении amount1")?;
+            (U256::zero(), amount1)
+        } else {
+            let sqrt_diff_upper_current = sqrt_price_upper.sub(current_price)?;
+            let numerator_amount0 = liquidity_delta
+                .checked_mul(sqrt_diff_upper_current.to_u256())
+                .ok_or("Переполнение при вычислении amount0 numerator")?;
+            let denominator_amount0 = sqrt_price_upper.mul(current_price)?.to_u256();
+            let amount0 = numerator_amount0
+                .checked_div(denominator_amount0)
+                .ok_or("Деление на ноль при расчете amount0")?;
+            (amount0, U256::zero())
+        };
+
+        Ok(MintParameters {
+            pool_address,
+            zero_for_one,
+            amount_desired: if zero_for_one { amount1 } else { amount0 },
+            amount_actual: if zero_for_one { amount1 } else { amount0 },
+            tick_lower,
+            tick_upper,
+            liquidity: liquidity_delta,
+        })
+    }
+
+    /// Применяет mint к снапшоту, возвращая новый изменённый снапшот
+    /// # Аргументы
+    /// * `snapshot` - Исходный снапшот
+    /// * `mint_params` - Параметры mint
+    /// # Возвращает
+    /// Новый снапшот или ошибку
+    fn apply_mint_to_snapshot(
+        &self,
+        snapshot: &Arc<GraphSnapshotHolder>,
+        mint_params: &MintParameters,
+    ) -> Result<Arc<GraphSnapshotHolder>, String> {
+        let mut new_snapshot = Arc::new(snapshot.as_ref().clone());
+
+        let pool = Arc::get_mut(&mut new_snapshot)
+            .unwrap()
+            .pools
+            .get_mut(&mint_params.pool_address)
+            .ok_or_else(|| format!("Пул {:?} не найден в снапшоте", mint_params.pool_address))?;
+
+        pool.uniswap_liquidity = pool
+            .uniswap_liquidity
+            .checked_add(mint_params.liquidity)
+            .ok_or("Переполнение ликвидности пула")?;
+
+        let fee_adjustment = Q64_96::from_u256(U256::from(1_000_000 - pool.uniswap_fee_tier))?
+            .div(Q64_96::from_u256(U256::from(1_000_000))?)?;
+
+        let liquidity_net = Q64_96::from_u256(mint_params.liquidity)?.mul(fee_adjustment)?;
+
+        let numerator = Q64_96::from_u256(pool.uniswap_liquidity)?.mul(pool.uniswap_sqrt_price)?;
+        let denominator = Q64_96::from_u256(pool.uniswap_liquidity)?.add(liquidity_net)?;
+
+        let new_price = numerator
+            .div(denominator)
+            .map_err(|e| format!("Ошибка деления при расчете новой цены: {}", e))?;
+
+        pool.uniswap_sqrt_price = new_price;
+
+        if mint_params.zero_for_one {
+            pool.liquidity_token_b = pool
+                .liquidity_token_b
+                .checked_add(mint_params.amount_desired)
+                .ok_or("Переполнение ликвидности token1")?;
+        } else {
+            pool.liquidity_token_a = pool
+                .liquidity_token_a
+                .checked_add(mint_params.amount_desired)
+                .ok_or("Переполнение ликвидности token0")?;
         }
 
-    /// Находит следующий тик выше текущего
-fn find_next_tick_above(current_tick: i32, tick_map: &[(i32, i128, U256)]) -> (i32, bool) {
-            tick_map
-                .iter()
-                .find(|(t, _, _)| *t > current_tick)
-                .map(|(t, _, _)| (*t, true))
-                .unwrap_or((MAX_TICK, false))
+        let tick_entry = Arc::get_mut(&mut new_snapshot)
+            .unwrap()
+            .tick_maps
+            .entry(mint_params.pool_address)
+            .or_insert_with(Vec::new);
+
+        for tick in mint_params.tick_lower..=mint_params.tick_upper {
+            if let Some((_, net_liquidity, gross_liquidity)) =
+                tick_entry.iter_mut().find(|(t, _, _)| *t == tick)
+            {
+                *net_liquidity = (*net_liquidity as u128 + mint_params.liquidity.as_u128()) as i128;
+                *gross_liquidity = gross_liquidity
+                    .checked_add(mint_params.liquidity)
+                    .ok_or("Переполнение gross liquidity")?;
+            } else {
+                tick_entry.push((
+                    tick,
+                    mint_params.liquidity.as_u128() as i128,
+                    mint_params.liquidity,
+                ));
+            }
         }
+
+        Ok(new_snapshot)
+    }
+
+    /// Вычисляет шаг свопа с учётом созданной ликвидности
+    /// # Аргументы
+    /// * `sqrt_price_current` - Текущая цена в Q64.96
+    /// * `sqrt_price_target` - Целевая цена в Q64.96
+    /// * `liquidity` - Текущая ликвидность пула (U256)
+    /// * `amount_in` - Входная сумма токенов
+    /// * `fee` - Комиссия пула в pips
+    /// * `zero_for_one` - Направление свопа
+    /// * `event_id`, `path_index` - Для логирования
+    /// * `_tick_current`, `_pool_addr`, `_price_impact_bps` - Не используются
+    /// # Возвращает
+    /// Кортеж (amount_in_used, amount_out, new_price, fee_amount)
+    fn compute_swap_step(
+        &self,
+        sqrt_price_current: Q64_96,
+        sqrt_price_target: Q64_96,
+        liquidity: U256,
+        amount_in: U256,
+        fee: u32,
+        zero_for_one: bool,
+        event_id: u64,
+        path_index: &str,
+        _tick_current: i32,
+        _pool_addr: Address,
+        _price_impact_bps: u32,
+    ) -> Result<(U256, U256, Q64_96, U256), String> {
+        if liquidity.is_zero() || amount_in.is_zero() {
+            debug!(
+                "[SWAP_STEP] 🆔={} путь={} нулевая ликвидность/вход: liq={}, in={}",
+                event_id, path_index, liquidity, amount_in
+            );
+            return Ok((U256::zero(), U256::zero(), sqrt_price_current, U256::zero()));
+        }
+
+        let fee_amount = mul_div_u256(amount_in, U256::from(fee), U256::from(1_000_000));
+        let amount_in_after_fee = amount_in.saturating_sub(fee_amount);
+
+        let (new_price, amount_out) = {
+            let q96 = Q64_96::from_u256(U256::from(1u128 << 96)).unwrap_or_default();
+            let liquidity_u256 = liquidity;
+
+            if zero_for_one {
+                if sqrt_price_current <= sqrt_price_target {
+                    debug!(
+                        "[SWAP_STEP] 🆔={} путь={} неверный порядок цен для zeroForOne",
+                        event_id, path_index
+                    );
+                    return Ok((U256::zero(), U256::zero(), sqrt_price_current, U256::zero()));
+                }
+
+                let term1 = Q64_96::from_u256(liquidity_u256)?
+                    .mul(sqrt_price_current)?
+                    .div(q96)?;
+
+                let term2 = Q64_96::from_u256(amount_in_after_fee)?
+                    .mul(sqrt_price_target)?
+                    .div(q96)?;
+
+                let denominator = Q64_96::from_u256(liquidity_u256)?.add(term2)?;
+
+                let new_price = term1.div(denominator)?.sub(sqrt_price_current)?;
+
+                let amount_out = if new_price.to_u256().is_zero() {
+                    U256::zero()
+                } else {
+                    let price_diff = sqrt_price_current.sub(new_price)?.to_u256();
+                    mul_div_u256(
+                        liquidity_u256 * price_diff,
+                        U256::one(),
+                        new_price.to_u256().max(U256::one()),
+                    )
+                };
+
+                (new_price, amount_out)
+            } else {
+                let delta = Q64_96::from_u256(amount_in_after_fee)?
+                    .mul(q96)?
+                    .div(Q64_96::from_u256(liquidity_u256)?)?;
+
+                let new_price = sqrt_price_current.add(delta)?;
+
+                let amount_out = if new_price > sqrt_price_current {
+                    let numerator = liquidity_u256 * new_price.sub(sqrt_price_current)?.to_u256();
+                    let denominator = mul_div_u256(
+                        new_price.to_u256() * sqrt_price_current.to_u256(),
+                        U256::one(),
+                        U256::from(1u128 << 96),
+                    )
+                    .max(U256::one());
+                    numerator / denominator
+                } else {
+                    U256::zero()
+                };
+
+                (new_price, amount_out)
+            }
+        };
+
+        let amount_out_adjusted = mul_div_u256(amount_out, U256::from(995), U256::from(1000));
+
+        debug!(
+            "[SWAP_STEP] 🆔={} путь={} шаг: in={}, out={}, price={:?}, fee={}",
+            event_id, path_index, amount_in, amount_out_adjusted, new_price, fee_amount
+        );
+
+        Ok((amount_in, amount_out_adjusted, new_price, fee_amount))
+    }
+
+    /// Вычисляет входную сумму для перехода к следующему тику
+    /// # Аргументы
+    /// * `hop` - Состояние хопа
+    /// # Возвращает
+    /// Кортеж (amount_in_with_fee, fee) или None
+    fn input_to_next_tick_local(&self, hop: HopState) -> Option<(U256, U256)> {
+        debug!(
+            "[INPUT_TO_NEXT_TICK] пул={:?}, tick={}, zero_for_one={}",
+            hop.pool_addr, hop.tick_current, hop.zero_for_one
+        );
+        if hop.liquidity.is_zero()
+            || hop.sqrt_price_x96.to_u256().is_zero()
+            || hop.sqrt_target_x96.to_u256().is_zero()
+        {
+            debug!("[INPUT_TO_NEXT_TICK] нулевые параметры — возврат None");
+            return None;
+        }
+
+        let q96 = Q64_96::from_u256(U256::from(1u128 << 96)).unwrap_or_default();
+        let amount_in = if hop.zero_for_one {
+            if hop.sqrt_price_x96 <= hop.sqrt_target_x96 {
+                debug!("[INPUT_TO_NEXT_TICK] некорректные цены: sqrt_price_x96 <= sqrt_target_x96");
+                return None;
+            }
+            let price_diff = hop
+                .sqrt_price_x96
+                .sub(hop.sqrt_target_x96)
+                .unwrap_or_default();
+            let num = hop.liquidity * price_diff.to_u256();
+            let denom = hop
+                .sqrt_target_x96
+                .mul(hop.sqrt_price_x96)
+                .unwrap_or_default()
+                .div(q96)
+                .unwrap_or_default();
+            mul_div_u256(num, U256::one(), denom.to_u256().max(U256::one()))
+        } else {
+            if hop.sqrt_price_x96 >= hop.sqrt_target_x96 {
+                debug!("[INPUT_TO_NEXT_TICK] некорректные цены: sqrt_price_x96 >= sqrt_target_x96");
+                return None;
+            }
+            let price_diff = hop
+                .sqrt_target_x96
+                .sub(hop.sqrt_price_x96)
+                .unwrap_or_default();
+            let num = hop.liquidity * q96.to_u256();
+            let denom = price_diff.to_u256();
+            mul_div_u256(num, U256::one(), denom.max(U256::one()))
+        };
+
+        let fee = mul_div_u256(amount_in, U256::from(hop.fee_pips), U256::from(1_000_000));
+        let amount_in_with_fee = amount_in.saturating_add(fee);
+
+        debug!(
+            "[INPUT_TO_NEXT_TICK] результат: amount_in={}, fee={}, total={}",
+            amount_in, fee, amount_in_with_fee
+        );
+        if amount_in_with_fee.is_zero() {
+            None
+        } else {
+            Some((amount_in_with_fee, fee))
+        }
+    }
+
+    /// Вычисляет выходную сумму для свопа и собирает комиссии
+    /// # Аргументы
+    /// * `sqrt_price_x96` - Текущая цена в Q64.96
+    /// * `liquidity` - Текущая ликвидность (U256)
+    /// * `tick_map` - Карта тиков
+    /// * `tick_current` - Текущий тик
+    /// * `fee_tier` - Комиссия пула в pips
+    /// * `amount_in` - Входная сумма
+    /// * `zero_for_one` - Направление свопа
+    /// * `event_id`, `path_index`, `pool_addr`, `price_impact_bps` - Для логирования
+    /// * `flash_loan_fee` - Комиссия флеш-займа
+    /// * `position_liquidity` - Ликвидность позиции (для расчёта доли комиссий)
+    /// # Возвращает
+    /// Кортеж (amount_out, fee_earned, crossed_ticks)
+    fn compute_amount_out(
+        &self,
+        sqrt_price_x96: Q64_96,
+        liquidity: U256,
+        tick_map: &[(i32, i128, U256)],
+        tick_current: i32,
+        fee_tier: u32,
+        amount_in: U256,
+        zero_for_one: bool,
+        event_id: u64,
+        path_index: &str,
+        pool_addr: Address,
+        price_impact_bps: u32,
+        flash_loan_fee: U256,
+        position_liquidity: U256,
+    ) -> (U256, U256, Vec<i32>) {
+        if amount_in.is_zero() || tick_map.is_empty() {
+            debug!(
+                "[COMPUTE_AMOUNT_OUT] 🆔={} путь={} нулевой вход или tick_map — возврат (0, 0)",
+                event_id, path_index
+            );
+            return (U256::zero(), U256::zero(), vec![]);
+        }
+
+        let mut sqrt_price_current = sqrt_price_x96;
+        let mut liquidity_active = liquidity;
+        let mut amount_remaining = amount_in;
+        let mut amount_out_total = U256::zero();
+        let mut total_fee_earned = U256::zero();
+        let mut tick_current = tick_current;
+        let mut crossed_ticks = vec![];
+
+        debug!(
+            "[COMPUTE_AMOUNT_OUT] 🆔={} путь={} старт: amount_in={}, tick={}, zero_for_one={}",
+            event_id, path_index, amount_in, tick_current, zero_for_one
+        );
+
+        while !amount_remaining.is_zero() && !liquidity_active.is_zero() {
+            let tick_next = self.find_next_initialized_tick(tick_current, zero_for_one, tick_map);
+
+            if (zero_for_one && tick_next <= MIN_TICK) || (!zero_for_one && tick_next >= MAX_TICK) {
+                debug!(
+                    "[COMPUTE_AMOUNT_OUT] 🆔={} путь={} достигнут предел тиков: tick_next={}",
+                    event_id, path_index, tick_next
+                );
+                break;
+            }
+
+            let sqrt_price_next = tick_to_sqrt_price(tick_next).unwrap_or(Q64_96 {
+                value: U256::zero(),
+            });
+            if sqrt_price_next.to_u256().is_zero() {
+                debug!(
+                    "[COMPUTE_AMOUNT_OUT] 🆔={} путь={} нулевая sqrt_price_next для tick={}",
+                    event_id, path_index, tick_next
+                );
+                break;
+            }
+
+            let hop = HopState {
+                sqrt_price_x96: sqrt_price_current,
+                sqrt_target_x96: sqrt_price_next,
+                liquidity: liquidity_active,
+                fee_pips: fee_tier,
+                zero_for_one,
+                tick_current,
+                pool_addr,
+            };
+
+            let (amount_in_step, fee_earned) = self
+                .input_to_next_tick_local(hop)
+                .unwrap_or((U256::zero(), U256::zero()));
+            if amount_in_step.is_zero() {
+                debug!("[COMPUTE_AMOUNT_OUT] 🆔={} путь={} нулевая входная сумма для перехода к следующему тику", 
+                       event_id, path_index);
+                break;
+            }
+
+            let amount_to_use = amount_remaining.min(amount_in_step);
+
+            let (amt_in_step, amt_out_step, sp_new, step_fee_earned) = match self.compute_swap_step(
+                sqrt_price_current,
+                sqrt_price_next,
+                liquidity_active,
+                amount_to_use,
+                fee_tier,
+                zero_for_one,
+                event_id,
+                path_index,
+                tick_current,
+                pool_addr,
+                price_impact_bps,
+            ) {
+                Ok(result) => result,
+                Err(e) => {
+                    debug!(
+                        "[COMPUTE_AMOUNT_OUT] 🆔={} путь={} ошибка swap_step: {}",
+                        event_id, path_index, e
+                    );
+                    (U256::zero(), U256::zero(), sqrt_price_current, U256::zero())
+                }
+            };
+
+            // Расчёт комиссии для позиции: fee_position = step_fee_earned * (position_liquidity / liquidity_active)
+            let fee_position = mul_div_u256(
+                step_fee_earned,
+                position_liquidity,
+                liquidity_active.max(U256::one()),
+            );
+            // Учитываем долю протокола (30%)
+            let fee_net = mul_div_u256(
+                fee_position,
+                U256::from(1_000_000 - PROTOCOL_FEE_SHARE),
+                U256::from(1_000_000),
+            );
+
+            amount_remaining = amount_remaining.saturating_sub(amt_in_step);
+            amount_out_total = amount_out_total.saturating_add(amt_out_step);
+            total_fee_earned = total_fee_earned.saturating_add(fee_net);
+            sqrt_price_current = sp_new;
+
+            let crossed = if zero_for_one {
+                sp_new <= sqrt_price_next
+            } else {
+                sp_new >= sqrt_price_next
+            };
+
+            if crossed {
+                crossed_ticks.push(tick_next);
+                liquidity_active = U256::from(self.update_liquidity_on_tick_cross(
+                    liquidity_active.as_u128(),
+                    tick_next,
+                    tick_map,
+                    zero_for_one,
+                ));
+                tick_current = tick_next;
+
+                debug!(
+                    "[COMPUTE_AMOUNT_OUT] 🆔={} путь={} переход тика: tick={}, ликвидность={}",
+                    event_id, path_index, tick_current, liquidity_active
+                );
+
+                if liquidity_active.is_zero() {
+                    debug!(
+                        "[COMPUTE_AMOUNT_OUT] 🆔={} путь={} ликвидность исчерпана",
+                        event_id, path_index
+                    );
+                    break;
+                }
+            }
+        }
+
+        if total_fee_earned < flash_loan_fee {
+            debug!(
+                "[COMPUTE_AMOUNT_OUT] 🆔={} путь={} комиссии {} < flash_loan_fee {}",
+                event_id, path_index, total_fee_earned, flash_loan_fee
+            );
+            return (U256::zero(), U256::zero(), vec![]);
+        }
+
+        debug!("[COMPUTE_AMOUNT_OUT] 🆔={} путь={} итог: amount_out={}, fee_earned={}, crossed_ticks={:?}", 
+               event_id, path_index, amount_out_total, total_fee_earned, crossed_ticks);
+
+        (amount_out_total, total_fee_earned, crossed_ticks)
+    }
+
+    /// Вычисляет прибыль от арбитража с двумя mint, флеш-свопами, burn/collect
+    /// # Аргументы
+    /// * `event_id` - Идентификатор события
+    /// * `path_index` - Индекс пути
+    /// * `aave_liquidity` - Ликвидность Aave
+    /// * `snapshot` - Снапшот графа
+    /// * `path` - Арбитражный путь
+    /// # Возвращает
+    /// Кортеж (profit_net, final_amount, used_flash_swap, reserved) или None
+    pub async fn compute_arbitrage_profit(
+        &self,
+        event_id: u64,
+        path_index: &str,
+        aave_liquidity: &AaveTokenLiquidity,
+        snapshot: &Arc<GraphSnapshotHolder>,
+        path: &ArbitragePath,
+    ) -> Option<(U256, U256, bool, u32)> {
+        debug!(
+            "[COMPUTE_ARBITRAGE_PROFIT] 🆔={} путь={} начало",
+            event_id, path_index
+        );
+
+        let config = &*DEFAULT_ARBITRAGE_STRATEGY_CONFIG;
+        let base_token = path.tokens.first().copied().unwrap_or_default();
+
+        let max_borrow = aave_liquidity
+            .aave_token_info
+            .get(&base_token)
+            .map(|(_, virtual_balance)| *virtual_balance)
+            .unwrap_or(U256::zero());
+        if max_borrow.is_zero() {
+            debug!(
+                "[COMPUTE_ARBITRAGE_PROFIT] 🆔={} путь={} нет ликвидности Aave для {:?}",
+                event_id, path_index, base_token
+            );
+            return None;
+        }
+        let arbitrage_loan_amount = mul_div_u256(
+            max_borrow,
+            U256::from(config.aave_utilization_percent),
+            U256::from(100),
+        );
+
+        let pool_ab = snapshot
+            .pools
+            .get(&path.pools[0])
+            .expect("Пул A→B не найден");
+        let pool_bc = snapshot
+            .pools
+            .get(&path.pools[1])
+            .expect("Пул B→C не найден");
+        let token_ab = if pool_ab.uniswap_token_a == path.tokens[0].into() {
+            pool_ab.uniswap_token_b.clone()
+        } else {
+            pool_ab.uniswap_token_a.clone()
+        };
+        let token_bc = if pool_bc.uniswap_token_a == path.tokens[1].into() {
+            pool_bc.uniswap_token_b.clone()
+        } else {
+            pool_bc.uniswap_token_a.clone()
+        };
+
+        let aave_liquidity_ab = aave_liquidity
+            .aave_token_info
+            .get(&token_ab)
+            .map(|(_, virtual_balance)| *virtual_balance)
+            .unwrap_or(U256::zero());
+        let aave_liquidity_bc = aave_liquidity
+            .aave_token_info
+            .get(&token_bc)
+            .map(|(_, virtual_balance)| *virtual_balance)
+            .unwrap_or(U256::zero());
+
+        let max_borrow_ab = mul_div_u256(
+            aave_liquidity_ab,
+            U256::from(config.aave_utilization_percent),
+            U256::from(100),
+        );
+        let max_borrow_bc = mul_div_u256(
+            aave_liquidity_bc,
+            U256::from(config.aave_utilization_percent),
+            U256::from(100),
+        );
+
+        let mint_params_ab = self
+            .calculate_mint_parameters(path.pools[0], config.target_price_impact_bps, snapshot)
+            .await
+            .unwrap_or_else(|e| {
+                debug!(
+                    "[COMPUTE_ARBITRAGE_PROFIT] 🆔={} путь={} ошибка mint AB: {}",
+                    event_id, path_index, e
+                );
+                MintParameters {
+                    pool_address: path.pools[0],
+                    zero_for_one: pool_ab.uniswap_token_a == path.tokens[0].into(),
+                    amount_desired: U256::zero(),
+                    amount_actual: U256::zero(),
+                    tick_lower: pool_ab.uniswap_tick_current - pool_ab.uniswap_tick_spacing,
+                    tick_upper: pool_ab.uniswap_tick_current + pool_ab.uniswap_tick_spacing,
+                    liquidity: U256::zero(),
+                }
+            });
+
+        let mint_params_bc = self
+            .calculate_mint_parameters(path.pools[1], config.target_price_impact_bps, snapshot)
+            .await
+            .unwrap_or_else(|e| {
+                debug!(
+                    "[COMPUTE_ARBITRAGE_PROFIT] 🆔={} путь={} ошибка mint BC: {}",
+                    event_id, path_index, e
+                );
+                MintParameters {
+                    pool_address: path.pools[1],
+                    zero_for_one: pool_bc.uniswap_token_a == path.tokens[1].into(),
+                    amount_desired: U256::zero(),
+                    amount_actual: U256::zero(),
+                    tick_lower: pool_bc.uniswap_tick_current - pool_bc.uniswap_tick_spacing,
+                    tick_upper: pool_bc.uniswap_tick_current + pool_bc.uniswap_tick_spacing,
+                    liquidity: U256::zero(),
+                }
+            });
+
+        let mut mint_params_ab = mint_params_ab;
+        let mut mint_params_bc = mint_params_bc;
+        mint_params_ab.amount_actual = mint_params_ab.amount_desired.min(max_borrow_ab);
+        mint_params_bc.amount_actual = mint_params_bc.amount_desired.min(max_borrow_bc);
+
+        let mut flash_swap_fee = U256::zero();
+        let mut flash_swap_amount = U256::zero();
+        let mut used_flash_swap = false;
+        if mint_params_ab.amount_actual < mint_params_ab.amount_desired {
+            let shortfall_ab = mint_params_ab.amount_desired - mint_params_ab.amount_actual;
+
+            if let Some(borrow_pools) = self.route_builder.borrow_pools.get(&token_ab) {
+                if let Some(borrow_pool) = borrow_pools.first() {
+                    let pool_liquidity = snapshot
+                        .pools
+                        .get(&borrow_pool.pool_address)
+                        .map(|p| {
+                            let token_a = Address::from_slice(&p.uniswap_token_a.to_fixed_bytes());
+                            let zero_for_one = token_a == *token_ab;
+                            if zero_for_one {
+                                p.liquidity_token_b
+                            } else {
+                                p.liquidity_token_a
+                            }
+                        })
+                        .unwrap_or(U256::zero());
+
+                    let flash_amount = shortfall_ab.min(mul_div_u256(
+                        // Используем shortfall_ab
+                        pool_liquidity,
+                        U256::from(config.uniswap_borrow_utilization),
+                        U256::from(100),
+                    ));
+
+                    flash_swap_fee += mul_div_u256(
+                        flash_amount,
+                        U256::from(borrow_pool.fee_tier),
+                        U256::from(1_000_000),
+                    );
+
+                    mint_params_ab.amount_actual += flash_amount;
+                    flash_swap_amount += flash_amount;
+                    used_flash_swap = true;
+                }
+            }
+        }
+
+        // Аналогично для token_bc:
+        if mint_params_bc.amount_actual < mint_params_bc.amount_desired {
+            let shortfall_bc = mint_params_bc.amount_desired - mint_params_bc.amount_actual; // Используем shortfall_bc
+
+            if let Some(borrow_pools) = self.route_builder.borrow_pools.get(&token_bc) {
+                if let Some(borrow_pool) = borrow_pools.first() {
+                    let pool_liquidity = snapshot
+                        .pools
+                        .get(&borrow_pool.pool_address)
+                        .map(|p| {
+                            let token_a = Address::from_slice(&p.uniswap_token_a.to_fixed_bytes());
+                            let zero_for_one = token_a == *token_bc;
+                            if zero_for_one {
+                                p.liquidity_token_b
+                            } else {
+                                p.liquidity_token_a
+                            }
+                        })
+                        .unwrap_or(U256::zero());
+
+                    let flash_amount = shortfall_bc.min(mul_div_u256(
+                        // Используем shortfall_bc
+                        pool_liquidity,
+                        U256::from(config.uniswap_borrow_utilization),
+                        U256::from(100),
+                    ));
+
+                    flash_swap_fee += mul_div_u256(
+                        flash_amount,
+                        U256::from(borrow_pool.fee_tier),
+                        U256::from(1_000_000),
+                    );
+
+                    mint_params_bc.amount_actual += flash_amount;
+                    flash_swap_amount += flash_amount;
+                    used_flash_swap = true;
+                }
+            }
+        }
+
+        let mint_loan_amount = mint_params_ab.amount_actual + mint_params_bc.amount_actual;
+        let mint_loan_fee = mul_div_u256(
+            mint_loan_amount,
+            U256::from(AAVE_FLASH_FEE_NUM),
+            U256::from(AAVE_FLASH_FEE_DEN),
+        );
+
+        let snapshot_ab = self
+            .apply_mint_to_snapshot(snapshot, &mint_params_ab)
+            .unwrap_or_else(|e| {
+                debug!(
+                    "[COMPUTE_ARBITRAGE_PROFIT] 🆔={} путь={} ошибка применения mint AB: {}",
+                    event_id, path_index, e
+                );
+                Arc::clone(snapshot)
+            });
+        let simulated_snapshot = self
+            .apply_mint_to_snapshot(&snapshot_ab, &mint_params_bc)
+            .unwrap_or_else(|e| {
+                debug!(
+                    "[COMPUTE_ARBITRAGE_PROFIT] 🆔={} путь={} ошибка применения mint BC: {}",
+                    event_id, path_index, e
+                );
+                Arc::clone(&snapshot_ab)
+            });
+
+        let arbitrage_loan_fee = mul_div_u256(
+            arbitrage_loan_amount,
+            U256::from(AAVE_FLASH_FEE_NUM),
+            U256::from(AAVE_FLASH_FEE_DEN),
+        );
+        let mut current_amount = arbitrage_loan_amount;
+        let mut current_token = base_token;
+        let mut total_fee_earned = U256::zero();
+
+        for (i, pool_address) in path.pools.iter().enumerate() {
+            let hop_pool = simulated_snapshot
+                .pools
+                .get(pool_address)
+                .expect("Пул не найден");
+            let zero_for_one = hop_pool.uniswap_token_a == current_token.into();
+
+            let (amount_out, fee_earned, crossed_ticks) = self.compute_amount_out(
+                hop_pool.uniswap_sqrt_price,
+                hop_pool.uniswap_liquidity,
+                &hop_pool
+                    .tick_map
+                    .iter()
+                    .map(|(t, (d, l))| (*t, *d, *l))
+                    .collect::<Vec<_>>(),
+                hop_pool.uniswap_tick_current,
+                hop_pool.uniswap_fee_tier,
+                current_amount,
+                zero_for_one,
+                event_id,
+                &format!("{}_hop{}", path_index, i),
+                *pool_address,
+                config.target_price_impact_bps,
+                if i == 0 {
+                    mint_loan_fee + arbitrage_loan_fee + flash_swap_fee
+                } else {
+                    U256::zero()
+                },
+                if i == 0 {
+                    mint_params_ab.liquidity
+                } else {
+                    mint_params_bc.liquidity
+                },
+            );
+
+            if amount_out.is_zero() {
+                debug!(
+                    "[COMPUTE_ARBITRAGE_PROFIT] 🆔={} путь={} нулевой выход на хопе {}",
+                    event_id, path_index, i
+                );
+                return None;
+            }
+
+            current_amount = amount_out;
+            total_fee_earned = total_fee_earned.saturating_add(fee_earned);
+            current_token = if zero_for_one {
+                *hop_pool.uniswap_token_b
+            } else {
+                *hop_pool.uniswap_token_a
+            };
+        }
+
+        if current_token != base_token {
+            debug!(
+                "[COMPUTE_ARBITRAGE_PROFIT] 🆔={} путь={} конечный токен не совпадает с базовым",
+                event_id, path_index
+            );
+            return None;
+        }
+
+        let mut returned_amount_ab = U256::zero();
+        let mut returned_amount_bc = U256::zero();
+        let mut fee_earned_ab = U256::zero();
+        let mut fee_earned_bc = U256::zero();
+
+        if mint_params_ab.liquidity > U256::zero() {
+            let sqrt_price_current = simulated_snapshot
+                .pools
+                .get(&mint_params_ab.pool_address)
+                .map(|p| p.uniswap_sqrt_price)
+                .unwrap_or_default();
+            let sqrt_price_lower = tick_to_sqrt_price(mint_params_ab.tick_lower).ok()?;
+            let sqrt_price_upper = tick_to_sqrt_price(mint_params_ab.tick_upper).ok()?;
+            let (amount, fee) = self
+                .calculate_burn_amount(
+                    mint_params_ab.liquidity,
+                    sqrt_price_current,
+                    sqrt_price_lower,
+                    sqrt_price_upper,
+                    mint_params_ab.zero_for_one,
+                    &simulated_snapshot
+                        .pools
+                        .get(&mint_params_ab.pool_address)
+                        .unwrap()
+                        .tick_map
+                        .iter()
+                        .map(|(t, (d, l))| (*t, *d, *l))
+                        .collect::<Vec<_>>(),
+                    mint_params_ab.tick_lower,
+                    mint_params_ab.tick_upper,
+                )
+                .ok()?;
+            returned_amount_ab = amount;
+            fee_earned_ab = fee;
+        }
+
+        if mint_params_bc.liquidity > U256::zero() {
+            let sqrt_price_current = simulated_snapshot
+                .pools
+                .get(&mint_params_bc.pool_address)
+                .map(|p| p.uniswap_sqrt_price)
+                .unwrap_or_default();
+            let sqrt_price_lower = tick_to_sqrt_price(mint_params_bc.tick_lower).ok()?;
+            let sqrt_price_upper = tick_to_sqrt_price(mint_params_bc.tick_upper).ok()?;
+            let (amount, fee) = self
+                .calculate_burn_amount(
+                    mint_params_bc.liquidity,
+                    sqrt_price_current,
+                    sqrt_price_lower,
+                    sqrt_price_upper,
+                    mint_params_bc.zero_for_one,
+                    &simulated_snapshot
+                        .pools
+                        .get(&mint_params_bc.pool_address)
+                        .unwrap()
+                        .tick_map
+                        .iter()
+                        .map(|(t, (d, l))| (*t, *d, *l))
+                        .collect::<Vec<_>>(),
+                    mint_params_bc.tick_lower,
+                    mint_params_bc.tick_upper,
+                )
+                .ok()?;
+            returned_amount_bc = amount;
+            fee_earned_bc = fee;
+        }
+
+        let total_borrow = mint_loan_amount + arbitrage_loan_amount + flash_swap_amount;
+        let total_fees = mint_loan_fee + arbitrage_loan_fee + flash_swap_fee;
+        let total_returned = current_amount
+            + returned_amount_ab
+            + returned_amount_bc
+            + total_fee_earned
+            + fee_earned_ab
+            + fee_earned_bc;
+        let profit_net = total_returned
+            .saturating_sub(total_borrow)
+            .saturating_sub(total_fees);
+
+        let threshold = MIN_PROFIT_THRESHOLD_BY_TOKEN
+            .get(&base_token)
+            .copied()
+            .unwrap_or(U256::from(100_000_000_000_000_000u128));
+
+        if profit_net < threshold || total_fee_earned < total_fees {
+            debug!("[COMPUTE_ARBITRAGE_PROFIT] 🆔={} путь={} профит {} < порога {} или комиссии {} < {}", 
+                   event_id, path_index, profit_net, threshold, total_fee_earned, total_fees);
+            return None;
+        }
+
+        debug!("[COMPUTE_ARBITRAGE_PROFIT] 🆔={} путь={} успех: profit={}, final_amount={}, fee_earned={}, returned_ab={}, returned_bc={}", 
+               event_id, path_index, profit_net, total_returned, total_fee_earned, returned_amount_ab, returned_amount_bc);
+
+        Some((profit_net, total_returned, used_flash_swap, 0))
+    }
+
+    /// Рассчитывает сумму токенов и комиссий, возвращаемых при burn
+    /// # Аргументы
+    /// * `liquidity` - Ликвидность позиции
+    /// * `sqrt_price_current` - Текущая цена пула
+    /// * `sqrt_price_lower` - Нижняя цена диапазона
+    /// * `sqrt_price_upper` - Верхняя цена диапазона
+    /// * `zero_for_one` - Направление позиции
+    /// * `tick_map` - Карта тиков пула
+    /// * `tick_lower`, `tick_upper` - Диапазон позиции
+    /// # Возвращает
+    /// Кортеж (amount, fee) или ошибка
+    fn calculate_burn_amount(
+        &self,
+        liquidity: U256,
+        sqrt_price_current: Q64_96,
+        sqrt_price_lower: Q64_96,
+        sqrt_price_upper: Q64_96,
+        zero_for_one: bool,
+        tick_map: &[(i32, i128, U256)],
+        tick_lower: i32,
+        tick_upper: i32,
+    ) -> Result<(U256, U256), String> {
+        if liquidity.is_zero() {
+            return Ok((U256::zero(), U256::zero()));
+        }
+
+        let amount = if zero_for_one {
+            let sqrt_diff = if sqrt_price_current < sqrt_price_lower {
+                sqrt_price_upper.sub(sqrt_price_lower)?
+            } else if sqrt_price_current < sqrt_price_upper {
+                sqrt_price_upper.sub(sqrt_price_current)?
+            } else {
+                Q64_96::from_u256(U256::zero())?
+            };
+            liquidity
+                .checked_mul(sqrt_diff.to_u256())
+                .ok_or("Переполнение при вычислении amount1")?
+        } else {
+            let sqrt_diff = if sqrt_price_current < sqrt_price_lower {
+                Q64_96::from_u256(U256::zero())?
+            } else if sqrt_price_current < sqrt_price_upper {
+                sqrt_price_current.sub(sqrt_price_lower)?
+            } else {
+                sqrt_price_upper.sub(sqrt_price_lower)?
+            };
+            let numerator = liquidity
+                .checked_mul(sqrt_diff.to_u256())
+                .ok_or("Переполнение при вычислении amount0 numerator")?;
+            let denominator = sqrt_price_upper.mul(sqrt_price_lower)?.to_u256();
+            numerator
+                .checked_div(denominator)
+                .ok_or("Деление на ноль при расчете amount0")?
+        };
+
+        // Расчёт комиссий по тиковой карте
+        let mut fee_earned = U256::zero();
+        let total_liquidity: U256 = tick_map
+            .iter()
+            .filter(|(t, _, l)| *t >= tick_lower && *t <= tick_upper && l > &U256::zero())
+            .fold(U256::zero(), |acc, (_, _, l)| acc.saturating_add(*l));
+
+        if !total_liquidity.is_zero() {
+            for (tick, _, tick_liquidity) in tick_map
+                .iter()
+                .filter(|(t, _, l)| *t >= tick_lower && *t <= tick_upper && l > &U256::zero())
+            {
+                let fee_global = mul_div_u256(amount, U256::from(1_000_000), U256::from(1_000_000)); // Пример: fee_global = amount * fee_tier
+                let fee_position =
+                    mul_div_u256(fee_global, liquidity, total_liquidity.max(U256::one()));
+                let fee_net = mul_div_u256(
+                    fee_position,
+                    U256::from(1_000_000 - PROTOCOL_FEE_SHARE),
+                    U256::from(1_000_000),
+                );
+                fee_earned = fee_earned.saturating_add(fee_net);
+            }
+        }
+
+        Ok((amount, fee_earned))
+    }
 
     /// Фильтрует результаты по минимальному порогу прибыли
-fn filter_by_min_profit_threshold(&self, results: Vec<PathSimulationResult>) -> Vec<PathSimulationResult> {
-            results
-                .into_iter()
-                .filter(|res| {
-                    let threshold = MIN_PROFIT_THRESHOLD_BY_TOKEN
-                        .get(&res.base_token)
-                        .copied()
-                        .unwrap_or_else(|| {
-                            let default = U256::from(100_000_000_000_000_000u128);
-                            debug!("[  FILTER_BY_MIN_PROFIT] для токена {:?} не найден порог, используется {}", res.base_token, default);
-                            default
-                        });
+    /// # Аргументы
+    /// * `results` - Вектор результатов симуляции
+    /// # Возвращает
+    /// Отфильтрованный вектор результатов
+    fn filter_by_min_profit_threshold(
+        &self,
+        results: Vec<PathSimulationResult>,
+    ) -> Vec<PathSimulationResult> {
+        results
+            .into_iter()
+            .filter(|res| {
+                let threshold = MIN_PROFIT_THRESHOLD_BY_TOKEN
+                    .get(&res.base_token)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        let default = U256::from(100_000_000_000_000_000u128);
+                        debug!("[FILTER_BY_MIN_PROFIT] для токена {:?} не найден порог, используется {}", res.base_token, default);
+                        default
+                    });
 
-                    if res.profit_net >= threshold {
-                        true
-                    } else {
-                        debug!("[  FILTER_BY_MIN_PROFIT] путь {} отфильтрован: прибыль {} < порога {}", res.path_index, res.profit_net, threshold);
-                        false
-                    }
-                })
-                .collect()
-        }
-
-    /// Выбирает финальные арбитражные возможности
-fn select_final_arbitrage_opportunities(
-            &self,
-            results: Vec<PathSimulationResult>,
-            event_id: &str,
-        ) -> Vec<PathSimulationResult> {
-            let mut grouped: HashMap<usize, PathSimulationResult> = HashMap::new();
-
-            for result in results {
-                let entry = grouped.entry(result.path_index).or_insert_with(|| result.clone());
-                if result.profit_net > entry.profit_net {
-                    *entry = result;
-                }
-            }
-
-            let mut final_results: Vec<PathSimulationResult> = grouped.into_values().collect();
-            final_results.sort_by(|a, b| b.profit_net.cmp(&a.profit_net));
-
-            debug!("[  SELECT_FINAL_ARBITRAGE  ] 🆔 ={} отобрано {} путей", event_id, final_results.len());
-            final_results
-        }
-
-/// Обновляет ликвидность при переходе через тик (статический метод)
-fn update_liquidity_on_tick_cross(
-            liquidity_current: u128,
-            tick: i32,
-            tick_map: &[(i32, i128, U256)],
-            zero_for_one: bool,
-        ) -> u128 {
-            if let Some((_, liq_delta, _)) = tick_map.iter().find(|(t, _, _)| *t == tick) {
-                let d = liq_delta.unsigned_abs() as u128; // Явная конвертация в u128
-                if zero_for_one {
-                    liquidity_current.saturating_sub(d)
+                if res.profit_net >= threshold {
+                    true
                 } else {
-                    liquidity_current.saturating_add(d)
+                    debug!("[FILTER_BY_MIN_PROFIT] путь {} отфильтрован: прибыль {} < порога {}", res.path_index, res.profit_net, threshold);
+                    false
                 }
-            } else {
-                liquidity_current
-            }
-        }
+            })
+            .collect()
+    }
 
-
-
-/// Находит следующий инициализированный тик
-fn find_next_initialized_tick(
-        tick_current: i32,
+    /// Находит следующий инициализированный тик в карте тиков
+    /// # Аргументы
+    /// * `current_tick` - Текущий тик
+    /// * `zero_for_one` - Направление свопа
+    /// * `tick_map` - Карта тиков
+    /// # Возвращает
+    /// Следующий инициализированный тик
+    fn find_next_initialized_tick(
+        &self,
+        current_tick: i32,
         zero_for_one: bool,
         tick_map: &[(i32, i128, U256)],
     ) -> i32 {
+        if tick_map.is_empty() {
+            return if zero_for_one { MIN_TICK } else { MAX_TICK };
+        }
+
         if zero_for_one {
-            let (next_tick, found) = TradeSimulator::find_next_tick_below(tick_current, tick_map);
-            if found {
-                next_tick
-            } else {
-                MIN_TICK
-            }
+            tick_map
+                .iter()
+                .filter(|(tick, _, _)| *tick < current_tick)
+                .map(|(tick, _, _)| *tick)
+                .max()
+                .unwrap_or(MIN_TICK)
         } else {
-            let (next_tick, found) = TradeSimulator::find_next_tick_above(tick_current, tick_map);
-            if found {
-                next_tick
-            } else {
-                MAX_TICK
-            }
+            tick_map
+                .iter()
+                .filter(|(tick, _, _)| *tick > current_tick)
+                .map(|(tick, _, _)| *tick)
+                .min()
+                .unwrap_or(MAX_TICK)
         }
     }
 
+    /// Обновляет ликвидность при пересечении тика
+    /// # Аргументы
+    /// * `current_liquidity` - Текущая ликвидность (u128 для совместимости)
+    /// * `tick` - Пересечённый тик
+    /// * `tick_map` - Карта тиков
+    /// * `zero_for_one` - Направление свопа
+    /// # Возвращает
+    /// Новая ликвидность
+    fn update_liquidity_on_tick_cross(
+        &self,
+        current_liquidity: u128,
+        tick: i32,
+        tick_map: &[(i32, i128, U256)],
+        zero_for_one: bool,
+    ) -> u128 {
+        let delta = tick_map
+            .iter()
+            .find(|(t, _, _)| *t == tick)
+            .map(|(_, delta, _)| *delta)
+            .unwrap_or(0);
 
+        if zero_for_one {
+            current_liquidity.saturating_sub(delta.unsigned_abs())
+        } else {
+            current_liquidity.saturating_add(delta.unsigned_abs())
+        }
+    }
+
+    /// Создаёт снапшот графа для указанных пулов
+    /// # Аргументы
+    /// * `route_pools` - Пулы для включения в снапшот
+    /// * `_reserved` - Зарезервированный параметр (не используется)
+    /// * `event_id` - Идентификатор события
+    /// # Возвращает
+    /// Снапшот графа
+    fn create_graph_snapshot(
+        &self,
+        route_pools: &[Address],
+        borrow_pools: &[BorrowPoolInfo],
+        event_id: u64,
+    ) -> Arc<GraphSnapshotHolder> {
+        debug!(
+            "[ CREATE_GRAPH_SNAPSHOT ] 🆔 = {} Создание снимка графа для пулов: {:?}",
+            event_id, route_pools
+        );
+        let mut pool_set: HashSet<Address> = HashSet::new();
+        for address in route_pools {
+            pool_set.insert(*address);
+        }
+        for borrow_pool_info in borrow_pools {
+            pool_set.insert(borrow_pool_info.pool_address);
+        }
+
+        let graph = self.graph.load();
+
+        let mut snapshot = GraphSnapshotHolder {
+            pools: HashMap::new(),
+            tick_maps: HashMap::new(),
+            token_decimals: HashMap::new(),
+        };
+
+        for addr in pool_set {
+            if let Some(pool) = graph.edges.get(&addr) {
+                snapshot.pools.insert(addr, pool.clone());
+                let mut tick_map: Vec<(i32, i128, U256)> =
+                    pool.tick_map.iter().map(|(k, v)| (*k, v.0, v.1)).collect();
+                tick_map.sort_by_key(|(t, _, _)| *t);
+                snapshot.tick_maps.insert(addr, tick_map);
+                snapshot
+                    .token_decimals
+                    .entry(Address::from_slice(&pool.uniswap_token_a.to_fixed_bytes()))
+                    .or_insert(pool.uniswap_token_a_decimals);
+                snapshot
+                    .token_decimals
+                    .entry(Address::from_slice(&pool.uniswap_token_b.to_fixed_bytes()))
+                    .or_insert(pool.uniswap_token_b_decimals);
+            }
+        }
+
+        debug!("[  CREATE_GRAPH_SNAPSHOT  ] Снимок для 🆔 = {} : пулов = {}, tick_maps = {}, decimals = {}", event_id, snapshot.pools.len(), snapshot.tick_maps.len(), snapshot.token_decimals.len());
+        Arc::new(snapshot)
+    }
+
+    
 }

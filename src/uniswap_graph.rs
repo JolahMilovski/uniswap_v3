@@ -1,16 +1,15 @@
-
 use dashmap::DashMap;
 use ethers::types::{Address, U256};
 use im::OrdMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_with::{serde_as, DeserializeAs, SerializeAs, DisplayFromStr};
+use serde_with::{serde_as, DeserializeAs, DisplayFromStr, SerializeAs};
+use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{rename, File};
-use std::io::{Write};
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, warn};
-use std::collections::hash_map::RandomState;
 
 // Q64_96 (64 бита целой части, 96 бит дробной)
 #[derive(Clone, Copy, Default, Debug, PartialEq, PartialOrd, Eq, Ord)]
@@ -33,6 +32,16 @@ impl Q64_96 {
     // Конвертация в U256
     pub fn to_u256(&self) -> U256 {
         self.value
+    }
+
+    pub fn sqrt(self) -> Result<Self, String> {
+        let mut x = self.value >> 96;
+        let mut y = (self.value << 96) / x;
+        while y < x {
+            x = (x + y) >> 1;
+            y = (self.value << 96) / x;
+        }
+        Q64_96::from_u256(x << 96)
     }
 
     // Создание из целой и дробной части
@@ -59,7 +68,10 @@ impl Q64_96 {
 
     // Сложение с проверкой переполнения
     pub fn add(self, other: Q64_96) -> Result<Self, String> {
-        let result = self.value.checked_add(other.value).ok_or("Переполнение при сложении Q64.96")?;
+        let result = self
+            .value
+            .checked_add(other.value)
+            .ok_or("Переполнение при сложении Q64.96")?;
         if result >> 160 != U256::zero() {
             return Err("Переполнение Q64.96".to_string());
         }
@@ -68,7 +80,10 @@ impl Q64_96 {
 
     // Вычитание с проверкой переполнения
     pub fn sub(self, other: Q64_96) -> Result<Self, String> {
-        let result = self.value.checked_sub(other.value).ok_or("Переполнение при вычитании Q64.96")?;
+        let result = self
+            .value
+            .checked_sub(other.value)
+            .ok_or("Переполнение при вычитании Q64.96")?;
         Ok(Q64_96 { value: result })
     }
 
@@ -93,9 +108,7 @@ impl Q64_96 {
         }
         Ok(Q64_96 { value: scaled })
     }
-   
 }
-
 
 // Вспомогательная функция для умножения U256
 fn full_multiply(a: U256, b: U256) -> (U256, U256) {
@@ -126,11 +139,7 @@ impl Serialize for Q64_96 {
     where
         S: Serializer,
     {
-        let s = format!(
-            "{}.{}",
-            self.integer_part(),
-            self.fractional_part()
-        );
+        let s = format!("{}.{}", self.integer_part(), self.fractional_part());
         serializer.serialize_str(&s)
     }
 }
@@ -149,10 +158,11 @@ impl<'de> Deserialize<'de> for Q64_96 {
         let integer = U256::from_dec_str(parts[0]).map_err(serde::de::Error::custom)?;
         let fraction = U256::from_dec_str(parts[1]).map_err(serde::de::Error::custom)?;
         if integer >> 96 != U256::zero() || fraction >> 64 != U256::zero() {
-            return Err(serde::de::Error::custom("Переполнение при десериализации Q96.64"));
+            return Err(serde::de::Error::custom(
+                "Переполнение при десериализации Q96.64",
+            ));
         }
-        Q64_96::from_parts(integer.as_u128(), fraction.as_u128())
-            .map_err(serde::de::Error::custom)
+        Q64_96::from_parts(integer.as_u128(), fraction.as_u128()).map_err(serde::de::Error::custom)
     }
 }
 
@@ -214,7 +224,7 @@ pub struct UniswapPool {
     #[serde_as(as = "DisplayFromStr")]
     pub uniswap_liquidity: U256,
     #[serde_as(as = "Q64_96AsString")]
-    pub uniswap_sqrt_price: Q64_96, 
+    pub uniswap_sqrt_price: Q64_96,
     #[serde_as(as = "DisplayFromStr")]
     pub liquidity_token_b: U256,
     pub uniswap_tick_current: i32,
@@ -285,9 +295,15 @@ impl<'de> DeserializeAs<'de, OrdMap<i32, (i128, U256)>> for OrdMapAsBTreeMap {
 
 impl UniversalGraph {
     pub fn new(shard_count: usize) -> Self {
-        debug!("[UNISWAP_GRAPH_new] 🧿 Создание нового универсального графа с {} шардами", shard_count);
+        debug!(
+            "[UNISWAP_GRAPH_new] 🧿 Создание нового универсального графа с {} шардами",
+            shard_count
+        );
         assert!(shard_count > 0, "Количество шардов должно быть > 0");
-        assert!(shard_count & (shard_count - 1) == 0, "Количество шардов должно быть степенью двойки");
+        assert!(
+            shard_count & (shard_count - 1) == 0,
+            "Количество шардов должно быть степенью двойки"
+        );
 
         let hasher = RandomState::new();
 
@@ -364,8 +380,9 @@ impl UniversalGraph {
         {
             Ok(Some(mut existing_pool)) => {
                 debug!(
-                    "[UNISWAP_GRAPH_upsert_pool] 🧿 Доступ к edges за {:?}, найден пул {:?}", 
-                    get_mut_start.elapsed(), pool_address
+                    "[UNISWAP_GRAPH_upsert_pool] 🧿 Доступ к edges за {:?}, найден пул {:?}",
+                    get_mut_start.elapsed(),
+                    pool_address
                 );
                 existing_pool.uniswap_liquidity = new_pool.uniswap_liquidity;
                 existing_pool.uniswap_sqrt_price = new_pool.uniswap_sqrt_price;
@@ -373,18 +390,21 @@ impl UniversalGraph {
                 existing_pool.is_active = new_pool.is_active;
                 existing_pool.liquidity_token_a = new_pool.liquidity_token_a;
                 existing_pool.liquidity_token_b = new_pool.liquidity_token_b;
-                existing_pool.tick_map = existing_pool.tick_map.clone().union(new_pool.tick_map.clone());
+                existing_pool.tick_map = existing_pool
+                    .tick_map
+                    .clone()
+                    .union(new_pool.tick_map.clone());
                 debug!(
                     "[UNISWAP_GRAPH_upsert_pool] 🧿 Вставка в nodes: pool_address: {:?}, tokens: ({:?}, {:?})",
                     pool_address, token_a, token_b
                 );
                 match self.nodes.insert(pool_address, (token_a, token_b)) {
                     Some(_) => debug!(
-                        "[UNISWAP_GRAPH_upsert_pool] 🧿 Обновлена запись в nodes для пула {:?}", 
+                        "[UNISWAP_GRAPH_upsert_pool] 🧿 Обновлена запись в nodes для пула {:?}",
                         pool_address
                     ),
                     None => debug!(
-                        "[UNISWAP_GRAPH_upsert_pool]🧿 Новая запись в nodes для пула {:?}", 
+                        "[UNISWAP_GRAPH_upsert_pool]🧿 Новая запись в nodes для пула {:?}",
                         pool_address
                     ),
                 }
@@ -396,16 +416,16 @@ impl UniversalGraph {
                     pool_address
                 );
                 debug!(
-                    "[UNISWAP_GRAPH_upsert_pool]🧿🧿🧿 Вставка нового пула в edges: {:?}", 
+                    "[UNISWAP_GRAPH_upsert_pool]🧿🧿🧿 Вставка нового пула в edges: {:?}",
                     pool_address
                 );
                 match self.edges.insert(pool_address, new_pool.clone()) {
                     Some(_) => debug!(
-                        "[UNISWAP_GRAPH_upsert_pool] 🧿 Обновлена запись в edges для пула {:?}", 
+                        "[UNISWAP_GRAPH_upsert_pool] 🧿 Обновлена запись в edges для пула {:?}",
                         pool_address
                     ),
                     None => debug!(
-                        "[UNISWAP_GRAPH_upsert_pool]🧿 Новая запись в edges для пула {:?}", 
+                        "[UNISWAP_GRAPH_upsert_pool]🧿 Новая запись в edges для пула {:?}",
                         pool_address
                     ),
                 }
@@ -415,11 +435,11 @@ impl UniversalGraph {
                 );
                 match self.nodes.insert(pool_address, (token_a, token_b)) {
                     Some(_) => debug!(
-                        "[UNISWAP_GRAPH_upsert_pool] 🧿 Обновлена запись в nodes для пула {:?}", 
+                        "[UNISWAP_GRAPH_upsert_pool] 🧿 Обновлена запись в nodes для пула {:?}",
                         pool_address
                     ),
                     None => debug!(
-                        "[UNISWAP_GRAPH_upsert_pool]🧿 Новая запись в nodes для пула {:?}", 
+                        "[UNISWAP_GRAPH_upsert_pool]🧿 Новая запись в nodes для пула {:?}",
                         pool_address
                     ),
                 }

@@ -132,7 +132,9 @@ pub async fn get_aave_data(
                 for result in results {
                     if let Some((addr, (symbol, virtual_balance))) = result {
                         new_data.aave_token_address.insert(addr);
-                        new_data.aave_token_info.insert(addr, (symbol, virtual_balance));
+                        new_data
+                            .aave_token_info
+                            .insert(addr, (symbol, virtual_balance));
                     } else {
                         all_ok = false;
                     }
