@@ -1085,7 +1085,7 @@ impl UniswapEventSubscriber {
                                 }
                             } else {
                                 warn!(
-                                "[UNISWAP_EVENTS_POOL_HANDLER_WARN][{:?}] Событие ID 🆔 {} пропущено для симуляции (время обработки: {} мс > 1000 мс)",
+                                "[UNISWAP_EVENTS_POOL_HANDLER_WARN][{:?}] Событие ID 🆔 {} пропущено для симуляции (время обработки больше положенного: {})",
                                 pool_address, event.event_id, elapsed_ms
                             );
                             }

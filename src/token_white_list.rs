@@ -4,8 +4,8 @@ use std::str::FromStr;
 use tracing::error;
 
 pub const TOKEN_WHITELIST: &[(&str, &str)] = &[
-    ("0xba5DdD1f9d7F570dc94a51479a000E3BCE967196", "AAVE"),
-    ("0x82aF49447D8a07e3bd95BD0d56f35241523fBab1", "WETH"),
+    //("0xba5DdD1f9d7F570dc94a51479a000E3BCE967196", "AAVE"),
+    //("0x82aF49447D8a07e3bd95BD0d56f35241523fBab1", "WETH"),
     //("0xf97f4df75117a78c1a5a0dbb814af92458539fb4", "LINK"),
     ("0xaf88d065e77c8cC2239327C5EDb3A432268e5831", "USDC"),
     ("0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f", "WBTC"),
