@@ -5,7 +5,7 @@ pub mod take_gas_price;
 pub mod tick_fetcher;
 pub mod token;
 pub mod token_white_list;
-pub mod trade_simulator;
+//pub mod trade_simulator;
 pub mod uniswap_cache;
 pub mod uniswap_events;
 pub mod uniswap_graph;
@@ -31,7 +31,7 @@ use tracing_subscriber::fmt::FormatFields;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
-use crate::trade_simulator::TradeSimulator;
+//use crate::trade_simulator::TradeSimulator;
 
 use crate::token::TokenInfo;
 use crate::uniswap_events::{PoolEventInfo, UniswapEventSubscriber};
@@ -145,7 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 uniswap::trade_simulator=info,\
                 uniswap::uniswap_cache=warn,\
                 uniswap::tick_fetcher=warn,\
-                uniswap::uniswap_events=warn,\
+                uniswap::uniswap_events=debug,\
                 uniswap::uniswap_graph=warn,\
                 uniswap::uniswap_v3=warn,\
                 h2=off,\
@@ -303,7 +303,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let is_paths_built_for_polling = Arc::clone(&is_paths_built);
     let event_tx_for_polling = event_tx.clone();
 
-    let (simulator_tx, simulator_rx) = mpsc::channel::<PoolEventInfo>(2000);
+    let (simulator_tx, simulator_rx) = mpsc::channel::<PoolEventInfo>(20000);
     //let token_cache_clone = Arc::clone(&token_cache);
 
     let polling_handle = spawn({
@@ -407,17 +407,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     //============================================================================ Запуск симулятора арбитража
-
+/*
     let mut trade_simulator =
         TradeSimulator::new(Arc::clone(&path_builder), aave_rx, Arc::clone(&graph));
 
     info!("[MAIN] Запуск TradeSimulator");
 
-    let simulation_handle = spawn(async move {
-        trade_simulator.run(simulator_rx).await;
-
-        info!("[MAIN_TRADE_SIMULATOR] TradeSimulator завершил работу");
-    });
+let simulation_handle = spawn(async move {
+    trade_simulator.run(simulator_rx).await;
+    
+    info!("[MAIN_TRADE_SIMULATOR] TradeSimulator завершил работу");
+});
+*/
 
     // ============================================================================ Ожидание завершения задач или сигнала завершения
 
@@ -435,9 +436,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ = polling_handle => {
             warn!("[MAIN] Задача polling_event завершилась неожиданно");
         }
-        _ = simulation_handle => {
-            warn!("[MAIN] Задача SimulationRunner завершилась неожиданно");
-        }
+      //  _ = simulation_handle => {
+      //      warn!("[MAIN] Задача SimulationRunner завершилась неожиданно");
+      //  }
 
     }
 

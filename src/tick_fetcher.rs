@@ -10,7 +10,7 @@ use std::env;
 use std::result::Result;
 use std::sync::Arc;
 use tokio::time::Duration;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 // ABI для Multicall3
 abigen!(
@@ -71,6 +71,7 @@ abigen!(
     }]"#
 );
 
+
 /// Обработка мультиколлов для получения тиков из пула Uniswap V3
 ///
 /// # Аргументы
@@ -97,7 +98,7 @@ async fn process_calls(
     if calls.is_empty() {
         return Ok(());
     }
-    //debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG][{:?}] Выполнение мультиколла с {} вызовами", pool_address, calls.len());
+    debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG][{:?}] Выполнение мультиколла с {} вызовами", pool_address, calls.len());
 
     // Выполняем мультиколл с таймаутом 20 секунд
     let results = tokio::time::timeout(
@@ -167,7 +168,7 @@ async fn process_calls(
                     .collect();
                 // Логируем только если есть тики
                 if !ticks.is_empty() {
-                    // debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG][{:?}] Слово {}: получено {} тиков", pool_address, word, ticks.len());
+                     debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG][{:?}] Слово {}: получено {} тиков", pool_address, word, ticks.len());
                 }
                 // Добавляем тики в карту
                 for tick in ticks {
@@ -196,6 +197,7 @@ async fn process_calls(
     Ok(())
 }
 
+
 /// Асинхронная функция для получения всех активных тиков из пула Uniswap V3
 ///
 /// # Аргументы
@@ -212,7 +214,7 @@ pub async fn fetch_active_ticks(
     current_tick: i32,
     fee: u32,
 ) -> Result<OrdMap<i32, (i128, U256)>, Error> {
-    //debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG] Начало fetch_active_ticks, pool_address: {:?}, current_tick: {}, fee: {}", pool_address, current_tick, fee);
+    debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG] Начало fetch_active_ticks, pool_address: {:?}, current_tick: {}, fee: {}", pool_address, current_tick, fee);
 
     // Загружаем адреса контрактов
     let multicall_address: Address = env::var("MULTICALL3_ADDRESS")?.parse()?; // Адрес Multicall3
@@ -220,7 +222,7 @@ pub async fn fetch_active_ticks(
     let multicall = Arc::new(Multicall3::new(multicall_address, client.clone())); // Экземпляр Multicall3
     let tick_lens = Arc::new(TickLens::new(tick_lens_address, client.clone())); // Экземпляр TickLens
 
-    //debug!("[UNISWAP_V3_FETH_ACTIVE_BUILD_DEBUG] Multicall3: {:?}, TickLens: {:?}", multicall_address, tick_lens_address);
+    debug!("[UNISWAP_V3_FETH_ACTIVE_BUILD_DEBUG] Multicall3: {:?}, TickLens: {:?}", multicall_address, tick_lens_address);
 
     // Определяем шаг тиков в зависимости от комиссии
     let tick_spacing = match fee {
@@ -230,14 +232,14 @@ pub async fn fetch_active_ticks(
         10_000 => 200,
         _ => return Err(anyhow::anyhow!("Недопустимый уровень комиссии: {}", fee)),
     };
-    //debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG] tick_spacing: {}", tick_spacing);
+    debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG] tick_spacing: {}", tick_spacing);
 
     // Вычисляем диапазон слов
     let min_tick_word = (-887272 >> 8) as i16; // Минимальное слово тиков
     let max_tick_word = (887272 >> 8) as i16; // Максимальное слово тиков
     let batch_size = 2000; // Размер батча для мультиколлов
 
-    //debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG] min_tick_word: {}, max_tick_word: {}, batch_size: {}",        min_tick_word, max_tick_word, batch_size);
+    debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG] min_tick_word: {}, max_tick_word: {}, batch_size: {}", min_tick_word, max_tick_word, batch_size);
 
     let mut all_ticks: OrdMap<i32, (i128, U256)> = OrdMap::new(); // Карта для хранения тиков
     let mut non_zero_liquidity = 0; // Счетчик тиков с ненулевой ликвидностью
@@ -280,6 +282,8 @@ pub async fn fetch_active_ticks(
             pool_address, fee, current_tick, all_ticks.len(), non_zero_liquidity);
     }
 
-    //debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG] Конец fetch_active_ticks, pool_address: {:?}, all_ticks: {}", pool_address, all_ticks.len());
+    debug!("[UNISWAP_V3_FETH_ACTIVE_DEBUG] Конец fetch_active_ticks, pool_address: {:?}, all_ticks: {}", pool_address, all_ticks.len());
+
     Ok(all_ticks)
+
 }

@@ -717,6 +717,21 @@ pub async fn build_uniswap_v3_pool(
         return None;
     }
 
+    // ----------------------------
+    // Корректный расчёт tickLower / tickUpper
+    // ----------------------------
+    let mut tick_quotient = tick / tick_spacing;
+    let tick_remainder = tick % tick_spacing;
+
+    // Если tick отрицательный и есть остаток, уменьшаем на 1 (floor)
+    if tick_remainder != 0 && tick < 0 {
+        tick_quotient -= 1;
+    }
+
+    let tick_lower = tick_quotient * tick_spacing;
+    let tick_upper = tick_lower + tick_spacing;
+
+
     let pool = UniswapPool {
         graph_pool_address: pool_address.into(),
         uniswap_dex: "uniswap_v3".to_string().into(),
@@ -729,8 +744,8 @@ pub async fn build_uniswap_v3_pool(
         uniswap_liquidity: liquidity,
         uniswap_sqrt_price: sqrt_price_x96,
         uniswap_tick_current: tick,
-        uniswap_tick_lower: tick - tick_spacing,
-        uniswap_tick_upper: tick + tick_spacing,
+        uniswap_tick_lower: tick_lower,
+        uniswap_tick_upper: tick_upper,
         uniswap_tick_spacing: tick_spacing,
         uniswap_max_liquidity_per_tick: U256::from(max_liquidity_per_tick),
         uniswap_fee_tier: fee,
@@ -771,6 +786,8 @@ pub async fn build_uniswap_v3_pool(
     );
     Some(pool)
 }
+
+
 
 /// Синхронизирует пулы Uniswap V3 с кэша и обновляет граф
 pub async fn sync_pools(
@@ -997,6 +1014,9 @@ async fn fetch_pool_data_multicall(
     );
     Some((U256::from(result.0), slot0, result.2, result.3, result.4))
 }
+
+
+
 
 /// Обрабатывает данные пула Uniswap V3
 pub async fn process_pool_data(
